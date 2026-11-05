@@ -1,0 +1,20 @@
+# Build output
+/build*/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/compile_commands.json
+/Testing/
+
+# Local runtime data
+/run-logs/
+/saves/
+/.cache/
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*~
