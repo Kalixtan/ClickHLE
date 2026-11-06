@@ -1,23 +1,16 @@
 // The "Metadata" library: 152 ordinals, the largest after OpenGLES.
 //
-// It is the iPod's own music library. Three of the ordinals are named --
-// now-playing playlist, now-playing index, playlist track count -- and that is
-// enough to say what the library is for: these games could quiz you on your
-// music and play your own tracks, which is why something peripheral-looking has
-// 152 entries.
+// The library includes music and artwork services. Most ordinal names and
+// object contracts are still being recovered from the firmware.
 //
-// Everything here reports an **empty library**: no playlist, no track, nothing
-// to count. That is what a freshly synced iPod with no music looks like, and it
-// is a real answer rather than a stub -- a game asking how many tracks are in a
-// playlist and being told none has been told something true about this device.
-//
-// The alternative would be inventing a music library, and a game that then
-// asked for track seven's title would be lied to twice.
+// The emulator has no device music database, so data queries must report an
+// empty result while honoring the firmware's object and handle rules.
 
 #include "clickhle/hle/modules.h"
 
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "clickhle/common/log.h"
 #include "clickhle/core/emulator.h"
@@ -34,6 +27,36 @@ constexpr const char* kModule = "Metadata";
 /// playlist that happens to be first.
 constexpr u32 kNoPlaylist = 0xFFFFFFFFu;
 
+u32 allocate_slot(std::vector<bool>& slots) {
+    for (std::size_t i = 0; i < slots.size(); ++i) {
+        if (!slots[i]) {
+            slots[i] = true;
+            return static_cast<u32>(i);
+        }
+    }
+    if (slots.size() >= kNoPlaylist) {
+        return kNoPlaylist;
+    }
+    slots.push_back(true);
+    return static_cast<u32>(slots.size() - 1);
+}
+
+void release_slot(std::vector<bool>& slots, u32 handle) {
+    if (handle < slots.size()) {
+        slots[handle] = false;
+    }
+}
+
+bool valid_music_handle(HleCallFrame& f, u32 handle) {
+    const auto& slots = f.emulator.metadata_state().music_library_slots;
+    if (handle < slots.size() && slots[handle]) return true;
+    CLICKHLE_ERROR(kCategory) << "invalid Metadata handle " << handle
+                              << " (RetailOS lookup returns null)";
+    // The wrappers dereference the lookup result without a null check.
+    f.cpu.request_stop();
+    return false;
+}
+
 }  // namespace
 
 void register_metadata(HleRegistry& registry) {
@@ -43,134 +66,199 @@ void register_metadata(HleRegistry& registry) {
                      std::move(handler));
     };
 
-    // #0 is what iQuiz asks for first, and it is not among the three the
-    // reference map names. Its caller keeps the result and passes it straight
-    // back in as an argument to the next call:
-    //
-    //     bl   <Metadata#0>
-    //     mov  r1, r0
-    //     mov  r0, r4
-    //
-    // So it yields a handle or count that the rest of the library is indexed
-    // by. Answering zero says "nothing here", which is consistent with the
-    // empty library the rest of this module reports.
-    fn(0, "library_root", 0, [](HleCallFrame& f) {
-        CLICKHLE_DEBUG(kCategory) << "library_root -> 0 (empty library)";
-        f.ret(0);
+    // RetailOS inserts a new library object and returns its table index. Index
+    // zero is valid even though the represented music library is empty.
+    fn(0, "music_library_create", 0, [](HleCallFrame& f) {
+        const u32 handle =
+            allocate_slot(f.emulator.metadata_state().music_library_slots);
+        CLICKHLE_DEBUG(kCategory) << "music library handle " << handle;
+        f.ret(handle);
     });
 
-    // #2 has the same shape as #0 -- its result is passed straight into the
-    // next call as an argument -- so it is another handle or count into the
-    // library, and zero is the answer an empty one gives.
-    // Arity 0, not 1. The firmware decompiles as `int ()` and touches no
-    // argument register (LLE track). This was the only arity conflict in a
-    // scrape of every handler we register, which is worth as much as the fix.
-    fn(2, "library_query", 0, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        f.ret(0);
+    fn(1, "music_library_release", 1, [](HleCallFrame& f) {
+        release_slot(f.emulator.metadata_state().music_library_slots,
+                     f.args.next_u32());
+        f.ret_void();
     });
 
-    // #1/#3 -- musika's exit/save path reaches these after #119 unblocked its
-    // main menu. Arity 1, per oracle's direct firmware-call measurement
-    // (`oracle/out/slot_measurements.csv`: both `r0:scalar`) -- an earlier
-    // guess of arity 2 here, by analogy to #29/#31/#45/#47, was wrong.
-    // Answered 0, the same "empty library" answer as the rest of this
-    // module. Corpus-checked: musika is the only title reaching either
-    // (`compat_table.py --check`, 20/20, 0 regressed), and with these two
-    // answered it completes a full menu -> exit -> save cycle with zero
-    // unimplemented calls, where it previously halted here.
-    //
-    // NOT the "music required to play musika" gate -- tried answering #62
-    // (now_playing_playlist) and #134 (playlist_track_count) as a non-empty
-    // one-track library and it made no difference to that dialog. LLE traced
-    // why: #62 is called from small wrapper functions that tail-jump straight
-    // into #134/#119/#125/#127 after it, so the gate is downstream of what
-    // those wrappers do with the return values, not a direct read of #62/#134
-    // themselves. Still open -- see hle-to-lle.md/hle-to-oracle.md.
-    fn(1, "library_query", 1, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        f.ret(0);
+    // The second pair manages artwork-library objects in a separate table.
+    fn(2, "artwork_library_create", 0, [](HleCallFrame& f) {
+        const u32 handle =
+            allocate_slot(f.emulator.metadata_state().artwork_library_slots);
+        CLICKHLE_DEBUG(kCategory) << "artwork library handle " << handle;
+        f.ret(handle);
     });
-    fn(3, "library_query", 1, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        f.ret(0);
+    fn(3, "artwork_library_release", 1, [](HleCallFrame& f) {
+        release_slot(f.emulator.metadata_state().artwork_library_slots,
+                     f.args.next_u32());
+        f.ret_void();
     });
 
-    // #29/#31/#45/#47 -- more library queries, all called with a small leading
-    // constant and a pointer to somewhere in the image. Answered zero, for the
-    // same reason as #0 and #2: this device has no music on it, and every
-    // answer here has to agree with every other or a title will believe in a
-    // library it cannot then enumerate.
-    for (const u32 ordinal : {29u, 31u, 45u, 47u}) {
-        fn(ordinal, "library_query", 2, [](HleCallFrame& f) {
-            (void)f.args.next_u32();
-            (void)f.args.next_u32();
-            f.ret(0);
-        });
-    }
+    // These two exports are literal zero-return stubs in RetailOS.
+    fn(121, "metadata_zero_121", 0,
+       [](HleCallFrame& f) { f.ret(0); });
+    fn(122, "metadata_zero_122", 0,
+       [](HleCallFrame& f) { f.ret(0); });
 
-    fn(62, "now_playing_playlist", 0,
-       [](HleCallFrame& f) { f.ret(kNoPlaylist); });
-    // Arity was 0; three independent methods agree it is wrong. oracle
-    // measured at least one argument consumed on a clean return; LLE's
-    // static read (after fixing a metric that had been discounting
-    // pass-through registers as "no evidence") makes it 4, consuming
-    // r1/r2/r3. The claim of 0 was the only outlier among the three
-    // (2026-09-19). What the four arguments MEAN is still unconfirmed --
-    // this corrects the declared signature, not the answer -- so the
-    // return stays 0, the same honest "empty library" answer the rest of
-    // this module gives.
-    fn(125, "now_playing_index", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+    // These wrappers all resolve argument 0 through the music-library object
+    // table before dereferencing the returned object. Their service calls are
+    // still incomplete, but invalid and released handles must not look valid.
+    fn(29, "metadata_29", 4, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
+        if (!valid_music_handle(f, handle)) return;
+        f.ret_void();
+    });
+    fn(31, "metadata_31", 4, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
+        if (!valid_music_handle(f, handle)) return;
+        f.ret_void();
+    });
+    fn(45, "metadata_45", 4, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
+        if (!valid_music_handle(f, handle)) return;
         f.ret(0);
     });
-    fn(134, "playlist_track_count", 0, [](HleCallFrame& f) { f.ret(0); });
+    fn(47, "metadata_47", 4, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
+        if (!valid_music_handle(f, handle)) return;
+        f.ret_void();
+    });
 
-    // #119 -- another library query, and the ONLY thing standing between
-    // musika and running at all. Answered 0, with the reasoning stated
-    // because the value is NOT confirmed:
-    //
-    // - Both other tracks tried and could not settle it. LLE: zero direct
-    //   `bl` callers anywhere in musika's binary (encoding-level scan), so
-    //   it is reached through a runtime-indexed function-pointer table; the
-    //   trail bottoms out in the game's own internal PLT, several layers
-    //   past anything statically reachable. oracle: called it against real
-    //   firmware with BOTH of musika's exact captured argument sets and got
-    //   the identical dead end each time (`Lost` at pc 0x0021a41c, 752
-    //   instructions, byte-identical tails) -- the failure is
-    //   argument-independent, a warm machine missing boot-time state, so
-    //   execution cannot give ground truth either.
-    //
-    // - Measured call shape (`--probe`): two sites, 0x1802dc9c and
-    //   0x1802dd84, args `(0xFFFFFFFF, 0x1, 0x1, 0x1, 0x20000050, 0x2, 0x3,
-    //   <retaddr>)` and `(0xFFFFFFFF, 0x3, 0x2025bff4, 0x0, ...)`. arg0 is
-    //   exactly kNoPlaylist -- the same "nothing selected" sentinel #0 and
-    //   #62 already return -- which is at least consistent with this being
-    //   another empty-library query.
-    //
-    // - Why answer at all rather than leave it unregistered: unregistered
-    //   means musika HALTS on its first call, at frame 1, having rendered
-    //   nothing. With 0 it runs and draws its real main menu (logo plus
-    //   play / visualizer / volume / options / help / exit, 19201 colours,
-    //   152113 draw calls over 7000 frames). Every other answer is a guess
-    //   too, and 0 is the one consistent with the empty library the rest of
-    //   this module reports.
-    //
-    // - Why this is safe to try: a corpus sweep shows **musika is the only
-    //   title that calls #119 at all** (2 calls in 200 frames; every other
-    //   title: zero). So this cannot reach anything that currently works.
-    //
-    // If a title ever depends on a real value here this will need revisiting
-    // -- see the Settings#0 note in settings.cpp for what a confidently
-    // wrong return value costs.
-    fn(119, "library_query", 8, [](HleCallFrame& f) {
-        for (u32 i = 0; i < 8; ++i) {
-            (void)f.args.next_u32();
+    fn(62, "audio_service", 0, [](HleCallFrame& f) {
+        auto& state = f.emulator.metadata_state();
+        if (state.service_object == kNullGuest) {
+            state.service_object = f.emulator.heap().allocate(0x90);
+            if (state.service_object == kNullGuest) {
+                CLICKHLE_ERROR(kCategory)
+                    << "Metadata#62 could not allocate its 0x90-byte service object";
+                // RetailOS immediately runs the constructor with the result;
+                // a failed allocation would fault there instead of returning
+                // a usable null singleton.
+                f.cpu.request_stop();
+                return;
+            }
+            for (u32 offset = 0; offset < 0x90; offset += 4) {
+                f.store<u32>(state.service_object + offset, 0);
+            }
+            // FUN_1019102c installs the pointer loaded from the firmware's
+            // vtable literal at 0x10191088.
+            f.store<u32>(state.service_object, 0x00668cb4);
+            // FUN_1019102c initializes these fields after constructing
+            // the service object. The configuration-derived +0x08 value
+            // and embedded service at +0x1c depend on runtime globals we
+            // do not have, but these zero/default fields are deterministic.
+            f.store<u32>(state.service_object + 0x04, 0);
+            f.store<u32>(state.service_object + 0x10, 0);
+            f.store<u32>(state.service_object + 0x14, kNoPlaylist);
+            f.store<u32>(state.service_object + 0x18, 0);
+            f.store<u32>(state.service_object + 0x20, 0);
+            // FUN_1019102c constructs the nested object at +0x24 through
+            // 0x101a3830. Its base constructor installs the second vtable at
+            // +0x28, and five empty 16-byte members follow from +0x3c.
+            f.store<u32>(state.service_object + 0x24, 0x006698c0);
+            f.store<u32>(state.service_object + 0x28, 0x0067315c);
+            f.store<u32>(state.service_object + 0x2c, 0);
+            for (const u32 offset : {0x3cu, 0x4cu, 0x5cu, 0x6cu, 0x7cu}) {
+                f.store<u32>(state.service_object + offset, 0x00664cd0);
+                f.store<u32>(state.service_object + offset + 4, 0x00672aa0);
+                f.store<u32>(state.service_object + offset + 8, 0);
+                f.store<u32>(state.service_object + offset + 0xc, kNoPlaylist);
+            }
+            f.store<u32>(state.service_object + 0x8c, 0);
         }
-        CLICKHLE_DEBUG(kCategory) << "#119 -> 0 (empty library)";
+        f.ret(state.service_object);
+    });
+    // Ghidra shows this getter reading the current index at object + 0x14.
+    fn(125, "current_index", 1, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        const auto index = f.memory.read<u32>(object + 0x14);
+        if (!index.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret(*index);
+    });
+    // The firmware getter returns the raw byte at object + 0x18.
+    fn(126, "current_state", 1, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        const auto state = f.memory.read<u8>(object + 0x18);
+        if (!state.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret(*state);
+    });
+    // RetailOS checks the audio context's +0x118 word, then invokes vtable
+    // slot +0x0c on the #62 singleton when it is -1. That method cleans the
+    // embedded service and calls vtable slot +0x08. The slot target at
+    // 0x10190afc loads singleton+4 and returns it normalized to 0/1. The
+    // constructor initializes +4 to zero; Audio#40 registrations are the
+    // only modeled transition that makes the stream service available.
+    fn(134, "has_registered_stream", 0, [](HleCallFrame& f) {
+        f.ret(f.emulator.audio_state().registered_stream_count != 0 ? 1u : 0u);
+    });
+
+    // These setters are direct byte stores in the track-state object.
+    fn(131, "set_state_flag_1a", 2, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        const u8 value = static_cast<u8>(f.args.next_u32());
+        if (!f.store<u8>(object + 0x1a, value)) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret_void();
+    });
+    fn(132, "set_state_flag_19", 2, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        const u8 value = static_cast<u8>(f.args.next_u32());
+        if (!f.store<u8>(object + 0x19, value)) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret_void();
+    });
+
+    // This initializer also performs firmware-specific stream/configuration
+    // cleanup. Reproduce the confirmed empty-index state; the media settings
+    // and stream object are not present in this emulator.
+    fn(119, "track_state_init", 1, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        // RetailOS immediately passes object+0x1c to its cleanup helper and
+        // then accesses fields in the object. It has no null or unmapped
+        // pointer guard; silently skipping initialization turns a guest data
+        // fault into an apparent success.
+        if (object == kNullGuest ||
+            !f.memory.read<u32>(object + 0x1c).has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        // RetailOS releases the old object through its resource-aware
+        // destructor, then clears this member. The destructor's nested
+        // resource graph is not modeled, but retaining a stale pointer here
+        // would still diverge on every subsequent initialization.
+        const auto old_object = f.memory.read<u32>(object + 4);
+        if (!old_object.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*old_object != 0 && !f.store<u32>(object + 4, 0)) {
+            f.cpu.request_stop();
+            return;
+        }
+        // RetailOS initializes the current index and state flags before
+        // copying device configuration. This emulator has no media settings
+        // to copy, so preserve the confirmed empty state.
+        if (!f.store<u32>(object + 0x14, kNoPlaylist) ||
+            !f.store<u8>(object + 0x18, 0) ||
+            !f.store<u8>(object + 0x19, 0) ||
+            !f.store<u8>(object + 0x1a, 0)) {
+            f.cpu.request_stop();
+            return;
+        }
         f.ret(0);
     });
 

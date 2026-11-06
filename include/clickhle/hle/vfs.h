@@ -84,13 +84,15 @@ public:
     enum class Mode { kRead, kWrite, kUpdate };
 
     /// Opens a guest path and returns a handle, or 0 on failure.
-    [[nodiscard]] u32 open(const std::string& guest_path, Mode mode);
+    [[nodiscard]] u32 open(const std::string& guest_path, Mode mode,
+                           bool allow_write = true);
 
     [[nodiscard]] bool close(u32 handle);
 
     /// Bytes read, or -1 if the handle is unknown.
     [[nodiscard]] i64 read(u32 handle, void* buffer, u32 length);
     [[nodiscard]] i64 write(u32 handle, const void* buffer, u32 length);
+    [[nodiscard]] bool writable(u32 handle) const;
 
     /// Size in bytes, or -1 if the handle is unknown.
     [[nodiscard]] i64 size(u32 handle) const;
@@ -116,6 +118,7 @@ private:
         std::FILE* handle = nullptr;
         std::string guest_path;
         Mode mode = Mode::kRead;
+        bool allow_write = false;
     };
 
     std::filesystem::path root_;

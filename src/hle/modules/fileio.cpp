@@ -19,9 +19,13 @@
 #include <algorithm>
 #include "clickhle/hle/modules.h"
 
+#include <filesystem>
+#include <cctype>
 #include <string>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <optional>
 #include <vector>
 #include <utility>
 
@@ -44,16 +48,25 @@ constexpr const char* kFilesystemModule = "Filesytem";
 /// bad pointer.
 constexpr u32 kMaxPath = 256;
 
-std::string read_path(HleCallFrame& frame, GuestAddr address) {
+constexpr u32 kFileObjectResult = 0x08;
+
+std::optional<std::string> read_path_strict(HleCallFrame& frame,
+                                             GuestAddr address) {
     std::string out;
     for (u32 i = 0; i < kMaxPath; ++i) {
         const auto c = frame.memory.read<u8>(address + i);
-        if (!c.has_value() || *c == 0) {
-            break;
-        }
+        if (!c.has_value()) return std::nullopt;
+        if (*c == 0) return out;
         out.push_back(static_cast<char>(*c));
     }
-    return out;
+    return std::nullopt;
+}
+
+template <typename T>
+bool store_guest_or_stop(HleCallFrame& frame, GuestAddr address, T value) {
+    if (frame.store<T>(address, value)) return true;
+    frame.cpu.request_stop();
+    return false;
 }
 
 }  // namespace
@@ -70,9 +83,10 @@ constexpr u32 kSeekOffset = 0x0C;
 constexpr u32 kSeekWhence = 0x10;  ///< byte: 0 set, 1 current, 2 end
 constexpr u32 kBuffer = 0x14;
 constexpr u32 kLength = 0x18;
-constexpr u32 kStatus = 0x20;      ///< 0 on success, all ones on failure
+constexpr u32 kStatus = 0x20;      ///< 0 on success; failure uses op-specific status
 constexpr u32 kSizeResult = 0x24;
 constexpr u32 kPositionResult = 0x28;
+constexpr u32 kDirectoryCount = 0x28;  ///< completed AsyncFileIO#7 entries
 /// Where the firmware leaves the handle for the game to cache. Later requests
 /// are resolved through *this* field, not through the file object, so an open
 /// that does not write it leaves the 0xffffffff the game put there and every
@@ -80,23 +94,15 @@ constexpr u32 kPositionResult = 0x28;
 constexpr u32 kHandle = 0x2C;
 }  // namespace request
 
-/// The file object's result word -- the result of the *operation*, which is not
-/// always the handle. For an open that loaded, it is how many bytes arrived.
-constexpr u32 kFileObjectResult = 0x08;
-
 constexpr u32 kFailure = 0xFFFFFFFFu;
 
-/// The save store's errno for a null handle argument (0x1016be30). The store
-/// slots (#12/#14/#16) are errno-style, 0 = success -- the opposite of the
-/// queued slots, which are boolean with 1 = accepted. Specific to #12 --
-/// #14/#16 have their own, different failure code (kStoreGenericFailure).
-constexpr u32 kStoreNullHandle = 0x13;
+/// #12 rejects a zero mode with 0x13. The store API is errno-style (0 =
+/// success), unlike the queued slots' boolean result. #14/#16 use 8 for an
+/// invalid slot instead.
+constexpr u32 kStoreInvalidMode = 0x13;
 
-/// #13-#16's own failure code, measured by oracle calling into the real
-/// firmware on a warm machine with no store (2026-09-19): #12 returns 0x13,
-/// #13-#16 return 8. Distinct from kStoreNullHandle (#12's own code) and
-/// from kFailure (the unrelated queued-slot completion-status sentinel) --
-/// conflating either with this one would misreport #14/#16's real errno.
+/// #13/#14/#16 invalid-index result. It is distinct from #12's zero-mode
+/// result and from kFailure, the unrelated queued-slot completion sentinel.
 constexpr u32 kStoreGenericFailure = 0x08;
 
 /// Dumps a request object.
@@ -137,10 +143,24 @@ void register_fileio(HleRegistry& registry) {
     // indistinguishable to a game that polls its own state and finds the work
     // already done.
     registry.add(kModule, 3, "afio_open_alt", 3, [](HleCallFrame& f) {
-        const u32 mode = f.args.next_u32();
+        const u32 mode = f.args.next_u32() & 0xFFu;
         const GuestAddr path_address = f.args.next_ptr();
         const GuestAddr req = f.args.next_ptr();
-        const std::string path = read_path(f, path_address);
+        const auto operation = f.memory.read<u8>(req + request::kOperation);
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (path_address == 0 || *operation != 6) {
+            f.ret(0);
+            return;
+        }
+        const auto path_value = read_path_strict(f, path_address);
+        if (!path_value.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        const std::string& path = *path_value;
         // The whole request, once per open. Cheap, and the alternative is
         // guessing which field mattered.
         {
@@ -192,17 +212,55 @@ void register_fileio(HleRegistry& registry) {
         // save ("savefile.dat", "pac_man.dat", "jdmgp.sav"). A save is opened
         // for update, not for writing -- see Vfs::Mode::kUpdate.
         const auto vfs_mode = mode == 0 ? Vfs::Mode::kRead : Vfs::Mode::kUpdate;
-        const u32 handle = f.emulator.vfs().open(path, vfs_mode);
+        Vfs& vfs = f.emulator.vfs();
+        const u32 handle = vfs.open(path, vfs_mode);
         if (handle == 0) {
-            f.store<u32>(req + request::kStatus, kFailure);
+            if (!store_guest_or_stop(f, req + request::kStatus, kFailure) ||
+                !store_guest_or_stop(f, req + request::kHandle, kFailure)) return;
             CLICKHLE_INFO(kCategory) << "open(\"" << path << "\") FAILED";
-            f.ret(0);
+            // The request passed the wrapper's opcode/path gates and would
+            // have been queued. Report accepted, then publish its failed
+            // completion just as the worker does.
+            f.emulator.queue_io_completion(req, path);
+            f.ret(1);
             return;
         }
 
-        Vfs& vfs = f.emulator.vfs();
+        // The SFX descriptor is created immediately before its WAV header is
+        // read. Retain the resolved asset on that handle so Audio#2 can play
+        // the actual sample; Audio#7's guest pointer is not a PCM address.
+        std::string extension = std::filesystem::path(path).extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char ch) {
+                           return static_cast<char>(std::tolower(ch));
+                       });
+        auto& audio = f.emulator.audio_state();
+        if ((extension == ".wav" || extension == ".m4a" ||
+             extension == ".mp3" || extension == ".aac" ||
+             extension == ".mp4" || extension == ".m4b" ||
+             extension == ".m4p" || extension == ".flac" ||
+             extension == ".ogg") &&
+            !audio.pending_sfx_assets.empty()) {
+            while (!audio.pending_sfx_assets.empty()) {
+                const u32 pending_handle = audio.pending_sfx_assets.front();
+                audio.pending_sfx_assets.pop_front();
+                const auto sound = audio.sounds.find(pending_handle);
+                if (sound == audio.sounds.end()) {
+                    continue;
+                }
+                sound->second.asset_path = vfs.resolve(path);
+                CLICKHLE_DEBUG(kCategory)
+                    << "bound WAV " << path << " to SFX handle "
+                    << pending_handle;
+                break;
+            }
+        }
+
         const i64 size = vfs.size(handle);
-        f.store<u32>(req + request::kHandle, handle);
+        if (!store_guest_or_stop(f, req + request::kHandle, handle) ||
+            !store_guest_or_stop(f, req + request::kStatus, 0u) ||
+            !store_guest_or_stop(f, req + request::kPositionResult,
+                                 static_cast<u32>(vfs.tell(handle)))) return;
 
         // An open that carries a destination buffer *is* the load.
         //
@@ -216,43 +274,36 @@ void register_fileio(HleRegistry& registry) {
         // Both modes load here. A save open carries an empty destination
         // buffer and expects its contents back, exactly as an asset open does.
         if (buffer.value_or(0) != 0 && length.value_or(0) != 0) {
-            std::vector<u8> bytes(*length);
-            loaded = vfs.read(handle, bytes.data(), *length);
-            for (i64 i = 0; i < loaded; ++i) {
-                f.store<u8>(*buffer + static_cast<u32>(i),
-                            bytes[static_cast<std::size_t>(i)]);
+            const i64 remaining = size - vfs.tell(handle);
+            const u32 wanted = remaining <= 0
+                                   ? 0u
+                                   : std::min<u32>(*length,
+                                                  static_cast<u32>(remaining));
+            std::vector<u8> bytes(wanted);
+            loaded = wanted == 0 ? 0 : vfs.read(handle, bytes.data(), wanted);
+            if (loaded > 0 &&
+                !f.memory.write_bytes(*buffer, bytes.data(),
+                                     static_cast<u32>(loaded))) {
+                loaded = -1;
             }
             CLICKHLE_DEBUG(kCategory)
                 << "open loaded " << loaded << " of " << *length
                 << " requested bytes";
         }
-        // The size result is what the operation produced: the bytes delivered
-        // when the open loaded, otherwise the file's size.
-        const u32 result =
-            loaded > 0 ? static_cast<u32>(loaded)
-                       : (size < 0 ? 0u : static_cast<u32>(size));
-        f.store<u32>(req + request::kSizeResult, result);
-        f.store<u32>(req + request::kPositionResult,
-                     static_cast<u32>(vfs.tell(handle)));
-        f.store<u32>(req + request::kStatus, 0);
+        // Opcode 6 is open + read + close. The read handler publishes the
+        // transferred byte count, but does not write the position field.
+        const u32 result = loaded < 0 ? 0u : static_cast<u32>(loaded);
+        if (!store_guest_or_stop(f, req + request::kSizeResult, result) ||
+            !store_guest_or_stop(f, req + request::kStatus,
+                                 loaded < 0 ? kFailure : 0u)) return;
 
-        // The file object's result word takes the *operation's* result. For an
-        // open that loaded, that is the byte count -- a title hands it on as an
-        // image size, so writing the handle here would tell the renderer its
-        // data is one byte long.
-        const auto object = f.memory.read<u32>(req + request::kFileObject);
-        if (object.has_value() && *object != 0) {
-            f.store<u32>(*object + kFileObjectResult, result);
-        }
+        (void)vfs.close(handle);
         CLICKHLE_INFO(kCategory)
-            << "open(\"" << path << "\") -> handle " << handle << ", " << size
-            << " bytes";
-        // The operation is done; tell the game so. Without this a title sits on
-        // its loading screen forever -- it is not polling anything, it is
-        // waiting to be called back.
-        f.emulator.queue_completion(req, "afio_open_alt(#3)");
-        // 1, not the handle -- boolean contract, see #0. 0x101da9cc returns 0
-        // at 0x101daa0c and 1 at 0x101daa50.
+            << "open/read/close(\"" << path << "\") -> handle " << handle
+            << ", " << size << " bytes, transferred " << loaded;
+        f.emulator.queue_io_completion(req, path);
+        // The wrapper returns whether it accepted the request, not the handle
+        // or the eventual operation status.
         f.ret(1);
     });
 
@@ -263,16 +314,24 @@ void register_fileio(HleRegistry& registry) {
     // contract and this is what advances it.
     registry.add(kModule, 2, "afio_read", 1, [](HleCallFrame& f) {
         const GuestAddr req = f.args.next_ptr();
-        const auto handle = f.memory.read<u32>(req + request::kHandle);
         const auto operation = f.memory.read<u8>(req + request::kOperation);
-        if (!handle.has_value() || !operation.has_value() ||
-            *handle == 0 || *handle == kFailure) {
-            f.store<u32>(req + request::kStatus, kFailure);
-            // 0 = refused, and it has to be. The error code belongs in the
-            // request's status word, never in r0: this path queues NO
-            // completion, so returning a truthy 0x1f told the guest the request
-            // had been accepted and then never called it back -- a guaranteed
-            // hang rather than a reported failure.
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        // RetailOS only accepts read, write, and seek request opcodes here. A
+        // refused request is not queued and the wrapper only returns 0; it does
+        // not write the request's completion status.
+        if (*operation != 3 && *operation != 4 && *operation != 5) {
+            f.ret(0);
+            return;
+        }
+        const auto handle = f.memory.read<u32>(req + request::kHandle);
+        if (!handle.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*handle == 0 || *handle == kFailure) {
             f.ret(0);
             return;
         }
@@ -295,7 +354,7 @@ void register_fileio(HleRegistry& registry) {
             constexpr u32 kBadWhence = 6;
             constexpr u32 kPastEnd = 5;
             if (from > 2) {
-                f.store<u32>(req + request::kStatus, kBadWhence);
+                if (!store_guest_or_stop(f, req + request::kStatus, kBadWhence)) return;
                 f.emulator.queue_io_completion(req, "");
                 // Accepted, then completed with an error -- so 1, with the code
                 // in the status word where the completion handler reads it.
@@ -313,7 +372,7 @@ void register_fileio(HleRegistry& registry) {
             if (target < 0 || (size >= 0 && target > size)) {
                 CLICKHLE_DEBUG(kCategory)
                     << "seek past end: " << target << " of " << size;
-                f.store<u32>(req + request::kStatus, kPastEnd);
+                if (!store_guest_or_stop(f, req + request::kStatus, kPastEnd)) return;
                 f.emulator.queue_io_completion(req, "");
                 // Accepted, completed with an error -- see the bad-whence arm.
                 f.ret(1);
@@ -335,15 +394,14 @@ void register_fileio(HleRegistry& registry) {
             //
             // Writing only the status is correct because that is what the
             // firmware does, which is the only justification it needs.
-            f.store<u32>(req + request::kStatus, ok ? 0u : kPastEnd);
+            if (!store_guest_or_stop(f, req + request::kStatus,
+                                     ok ? 0u : kPastEnd)) return;
             if (std::getenv("CLICKHLE_NO_SEEK_COMPLETION") == nullptr) {
                 f.emulator.queue_io_completion(req, "");
             }
-            // 1 on success, NOT 0.
-            //
-            // The firmware's afio_perform returns 1 when it has enqueued the
-            // operation and 0 when it refused it, and the guest tests that as a
-            // boolean: stream_seek only advances stream[0x108] to 2 `if (ok)`.
+            // The wrapper reports whether it accepted the request, not whether
+            // the worker's seek operation succeeded. The guest tests this as a
+            // boolean: stream_seek advances stream[0x108] only when accepted.
             //
             // Returning 0 for a successful seek meant Mahjong issued the seek,
             // was told the issue had FAILED, left its state at 0, and re-issued
@@ -351,7 +409,7 @@ void register_fileio(HleRegistry& registry) {
             // "state == 0" arm 594 times out of 594 and never once reached
             // case 2. Everything downstream was working; the game was simply
             // never told the request had been accepted.
-            f.ret(ok ? 1u : 0u);
+            f.ret(1);
             return;
         }
 
@@ -373,25 +431,32 @@ void register_fileio(HleRegistry& registry) {
             const auto buffer = f.memory.read<u32>(req + request::kBuffer);
             const auto length = f.memory.read<u32>(req + request::kLength);
             if (!buffer.has_value() || !length.has_value()) {
-                f.store<u32>(req + request::kStatus, kFailure);
-                f.ret(0);
+                if (!store_guest_or_stop(f, req + request::kStatus, kFailure)) return;
+                f.emulator.queue_io_completion(req, "");
+                f.ret(1);
                 return;
             }
             std::vector<u8> bytes(*length);
-            for (u32 i = 0; i < *length; ++i) {
-                bytes[i] = f.memory.read<u8>(*buffer + i).value_or(0);
+            if (*length != 0 &&
+                (*buffer == 0 ||
+                 !f.memory.read_bytes(*buffer, bytes.data(), *length))) {
+                if (!store_guest_or_stop(f, req + request::kStatus, kFailure)) return;
+                f.emulator.queue_io_completion(req, "");
+                f.ret(1);
+                return;
             }
             const i64 written = vfs.write(*handle, bytes.data(), *length);
             CLICKHLE_DEBUG(kCategory)
                 << "write " << written << " of " << *length
                 << " bytes on handle " << *handle;
-            f.store<u32>(req + request::kSizeResult,
-                         written < 0 ? 0u : static_cast<u32>(written));
+            if (!store_guest_or_stop(f, req + request::kSizeResult,
+                                     written < 0 ? 0u : static_cast<u32>(written))) return;
             // Op 4's extra step: it fetches the resulting file position into
             // +0x28 (0x1024c900), which is a write-shaped thing to want.
-            f.store<u32>(req + request::kPositionResult,
-                         static_cast<u32>(vfs.tell(*handle)));
-            f.store<u32>(req + request::kStatus, written < 0 ? kFailure : 0u);
+            if (!store_guest_or_stop(f, req + request::kPositionResult,
+                                     static_cast<u32>(vfs.tell(*handle))) ||
+                !store_guest_or_stop(f, req + request::kStatus,
+                                     written < 0 ? kFailure : 0u)) return;
             f.emulator.queue_io_completion(req, "");
             f.ret(1);
             return;
@@ -401,9 +466,13 @@ void register_fileio(HleRegistry& registry) {
         const auto buffer = f.memory.read<u32>(req + request::kBuffer);
         const auto length = f.memory.read<u32>(req + request::kLength);
         if (!buffer.has_value() || !length.has_value()) {
-            f.store<u32>(req + request::kStatus, kFailure);
-            // Refused, no completion queued -- 0. See the bad-handle arm.
-            f.ret(0);
+            if (!store_guest_or_stop(f, req + request::kStatus, kFailure)) return;
+            // The wrapper accepted this valid opcode/handle. Worker-side
+            // failures complete the request; they do not change that result.
+            if (std::getenv("CLICKHLE_NO_READ_COMPLETION") == nullptr) {
+                f.emulator.queue_io_completion(req, "");
+            }
+            f.ret(1);
             return;
         }
         // Clamp to what the file can actually supply BEFORE allocating.
@@ -433,9 +502,11 @@ void register_fileio(HleRegistry& registry) {
         if (got < 0) {
             CLICKHLE_WARN(kCategory)
                 << "afio_read: vfs read failed on handle " << *handle;
-            f.store<u32>(req + request::kStatus, kFailure);
-            // Refused, no completion queued -- 0. See the bad-handle arm.
-            f.ret(0);
+            if (!store_guest_or_stop(f, req + request::kStatus, kFailure)) return;
+            if (std::getenv("CLICKHLE_NO_READ_COMPLETION") == nullptr) {
+                f.emulator.queue_io_completion(req, "");
+            }
+            f.ret(1);
             return;
         }
         // Bulk copy, not a byte at a time. This loop was `f.store<u8>` per
@@ -449,19 +520,16 @@ void register_fileio(HleRegistry& registry) {
             CLICKHLE_WARN(kCategory)
                 << "afio_read: refusing " << got << " bytes to " << std::hex
                 << *buffer << std::dec << " -- outside guest memory";
-            f.store<u32>(req + request::kStatus, kFailure);
-            f.ret(0);
+            if (!store_guest_or_stop(f, req + request::kStatus, kFailure)) return;
+            if (std::getenv("CLICKHLE_NO_READ_COMPLETION") == nullptr) {
+                f.emulator.queue_io_completion(req, "");
+            }
+            f.ret(1);
             return;
         }
-        f.store<u32>(req + request::kSizeResult, static_cast<u32>(got));
-        f.store<u32>(req + request::kPositionResult,
-                     static_cast<u32>(vfs.tell(*handle)));
-        f.store<u32>(req + request::kStatus, 0);
-
-        const auto object = f.memory.read<u32>(req + request::kFileObject);
-        if (object.has_value() && *object != 0) {
-            f.store<u32>(*object + kFileObjectResult, static_cast<u32>(got));
-        }
+        if (!store_guest_or_stop(f, req + request::kSizeResult,
+                                 static_cast<u32>(got)) ||
+            !store_guest_or_stop(f, req + request::kStatus, 0u)) return;
         CLICKHLE_DEBUG(kCategory) << "read " << got << " bytes";
         // A read completes through the app+0x2c list, like an open. Mahjong
         // only reaches this call at all once its streaming open completes, and
@@ -501,13 +569,30 @@ void register_fileio(HleRegistry& registry) {
 
     registry.add(kModule, 1, "afio_close", 1, [](HleCallFrame& f) {
         const GuestAddr req = f.args.next_ptr();
+        const auto operation = f.memory.read<u8>(req + request::kOperation);
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*operation != 2) {
+            f.ret(0);
+            return;
+        }
         const auto handle = f.memory.read<u32>(req + request::kHandle);
+        if (!handle.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
         CLICKHLE_DEBUG(kCategory)
             << "afio_close: handle " << handle.value_or(0);
-        if (handle.has_value()) {
-            (void)f.emulator.vfs().close(*handle);
+        // The firmware wrapper accepts only opcode 2 and returns 0 without
+        // touching the request if the opcode or stream handle is invalid.
+        if (*handle == 0 || *handle == kFailure ||
+            !f.emulator.vfs().close(*handle)) {
+            f.ret(0);
+            return;
         }
-        f.store<u32>(req + request::kStatus, 0);
+        if (!store_guest_or_stop(f, req + request::kStatus, 0u)) return;
         // A close DOES need a completion, and suppressing it leaked every slot.
         //
         // The old note here said a close is not something a title waits on.
@@ -542,261 +627,491 @@ void register_fileio(HleRegistry& registry) {
         f.ret(1);
     });
 
-    // #4 carries the request in r2 rather than r0 and otherwise behaves as a
-    // close: complete it with nothing to do.
+    // #4(mode, path, request) accepts opcode 7: open, write, close.
     registry.add(kModule, 4, "afio_operation", 3, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        const GuestAddr req = f.args.next_ptr();
-        const auto handle = f.memory.read<u32>(req + request::kHandle);
-        if (handle.has_value()) {
-            (void)f.emulator.vfs().close(*handle);
-        }
-        f.store<u32>(req + request::kStatus, 0);
-        // Close-like, so no completion -- same reasoning as #1, and the same
-        // boolean return: 0x101daa58 returns 0 at 0x101daa9c and 1 at
-        // 0x101daae0.
-        f.ret(1);
-    });
-
-    // #0 afio_open(mode, path, flag, request) -- the four-argument open.
-    //
-    // The order matters and was wrong: the extra word is the *third* argument,
-    // not the first. Call sites across the corpus all read
-    // (0, "Sudoku.rlb", 1, request), (0, "jdmgsheets0", 1, request),
-    // (0, "Localization/en.lproj/text.strings", 1, request) -- mode first, then
-    // the path. Skipping a leading word instead read the path pointer as the
-    // mode and guest address 1 as the path, so every #0 open failed with an
-    // empty name, silently, once per frame forever.
-    registry.add(kModule, 0, "afio_open", 4, [](HleCallFrame& f) {
-        const u32 mode = f.args.next_u32();
+        const u32 mode = f.args.next_u32() & 0xFFu;
         const GuestAddr path_address = f.args.next_ptr();
-        (void)f.args.next_u32();
         const GuestAddr req = f.args.next_ptr();
-        const std::string path = read_path(f, path_address);
-        dump_request(f, req);
-        // mode 0 is an asset ("Strings.dta", "audio/bad.wav"); mode 1 is a
-        // save ("savefile.dat", "pac_man.dat", "jdmgp.sav"). A save is opened
-        // for update, not for writing -- see Vfs::Mode::kUpdate.
-        const auto vfs_mode = mode == 0 ? Vfs::Mode::kRead : Vfs::Mode::kUpdate;
-        Vfs& vfs = f.emulator.vfs();
-        const u32 handle = vfs.open(path, vfs_mode);
-        if (handle == 0) {
-            f.store<u32>(req + request::kStatus, kFailure);
-            // A failure is still a completion. A title that is never told its
-            // open failed retries it forever, which looks exactly like a hang.
-            CLICKHLE_INFO(kCategory) << "open4(\"" << path << "\") FAILED";
-            // No completion, and this is the difference between #0 and #3.
-        //
-        // #3 is "open and load" -- it carries a destination buffer and the data
-        // is there when it returns, so a completion is owed and titles wait for
-        // it. #0 is the streaming open: operation 1, no buffer, nothing
-        // transferred. Completing it claims a load finished that never started.
-        //
-        // Bisected rather than reasoned. Texas Hold'em issues 20 #3 completions
-        // and 2 #0 completions; suppressing only the #0 pair takes it from
-        // faulting at frame 38 to running all 60 and drawing 202 times, and
-        // Vortex from 6 draws to 180. No title in the corpus is worse without
-        // it, and the fault count across all 20 goes from 1 to 0.
-        //
-        // The shape of the failure fits: a title told a stream had finished
-        // loading walked a table it had not finished filling
-        // (ABI_FINDINGS section 41).
-        //
-        // Re-tested 2026-09-11: the *trampoline* completion changes nothing.
-        // The streaming open instead completes through the file-IO list on
-        // app+0x2c, which the frame driver publishes once per frame.
-        if (std::getenv("CLICKHLE_NO_OPEN_COMPLETION") == nullptr) {
-            f.emulator.queue_io_completion(req, path);
+        const auto operation = f.memory.read<u8>(req + request::kOperation);
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
         }
+        if (mode == 0 || path_address == 0 || *operation != 7) {
             f.ret(0);
             return;
         }
-        const i64 size = vfs.size(handle);
-        f.store<u32>(req + request::kHandle, handle);
-        i64 loaded = 0;
+        const auto path_value = read_path_strict(f, path_address);
+        if (!path_value.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        const std::string& path = *path_value;
+        Vfs& vfs = f.emulator.vfs();
+        const u32 handle = vfs.open(path, Vfs::Mode::kUpdate);
+        if (handle == 0) {
+            if (!store_guest_or_stop(f, req + request::kHandle, kFailure) ||
+                !store_guest_or_stop(f, req + request::kSizeResult, 0u) ||
+                !store_guest_or_stop(f, req + request::kPositionResult, 0u) ||
+                !store_guest_or_stop(f, req + request::kStatus, kFailure)) return;
+            f.emulator.queue_io_completion(req, path);
+            f.ret(1);
+            return;
+        }
+
+        if (!store_guest_or_stop(f, req + request::kHandle, handle)) return;
         const auto buffer = f.memory.read<u32>(req + request::kBuffer);
         const auto length = f.memory.read<u32>(req + request::kLength);
-        // Both modes load here. A save open carries an empty destination
-        // buffer and expects its contents back, exactly as an asset open does.
-        if (buffer.value_or(0) != 0 && length.value_or(0) != 0) {
+        i64 written = -1;
+        if (buffer.has_value() && length.has_value() &&
+            (*length == 0 || *buffer != 0)) {
             std::vector<u8> bytes(*length);
-            loaded = vfs.read(handle, bytes.data(), *length);
-            for (i64 i = 0; i < loaded; ++i) {
-                f.store<u8>(*buffer + static_cast<u32>(i),
-                            bytes[static_cast<std::size_t>(i)]);
+            if (*length == 0 ||
+                f.memory.read_bytes(*buffer, bytes.data(), *length)) {
+                written = vfs.write(handle, bytes.data(), *length);
             }
         }
-        // +0x24 is BYTES TRANSFERRED and is written by ops 3, 4, 6 and 7 --
-        // NOT by op 1. A game reads it as a byte count, so an open that
-        // transferred nothing must not claim the file's size arrived: Mahjong's
-        // completion handler takes `count = request[0x24]` and hands it to its
-        // own callback, so telling it 7,292,512 bytes landed when zero did is
-        // worse than telling it nothing.
-        const u32 result = loaded > 0 ? static_cast<u32>(loaded)
-                                      : (size < 0 ? 0u : static_cast<u32>(size));
-        // The two firmware readings conflict here and the working one wins.
-        //
-        // The LLE track's opcode table says +0x24 is written by ops 3/4/6/7 and
-        // not by op 1. The recompiler's *working* implementation sets it to the
-        // FILE SIZE on a bufferless open, commented as exactly that. Mahjong's
-        // completion handler reads `count = request[0x24]` and currently gets
-        // 0, then seeks and retries -- 592 times.
-        //
-        // A table derived by reading is weaker evidence than an implementation
-        // that runs the titles, so: bytes for a transfer, size for a bufferless
-        // open.
-        f.store<u32>(req + request::kSizeResult, result);
-        // An open does NOT write +0x28.
-        //
-        // The result reaches fileobject[0x08] by this handler writing it there
-        // directly, below -- which is what the recompiler's working
-        // implementation does. Writing +0x28 as well makes the guest's
-        // completion processor copy it a second time, and that is a regression:
-        // it faults Texas Hold'em at frame 36, the same fault as section 45.
-        //
-        // The courier at +0x28 is for operations whose result the open path
-        // does not deliver itself.
-        f.store<u32>(req + request::kStatus, 0);
-        const auto object = f.memory.read<u32>(req + request::kFileObject);
-        if (object.has_value() && *object != 0) {
-            f.store<u32>(*object + kFileObjectResult, result);
-        }
-        CLICKHLE_INFO(kCategory)
-            << "open4(\"" << path << "\") -> handle " << handle << ", "
-            << size << " bytes, loaded " << loaded;
-        // Same request contract as #3, so the same completion is owed.
-        // No completion, and this is the difference between #0 and #3.
-        //
-        // #3 is "open and load" -- it carries a destination buffer and the data
-        // is there when it returns, so a completion is owed and titles wait for
-        // it. #0 is the streaming open: operation 1, no buffer, nothing
-        // transferred. Completing it claims a load finished that never started.
-        //
-        // Bisected rather than reasoned. Texas Hold'em issues 20 #3 completions
-        // and 2 #0 completions; suppressing only the #0 pair takes it from
-        // faulting at frame 38 to running all 60 and drawing 202 times, and
-        // Vortex from 6 draws to 180. No title in the corpus is worse without
-        // it, and the fault count across all 20 goes from 1 to 0.
-        //
-        // The shape of the failure fits: a title told a stream had finished
-        // loading walked a table it had not finished filling
-        // (ABI_FINDINGS section 41).
-        //
-        // Re-tested 2026-09-11: the *trampoline* completion changes nothing.
-        // The streaming open instead completes through the file-IO list on
-        // app+0x2c, which the frame driver publishes once per frame.
-        if (std::getenv("CLICKHLE_NO_OPEN_COMPLETION") == nullptr) {
-            f.emulator.queue_io_completion(req, path);
-        }
-        // 1, not the handle. Every queued AsyncFileIO slot (#0-#4) returns a
-        // boolean: 1 accepted, 0 refused -- 0x101da410 returns 0 at 0x101da458
-        // and 1 at 0x101da498. The handle happens to be non-zero here, so the
-        // guest's boolean test passed by luck rather than by contract; the
-        // caller reads it as a flag and never as a handle, which it takes from
-        // request[0x2c].
+        if (!store_guest_or_stop(f, req + request::kSizeResult,
+                                 written < 0 ? 0u : static_cast<u32>(written)) ||
+            !store_guest_or_stop(f, req + request::kPositionResult,
+                                 static_cast<u32>(vfs.tell(handle))) ||
+            !store_guest_or_stop(f, req + request::kStatus,
+                                 written < 0 ? kFailure : 0u)) return;
+        (void)vfs.close(handle);
+        f.emulator.queue_io_completion(req, path);
+        // 1 means the composite request was accepted. Its status and byte
+        // count are delivered through the request completion.
         f.ret(1);
     });
 
-    // #7(mode, path, a3, out) -- a directory operation. iQuiz is the only
-    // caller in the corpus; it asks for "UserTrivia/Packs".
-    //
-    // CORRECTION (2026-09-13): the note here used to say that directory "does
-    // not exist in this corpus". It does. `UserTrivia/Packs/` ships with the
-    // title and is simply EMPTY -- which is a different thing, and the real
-    // device would answer it differently: "directory present, no entries"
-    // rather than "no such directory". We conflate the two.
-    //
-    // Kept as-is anyway, because it was measured NOT to be what blocks iQuiz.
-    // Sweeping the return value (0/1/2/-1) and writing the `out` struct made
-    // no difference at all: 900 draw calls and 2597 colours every time, the
-    // logo screen unchanged. So this is a correctness wart to fix when the
-    // ordinal's real contract is known, not the cause of the stall -- and
-    // guessing a contract for an out-struct we cannot verify is how the
-    // Settings#0 -50 regression happened.
-    //
-    // Live argument dump: CLICKHLE_DUMP_OPENDIR=1. Measured shape is
-    // mode=0, a3=null, out=<uninitialised 6-word struct we never write>.
-    registry.add(kModule, 7, "afio_open_directory", 4, [](HleCallFrame& f) {
-        const u32 mode = f.args.next_u32();
+    // #0 afio_open(mode, path, flag, request) -- streaming open.
+    registry.add(kModule, 0, "afio_open", 4, [](HleCallFrame& f) {
+        const u32 mode = f.args.next_u32() & 0xffu;
         const GuestAddr path_address = f.args.next_ptr();
-        const GuestAddr a3 = f.args.next_ptr();
-        const GuestAddr out = f.args.next_ptr();
-        const std::string path = read_path(f, path_address);
+        const u32 flag = f.args.next_u32() & 0xffu;
+        const GuestAddr req = f.args.next_ptr();
+        const auto operation = f.memory.read<u8>(req + request::kOperation);
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*operation != 1 || path_address == 0 ||
+            (mode == 0 && flag == 0)) {
+            f.ret(0);
+            return;
+        }
+        const auto path_value = read_path_strict(f, path_address);
+        if (!path_value.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        const std::string& path = *path_value;
+        dump_request(f, req);
+
+        Vfs& vfs = f.emulator.vfs();
+        const auto vfs_mode = mode == 0 ? Vfs::Mode::kRead : Vfs::Mode::kUpdate;
+        const u32 handle = vfs.open(path, vfs_mode);
+        if (handle == 0) {
+            if (!store_guest_or_stop(f, req + request::kHandle, kFailure) ||
+                !store_guest_or_stop(f, req + request::kStatus, 0x17u)) return;
+            CLICKHLE_INFO(kCategory) << "open4(\"" << path << "\") FAILED";
+            if (std::getenv("CLICKHLE_NO_OPEN_COMPLETION") == nullptr) {
+                f.emulator.queue_io_completion(req, path);
+            }
+            f.ret(1);
+            return;
+        }
+
+        const i64 size = vfs.size(handle);
+        if (!store_guest_or_stop(f, req + request::kHandle, handle)) return;
+        i64 loaded = 0;
+        const auto buffer = f.memory.read<u32>(req + request::kBuffer);
+        const auto length = f.memory.read<u32>(req + request::kLength);
+        if (buffer.value_or(0) != 0 && length.value_or(0) != 0) {
+            const i64 remaining = size - vfs.tell(handle);
+            const u32 wanted = remaining <= 0
+                                   ? 0u
+                                   : std::min<u32>(*length,
+                                                  static_cast<u32>(remaining));
+            std::vector<u8> bytes(wanted);
+            loaded = wanted == 0 ? 0 : vfs.read(handle, bytes.data(), wanted);
+            if (loaded > 0 &&
+                !f.memory.write_bytes(*buffer, bytes.data(),
+                                     static_cast<u32>(loaded))) {
+                loaded = -1;
+            }
+        }
+        const u32 result = loaded > 0
+                               ? static_cast<u32>(loaded)
+                               : (size < 0 ? 0u : static_cast<u32>(size));
+        if (!store_guest_or_stop(f, req + request::kSizeResult, result) ||
+            !store_guest_or_stop(f, req + request::kStatus,
+                                 loaded < 0 ? kFailure : 0u)) return;
+
+        // RetailOS leaves request+0x28 alone on open. Its result is published
+        // through fileobject+0x08, which the game's stream reader uses to size
+        // the next read. Omitting that field leaves the stream waiting forever.
+        const auto object = f.memory.read<u32>(req + request::kFileObject);
+        if (object.has_value() && *object != 0 &&
+            !store_guest_or_stop(f, *object + kFileObjectResult, result)) return;
+
+        CLICKHLE_INFO(kCategory)
+            << "open4(\"" << path << "\") -> handle " << handle
+            << ", " << size << " bytes, loaded " << loaded;
+        if (std::getenv("CLICKHLE_NO_OPEN_COMPLETION") == nullptr) {
+            f.emulator.queue_io_completion(req, path);
+        }
+        f.ret(1);
+    });
+
+    // #7 opens a directory and queues its names for #9. RetailOS caps the
+    // result list at 500 entries and writes its count at request+0x28.
+    // iQuiz currently supplies mode 0 and flags 0 for UserTrivia/Packs.
+    registry.add(kModule, 7, "afio_open_directory", 4, [](HleCallFrame& f) {
+        const u32 mode = f.args.next_u32() & 0xFFu;
+        const GuestAddr path_address = f.args.next_ptr();
+        const u32 flags = f.args.next_u32();
+        const GuestAddr req = f.args.next_ptr();
+        const auto operation = f.memory.read<u8>(req + request::kOperation);
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*operation != 10 || path_address == kNullGuest) {
+            f.ret(0);
+            return;
+        }
+        const auto path_value = read_path_strict(f, path_address);
+        if (!path_value.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        const std::string& path = *path_value;
+
+        Vfs& vfs = f.emulator.vfs();
+        const std::filesystem::path& root =
+            mode == 0 ? vfs.root() : vfs.save_root();
+        const std::filesystem::path host_path = vfs.resolve_under(root, path);
+        std::error_code error;
+        if (host_path.empty() ||
+            !std::filesystem::is_directory(host_path, error) || error) {
+            f.ret(0);
+            return;
+        }
+
+        constexpr u32 kMaximumEntries = 500;
+        Emulator::FilesystemState::DirectoryRequest directory;
+        directory.path = path;
+        directory.mode = static_cast<u8>(mode);
+        directory.flags = static_cast<u8>(flags);
+        for (std::filesystem::directory_iterator it(host_path, error), end;
+             !error && it != end; it.increment(error)) {
+            if (directory.entries.size() == kMaximumEntries) {
+                break;
+            }
+            std::error_code type_error;
+            const bool is_directory = it->is_directory(type_error);
+            if (type_error) {
+                error = type_error;
+                break;
+            }
+            directory.entries.push_back(
+                {it->path().filename().string(),
+                 static_cast<u8>(is_directory ? 1 : 0)});
+        }
+        if (error) {
+            f.ret(0);
+            return;
+        }
+
+        const u32 status = directory.entries.size() == kMaximumEntries
+                                ? 0x12u
+                                : 0u;
+        auto& directories = f.emulator.filesystem_state().directories;
+        const u32 handle = static_cast<u32>(directories.size());
+        if (!store_guest_or_stop(f, req + request::kStatus, status) ||
+            !store_guest_or_stop(f, req + request::kDirectoryCount,
+                                 static_cast<u32>(directory.entries.size()))) {
+            return;
+        }
+        directories.push_back(std::move(directory));
+        if (!f.store<u32>(req + request::kHandle, handle)) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.emulator.queue_io_completion(req, path);
         if (std::getenv("CLICKHLE_DUMP_OPENDIR") != nullptr) {
             CLICKHLE_INFO(kCategory)
                 << "open_directory(\"" << path << "\") mode=" << mode
-                << " a3=0x" << std::hex << a3 << " out=0x" << out << std::dec;
+                << " flags=0x" << std::hex << flags << " request=0x" << req
+                << " handle=" << std::dec << handle;
         }
         CLICKHLE_DEBUG(kCategory)
-            << "open_directory(\"" << path << "\") -> none";
+            << "open_directory(\"" << path << "\") -> handle " << handle
+            << ", " << directories.back().entries.size() << " entries";
+        f.ret(1);
+    });
+
+    // #9 returns one NUL-terminated directory name per poll. Its status byte
+    // identifies the entry type; RetailOS returns 0 while more entries remain,
+    // 1 on the final/empty result, 4 for a missing queue slot, and 0x17 when
+    // the caller's buffer is too small.
+    registry.add(kModule, 9, "afio_poll_directory", 4, [](HleCallFrame& f) {
+        const u32 slot = f.args.next_u32();
+        const GuestAddr buffer = f.args.next_ptr();
+        const u32 capacity = f.args.next_u32();
+        const GuestAddr type_out = f.args.next_ptr();
+
+        auto& directories = f.emulator.filesystem_state().directories;
+        if (slot >= directories.size()) {
+            f.ret(4);
+            return;
+        }
+
+        auto& directory = directories[slot];
+        if (directory.completed ||
+            directory.next_entry >= directory.entries.size()) {
+            directory.completed = true;
+            CLICKHLE_DEBUG(kCategory)
+                << "poll_directory slot " << slot << " -> complete";
+            f.ret(1);
+            return;
+        }
+
+        // RetailOS marks a queue record complete before checking the caller's
+        // capacity, so a short-buffer result is followed by a completed poll.
+        directory.completed = true;
+        const auto& entry = directory.entries[directory.next_entry];
+        const u32 required = static_cast<u32>(entry.name.size() + 1);
+        if (capacity < required) {
+            CLICKHLE_DEBUG(kCategory)
+                << "poll_directory slot " << slot << " buffer too small: "
+                << capacity << " < " << required;
+            f.ret(0x17);
+            return;
+        }
+
+        std::vector<u8> name(required);
+        std::copy(entry.name.begin(), entry.name.end(), name.begin());
+        name.back() = 0;
+        if (buffer == kNullGuest || type_out == kNullGuest ||
+            !f.memory.write_bytes(buffer, name.data(), required) ||
+            !store_guest_or_stop(f, type_out, entry.type)) {
+            f.cpu.request_stop();
+            return;
+        }
+        ++directory.next_entry;
+        directory.completed =
+            directory.next_entry >= directory.entries.size();
+        CLICKHLE_DEBUG(kCategory)
+            << "poll_directory slot " << slot << " -> \"" << entry.name
+            << "\" type " << static_cast<u32>(entry.type)
+            << (directory.completed ? " (last)" : "");
+        f.ret(directory.completed ? 1u : 0u);
+    });
+
+    // The save store uses four indexed entries. #12 opens a name and writes
+    // the selected slot index through its third argument; #13 retains a slot,
+    // #14 releases it, #15 reads at an absolute or current-relative offset,
+    // and #16 replaces its stored bytes. The VFS backs persistent bytes,
+    // while indices, positions, and reference counts are per app.
+    registry.add(kModule, 12, "afio_store_open", 3, [](HleCallFrame& f) {
+        const u32 mode = f.args.next_u32() & 0xFFu;
+        const GuestAddr path_address = f.args.next_ptr();
+        const GuestAddr out = f.args.next_ptr();
+        if (mode == 0) {
+            f.ret(kStoreInvalidMode);
+            return;
+        }
+        const auto path_value = read_path_strict(f, path_address);
+        if (!path_value) {
+            f.cpu.request_stop();
+            return;
+        }
+        const std::string& path = *path_value;
+
+        auto& stores = f.emulator.filesystem_state().stores;
+        for (u32 i = 0; i < stores.size(); ++i) {
+            if (stores[i].references != 0 && stores[i].path == path) {
+                ++stores[i].references;
+                if (!f.store<u32>(out, i)) {
+                    f.cpu.request_stop();
+                    return;
+                }
+                f.ret(0);
+                return;
+            }
+        }
+        for (u32 i = 0; i < stores.size(); ++i) {
+            if (stores[i].references == 0) {
+                std::vector<u8> data;
+                const u32 file = f.emulator.vfs().open(path, Vfs::Mode::kRead);
+                if (file != 0) {
+                    const i64 file_size = f.emulator.vfs().size(file);
+                    if (file_size < 0 || file_size > 0x19000u) {
+                        (void)f.emulator.vfs().close(file);
+                        f.ret(0x17);
+                        return;
+                    }
+                    data.resize(static_cast<std::size_t>(file_size));
+                    if (file_size != 0 &&
+                        f.emulator.vfs().read(file, data.data(),
+                                              static_cast<u32>(file_size)) !=
+                            file_size) {
+                        (void)f.emulator.vfs().close(file);
+                        f.ret(0x17);
+                        return;
+                    }
+                    (void)f.emulator.vfs().close(file);
+                }
+                const u64 total = static_cast<u64>(f.emulator.filesystem_state().store_bytes) +
+                                  data.size();
+                if (total > 0x19000u) {
+                    f.ret(0x17);
+                    return;
+                }
+                stores[i].path = path;
+                stores[i].references = 1;
+                stores[i].size = static_cast<u32>(data.size());
+                stores[i].position = 0;
+                stores[i].data = std::move(data);
+                f.emulator.filesystem_state().store_bytes =
+                    static_cast<u32>(total);
+                if (!f.store<u32>(out, i)) {
+                    f.cpu.request_stop();
+                    return;
+                }
+                CLICKHLE_INFO(kCategory) << "store_open(\"" << path
+                                         << "\") -> slot " << i;
+                f.ret(0);
+                return;
+            }
+        }
+        f.ret(0x17);
+    });
+
+    registry.add(kModule, 13, "afio_store_retain", 1, [](HleCallFrame& f) {
+        const u32 slot = f.args.next_u32();
+        auto& stores = f.emulator.filesystem_state().stores;
+        if (slot >= stores.size() || stores[slot].references == 0) {
+            f.ret(kStoreGenericFailure);
+            return;
+        }
+        ++stores[slot].references;
         f.ret(0);
     });
 
-    // The save store: #12/#14/#16.
-    //
-    // Separate from the asset filesystem -- a place a title keeps its progress,
-    // which is what Sudoku opening "savefile.dat" in write mode is. Handled
-    // through the same VFS, so a save lands in the game's own directory beside
-    // its assets, exactly where the device would put it.
-    registry.add(kModule, 12, "afio_store_open", 3, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        const GuestAddr path_address = f.args.next_ptr();
-        (void)f.args.next_u32();
-        const std::string path = read_path(f, path_address);
-        const u32 handle = f.emulator.vfs().open(path, Vfs::Mode::kWrite);
-        CLICKHLE_INFO(kCategory)
-            << "store_open(\"" << path << "\") -> "
-            << (handle != 0 ? "ok" : "FAILED");
-        // ERRNO, 0 = SUCCESS -- the opposite of the queued slots, and the
-        // fourth time this ABI's return conventions have cost a blocker.
-        //
-        // `AsyncFileIO` has two opposite conventions in one interface: #0-#4 are
-        // boolean with 1 = accepted, while the save store (#12/#14/#16) goes
-        // through 0x1016bd44 instead of the IO context and returns errno-style
-        // codes -- 0 on success, 0x13 when the handle argument is null
-        // (0x1016be24). Returning the VFS handle here meant every successful
-        // open handed the guest a non-zero value, which it reads as an error
-        // code, so it retried forever: 199 opens against 34 closes, with
-        // store_open("en/stats") repeating to the end of the run.
-        //
-        // OPEN QUESTION, deliberately not guessed at: where the handle is
-        // supposed to be published. It cannot be r0 if r0 is an errno, so there
-        // is an out-parameter we are not writing. The argument read above
-        // demonstrably yields correct paths, so the layout is not simply
-        // shifted. Fixing the return is the part the evidence supports; if
-        // store_write then fails on a bad handle, that identifies the
-        // out-parameter and is the next thing to chase.
-        // Investigation hook: make every store_open fail cleanly, to test
-        // whether the save path is the blocker or merely a symptom.
-        if (std::getenv("CLICKHLE_STORE_FAIL") != nullptr) {
-            f.ret(kStoreNullHandle);
+    registry.add(kModule, 14, "afio_store_close", 1, [](HleCallFrame& f) {
+        const u32 slot = f.args.next_u32();
+        auto& state = f.emulator.filesystem_state();
+        if (slot >= state.stores.size() ||
+            state.stores[slot].references == 0) {
+            f.ret(kStoreGenericFailure);
             return;
         }
-        f.ret(handle != 0 ? 0u : kStoreNullHandle);
+        auto& store = state.stores[slot];
+        --store.references;
+        if (store.references == 0) {
+            state.store_bytes -= store.size;
+            store = {};
+        }
+        f.ret(0);
     });
 
-    registry.add(kModule, 14, "afio_store_close", 1, [](HleCallFrame& f) {
-        const u32 handle = f.args.next_u32();
-        f.ret(f.emulator.vfs().close(handle) ? 0 : kStoreGenericFailure);
+    // #15(slot, destination, in/out byte_count, origin byte, offset) reads
+    // from the store object. origin 0 uses an absolute offset; origin 1 adds
+    // the supplied offset to the object's current position. RetailOS returns
+    // 8 for an invalid/uninitialized slot, 6 for an invalid origin or
+    // negative effective offset, 5 when the offset is at/past EOF, and 0 on
+    // success. At EOF the count pointer is not touched.
+    registry.add(kModule, 15, "afio_store_read", 5, [](HleCallFrame& f) {
+        const u32 slot = f.args.next_u32();
+        const GuestAddr destination = f.args.next_ptr();
+        const GuestAddr count_address = f.args.next_ptr();
+        const u32 origin = f.args.next_u32() & 0xFFu;
+        const u32 requested_offset = f.args.next_u32();
+        auto& stores = f.emulator.filesystem_state().stores;
+        if (slot >= stores.size() || stores[slot].references == 0) {
+            f.ret(kStoreGenericFailure);
+            return;
+        }
+        auto& store = stores[slot];
+        if (origin > 1) {
+            f.ret(6);
+            return;
+        }
+        const i64 offset = static_cast<i64>(requested_offset) +
+                           (origin == 1 ? store.position : 0);
+        if (offset < 0 || offset > std::numeric_limits<i32>::max()) {
+            f.ret(6);
+            return;
+        }
+        if (static_cast<u64>(offset) >= store.size) {
+            f.ret(5);
+            return;
+        }
+        const auto count = f.memory.read<u32>(count_address);
+        if (!count) {
+            f.cpu.request_stop();
+            return;
+        }
+        const u32 available = store.size - static_cast<u32>(offset);
+        const u32 length = std::min(*count, available);
+        if (length != *count && !f.store<u32>(count_address, length)) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (length != 0 &&
+            (store.data.size() < store.size ||
+             !f.memory.write_bytes(destination, store.data.data() + offset,
+                                   length))) {
+            f.cpu.request_stop();
+            return;
+        }
+        store.position = static_cast<u32>(offset) + length;
+        f.ret(0);
     });
 
     registry.add(kModule, 16, "afio_store_write", 3, [](HleCallFrame& f) {
-        const u32 handle = f.args.next_u32();
+        const u32 slot = f.args.next_u32();
         const GuestAddr buffer = f.args.next_ptr();
         const u32 length = f.args.next_u32();
-        std::vector<u8> bytes(length);
-        for (u32 i = 0; i < length; ++i) {
-            bytes[i] = f.memory.read<u8>(buffer + i).value_or(0);
+        auto& state = f.emulator.filesystem_state();
+        if (slot >= state.stores.size() ||
+            state.stores[slot].references == 0) {
+            f.ret(kStoreGenericFailure);
+            return;
         }
-        const i64 written = f.emulator.vfs().write(handle, bytes.data(), length);
-        CLICKHLE_DEBUG(kCategory) << "store_write " << written << " bytes";
-        // Errno, 0 = success -- same group as #12, NOT a byte count. Returning
-        // the number written meant every successful write of N bytes reported
-        // error N. Failure code is #14-#16's own (kStoreGenericFailure, = 8),
-        // NOT #12's kStoreNullHandle (0x13) -- oracle measured these as two
-        // different codes, 2026-09-19.
-        f.ret(written < 0 ? kStoreGenericFailure : 0u);
+        const u64 total = static_cast<u64>(state.store_bytes) -
+                          state.stores[slot].size + length;
+        if (total > 0x19000u || (length != 0 && buffer == kNullGuest)) {
+            f.ret(0x17);
+            return;
+        }
+        std::vector<u8> bytes(length);
+        if (length != 0 && !f.memory.read_bytes(buffer, bytes.data(), length)) {
+            f.ret(0x17);
+            return;
+        }
+        const std::string path = state.stores[slot].path;
+        const u32 host_handle = f.emulator.vfs().open(path, Vfs::Mode::kWrite);
+        if (host_handle == 0) {
+            f.ret(0x17);
+            return;
+        }
+        const i64 written = f.emulator.vfs().write(host_handle, bytes.data(), length);
+        (void)f.emulator.vfs().close(host_handle);
+        if (written < 0 || static_cast<u32>(written) != length) {
+            f.ret(0x17);
+            return;
+        }
+        state.store_bytes = static_cast<u32>(total);
+        state.stores[slot].size = length;
+        state.stores[slot].data = std::move(bytes);
+        state.stores[slot].position = 0;
+        CLICKHLE_DEBUG(kCategory) << "store_write slot " << slot << ": "
+                                  << length << " bytes";
+        f.ret(0);
     });
 
     // --- "Filesytem" (Apple's spelling) -------------------------------------
@@ -815,62 +1130,98 @@ void register_fileio(HleRegistry& registry) {
     // implementation detail: an eleventh open has nowhere to go, and a title
     // that hits it on hardware would get a failure we would otherwise not give.
     static constexpr u32 kFsSlots = 10;
-    // #0 returns 0x17 when the open fails. #2 and #3's bad-handle codes were
-    // an unconfirmed placeholder (0x20) until oracle called both directly
-    // against real firmware (2026-09-19, no arguments, a cold handle table):
-    // #2 (read) returns 0x02, #3 (size) returns 0x13. The two differ -- a
-    // read and a size query do not fail alike -- so they get separate
-    // constants rather than sharing one. #3's 0x13 is bit-identical to
-    // kStoreNullHandle, AsyncFileIO#12's own failure code: two unrelated
-    // interfaces producing the same non-obvious value, which reads like a
-    // shared system errno space rather than coincidence.
+    // #0 returns 0x17 when open fails. A nonzero handle absent from the
+    // ten-entry table returns 0x20 in both #2 and #3. An oracle probe using
+    // handle 0 on a cold table instead matched the first empty slot and
+    // reached the inner file method: it returned 0x02 for read and 0x13 for
+    // write. Keep those inner-method errors distinct from the wrapper's table
+    // miss; zero is also the table's empty-slot value.
     static constexpr u32 kFsOpenFailed = 0x17;
-    static constexpr u32 kFsReadBadHandle = 0x02;
-    static constexpr u32 kFsSizeBadHandle = kStoreNullHandle;
-    static std::vector<u32> fs_table;
-    fs_table.assign(kFsSlots, 0);
+    static constexpr u32 kFsTableMiss = 0x20;
+    static constexpr u32 kFsReadNullObject = 0x02;
+    static constexpr u32 kFsWriteDenied = 0x13;
 
     registry.add(kFilesystemModule, 0, "fs_open", 4, [](HleCallFrame& f) {
-        const u32 mode = f.args.next_u32();
+        const u32 namespace_id = f.args.next_u32() & 0xFFu;
         const GuestAddr path_address = f.args.next_ptr();
-        (void)f.args.next_u32();
+        const u32 access_flag = f.args.next_u32() & 0xFFu;
         const GuestAddr out = f.args.next_ptr();
-        const std::string path = read_path(f, path_address);
 
-        // The handle goes out through the fourth argument; the *return value is
-        // a status*. We had been returning the handle, which a title checking
-        // for zero-means-success reads as a failure on every successful open.
+        // RetailOS initializes *out before it even scans the handle table or
+        // dereferences the path. Do not turn an invalid output pointer into a
+        // recoverable open error, and do not open a host file after that fault.
+        if (!f.store<u32>(out, 0)) {
+            f.cpu.request_stop();
+            return;
+        }
+
+        auto& fs_table = f.emulator.filesystem_state().handles;
         std::size_t slot = 0;
         while (slot < kFsSlots && fs_table[slot] != 0) {
             ++slot;
         }
         if (slot == kFsSlots) {
             CLICKHLE_WARN(kCategory)
-                << "fs_open(\"" << path << "\"): all " << kFsSlots
+                << "fs_open: all " << kFsSlots
                 << " handle slots are in use, as on hardware";
-            if (out != kNullGuest) {
-                f.store<u32>(out, 0);
-            }
             f.ret(kFsOpenFailed);
             return;
         }
 
-        // mode 0 is an asset ("Strings.dta", "audio/bad.wav"); mode 1 is a
-        // save ("savefile.dat", "pac_man.dat", "jdmgp.sav"). A save is opened
-        // for update, not for writing -- see Vfs::Mode::kUpdate.
-        const auto vfs_mode = mode == 0 ? Vfs::Mode::kRead : Vfs::Mode::kUpdate;
-        const u32 handle = f.emulator.vfs().open(path, vfs_mode);
-        if (out != kNullGuest) {
-            f.store<u32>(out, handle);
+        // The firmware's path helper reads until NUL. Bound that walk for a
+        // corrupt guest pointer, but preserve its fault behavior instead of
+        // treating an unmapped or unterminated path as an empty filename.
+        std::string path;
+        bool terminated = false;
+        for (u32 i = 0; i < kMaxPath; ++i) {
+            const auto c = f.memory.read<u8>(path_address + i);
+            if (!c.has_value()) {
+                f.cpu.request_stop();
+                return;
+            }
+            if (*c == 0) {
+                terminated = true;
+                break;
+            }
+            path.push_back(static_cast<char>(*c));
         }
+        if (!terminated) {
+            f.cpu.request_stop();
+            return;
+        }
+        // The first argument selects the firmware path namespace: 0 is
+        // games_RO, 1 is gamedata_RW, and 2 is gamestats_WO. The third
+        // argument is a separate file-object access flag; the inner writer
+        // returns 0x13 whenever it is nonzero.
+        Vfs::Mode vfs_mode = Vfs::Mode::kRead;
+        const char* namespace_name = "unknown";
+        if (namespace_id == 0) {
+            namespace_name = "games_RO";
+        } else if (namespace_id == 1) {
+            namespace_name = "gamedata_RW";
+            vfs_mode = Vfs::Mode::kUpdate;
+        } else if (namespace_id == 2) {
+            namespace_name = "gamestats_WO";
+            vfs_mode = Vfs::Mode::kWrite;
+        }
+        const bool allow_write = namespace_id != 0 && access_flag == 0;
+        const u32 handle = f.emulator.vfs().open(path, vfs_mode, allow_write);
         if (handle == 0) {
             CLICKHLE_INFO(kCategory)
                 << "fs_open(\"" << path << "\") -> MISSING";
             f.ret(kFsOpenFailed);
             return;
         }
+        // The successful object is installed in the global table before the
+        // wrapper publishes its handle through argument 4.
         fs_table[slot] = handle;
-        CLICKHLE_INFO(kCategory) << "fs_open(\"" << path << "\") -> ok";
+        if (!f.store<u32>(out, handle)) {
+            f.cpu.request_stop();
+            return;
+        }
+        CLICKHLE_INFO(kCategory) << "fs_open[" << namespace_name << "](\""
+                                 << path << "\", access=" << access_flag
+                                 << ") -> ok";
         f.ret(0);
     });
 
@@ -903,10 +1254,12 @@ void register_fileio(HleRegistry& registry) {
     // AFTER the ordinal boundary, and the ordinal's own signature is the
     // natural one -- which is what a caller can actually see.
     //
-    // NOT applied to #3 (fs_size): its claimed layout carries the same
-    // unverified swap, but no title in the corpus calls it, so there is no
-    // evidence either way and guessing symmetrically would repeat exactly the
-    // mistake this comment documents.
+    // #3's writer also receives the same public `(handle, buffer, length,
+    // out)` ordering: its export performs the same internal argument swap,
+    // and the target's decompilation identifies arg3 as the byte count and
+    // arg2 as the source buffer. It has no runtime caller in the current
+    // corpus, so this part is firmware-structure evidence rather than a title
+    // observation.
     registry.add(kFilesystemModule, 2, "fs_read", 4, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
         const u32 arg2 = f.args.next_u32();
@@ -919,23 +1272,29 @@ void register_fileio(HleRegistry& registry) {
         }
         const GuestAddr buffer = arg2;
         const u32 length = arg3;
+        const auto& fs_table = f.emulator.filesystem_state().handles;
         if (std::find(fs_table.begin(), fs_table.end(), handle) ==
             fs_table.end()) {
-            f.ret(kFsReadBadHandle);
+            f.ret(kFsTableMiss);
             return;
         }
+        // The inner RetailOS method clears the byte-count output before it
+        // checks the file object or performs the read. It dereferences this
+        // pointer unconditionally; a null/unmapped output is a guest memory
+        // fault, not an omitted optional result.
+        if (!store_guest_or_stop(f, out, 0u)) return;
         std::vector<u8> bytes(length);
         const i64 got = f.emulator.vfs().read(handle, bytes.data(), length);
         for (i64 i = 0; i < got; ++i) {
-            f.store<u8>(buffer + static_cast<u32>(i),
-                        bytes[static_cast<std::size_t>(i)]);
+            if (!store_guest_or_stop(
+                    f, buffer + static_cast<u32>(i),
+                    bytes[static_cast<std::size_t>(i)])) return;
         }
-        if (out != kNullGuest) {
-            f.store<u32>(out, got < 0 ? 0u : static_cast<u32>(got));
-        }
+        if (!store_guest_or_stop(f, out,
+                                 got < 0 ? 0u : static_cast<u32>(got))) return;
         CLICKHLE_DEBUG(kCategory)
             << "fs_read(" << handle << ", " << length << ") -> " << got;
-        f.ret(got < 0 ? kFsReadBadHandle : 0u);
+        f.ret(got < 0 ? kFsReadNullObject : 0u);
     });
 
     registry.add(kFilesystemModule, 1, "fs_close", 1, [](HleCallFrame& f) {
@@ -943,11 +1302,12 @@ void register_fileio(HleRegistry& registry) {
         // Free the table slot too, or the ten-handle ceiling becomes a
         // ten-open-ever limit and a title that opens and closes in a loop
         // starts failing partway through.
+        auto& fs_table = f.emulator.filesystem_state().handles;
         const auto slot = std::find(fs_table.begin(), fs_table.end(), handle);
         if (slot != fs_table.end()) {
             *slot = 0;
+            (void)f.emulator.vfs().close(handle);
         }
-        (void)f.emulator.vfs().close(handle);
         // VOID. It does not write r0 at all.
         //
         // Measured by the oracle against both RetailOS images, four inputs:
@@ -961,29 +1321,49 @@ void register_fileio(HleRegistry& registry) {
         f.ret_void();
     });
 
-    // #3(handle, a, out, d) -- four arguments, not two. The decompiled body
-    // references param_3 and param_4 by name, and it forwards (p1, p3, p2, p4)
-    // like #2, so the out-pointer is the *third* argument.
-    //
-    // Under-declaring this at 2 silently discarded two arguments the firmware
-    // reads. Argument layout is from the firmware decompile, not observed
-    // behaviour -- same caveat as #2. The failure return value is
-    // oracle-measured; see kFsSizeBadHandle above.
-    registry.add(kFilesystemModule, 3, "fs_size", 4, [](HleCallFrame& f) {
+    // #3(handle, buffer, length, out) writes bytes. The export forwards
+    // (handle, arg3, arg2, arg4) to the internal writer; its second argument
+    // is the byte count, third is the source buffer, and fourth receives the
+    // number written. This is the write-side twin of #2's read call.
+    registry.add(kFilesystemModule, 3, "fs_write", 4, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        (void)f.args.next_u32();
+        const GuestAddr buffer = f.args.next_ptr();
+        const u32 length = f.args.next_u32();
         const GuestAddr out = f.args.next_ptr();
-        (void)f.args.next_u32();
+        const auto& fs_table = f.emulator.filesystem_state().handles;
         if (std::find(fs_table.begin(), fs_table.end(), handle) ==
             fs_table.end()) {
-            f.ret(kFsSizeBadHandle);
+            f.ret(kFsTableMiss);
             return;
         }
-        const i64 size = f.emulator.vfs().size(handle);
-        if (out != kNullGuest) {
-            f.store<u32>(out, size < 0 ? 0u : static_cast<u32>(size));
+
+        // The inner writer initializes its byte-count output before checking
+        // the file's write mode. A null table entry is possible when the
+        // caller passes handle zero; it reaches the inner method and reports
+        // its observed write-denied status (0x13), unlike a nonzero table miss.
+        if (!store_guest_or_stop(f, out, 0u)) return;
+        Vfs& vfs = f.emulator.vfs();
+        if (!vfs.writable(handle)) {
+            f.ret(kFsWriteDenied);
+            return;
         }
-        f.ret(size < 0 ? kFsSizeBadHandle : 0u);
+        std::vector<u8> bytes(length);
+        if (length != 0 &&
+            (buffer == kNullGuest ||
+             !f.memory.read_bytes(buffer, bytes.data(), length))) {
+            // RetailOS passes the guest source directly to its copy/write
+            // path. An invalid guest address faults there; it is not the
+            // filesystem's write-denied status.
+            f.cpu.request_stop();
+            return;
+        }
+        const i64 written = vfs.write(handle, bytes.data(), length);
+        if (written < 0) {
+            f.ret(kFsWriteDenied);
+            return;
+        }
+        if (!store_guest_or_stop(f, out, static_cast<u32>(written))) return;
+        f.ret(0);
     });
 }
 

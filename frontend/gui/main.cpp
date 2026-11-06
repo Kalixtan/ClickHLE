@@ -12,16 +12,20 @@
 
 #include <QAction>
 #include <QActionGroup>
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QByteArray>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QDockWidget>
 #include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QHBoxLayout>
+#include <QHeaderView>
 #include <QImage>
-#include <QKeySequence>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -30,15 +34,18 @@
 #include <QMessageBox>
 #include <QPaintEvent>
 #include <QPainter>
-#include <QPushButton>
 #include <QPlainTextEdit>
+#include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
 #include <QStatusBar>
+#include <QStringList>
+#include <QTableWidget>
 #include <QTimer>
 #include <QToolBar>
 #include <QVBoxLayout>
 
+#include "clickhle/common/log.h"
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/modules.h"
 
@@ -99,6 +106,12 @@ public:
 
     void setFrame(QImage frame) {
         frame_ = std::move(frame);
+        if (!frame_.isNull()) message_.clear();
+        update();
+    }
+
+    void setMessage(QString message) {
+        message_ = std::move(message);
         update();
     }
 
@@ -115,8 +128,11 @@ protected:
         painter.fillRect(rect(), QColor(8, 10, 13));
         if (frame_.isNull()) {
             painter.setPen(QColor(145, 153, 165));
-            painter.drawText(rect(), Qt::AlignCenter,
-                             tr("Open a click-wheel game executable to begin"));
+            painter.drawText(rect().adjusted(24, 24, -24, -24),
+                             Qt::AlignCenter | Qt::TextWordWrap,
+                             message_.isEmpty()
+                                 ? tr("Open a click-wheel game executable to begin")
+                                 : message_);
             return;
         }
         QSize target = frame_.size();
@@ -138,12 +154,13 @@ protected:
 
 private:
     QImage frame_;
+    QString message_;
     bool integer_scaling_ = true;
 };
 
 class MainWindow final : public QMainWindow {
 public:
-    MainWindow() {
+    explicit MainWindow(QString startup_game = {}) {
         setWindowTitle(tr("ClickHLE"));
         resize(920, 700);
         canvas_ = new GameCanvas(this);
@@ -151,6 +168,7 @@ public:
         createActions();
         createMenus();
         createTools();
+        refreshTools();
         statusBar()->showMessage(tr("Ready — open a game executable"));
 
         frame_timer_ = new QTimer(this);
@@ -163,6 +181,11 @@ public:
         recent_games_ = settings.value(QStringLiteral("games/recent")).toStringList();
         rebuildRecentMenu();
         updateActions();
+        if (!startup_game.isEmpty()) {
+            QTimer::singleShot(0, this, [this, startup_game = std::move(startup_game)] {
+                loadGame(startup_game);
+            });
+        }
     }
 
     ~MainWindow() override {
@@ -261,7 +284,8 @@ private:
 
     void createMenus() {
         QMenuBar* bar = menuBar();
-        bar->setNativeMenuBar(true);
+        bar->setNativeMenuBar(false);
+        bar->setVisible(true);
 
         QMenu* file = bar->addMenu(tr("File"));
         file->addAction(open_action_);
@@ -296,10 +320,18 @@ private:
         dock->setAllowedAreas(Qt::NoDockWidgetArea);
         dock->setWidget(content);
         addDockWidget(Qt::RightDockWidgetArea, dock);
-        dock->setFloating(true);
-        dock->hide();
-        tools_menu_->addAction(dock->toggleViewAction());
-        debug_menu_->addAction(dock->toggleViewAction());
+        dock->setVisible(false);
+        QAction* view_action = dock->toggleViewAction();
+        view_action->setChecked(false);
+        connect(dock, &QDockWidget::visibilityChanged, this,
+                [this, dock](bool visible) {
+                    if (!visible) return;
+                    if (!dock->isFloating()) dock->setFloating(true);
+                    refreshTools();
+                    if (dock == memory_dock_) refreshMemory();
+                });
+        tools_menu_->addAction(view_action);
+        debug_menu_->addAction(view_action);
         return dock;
     }
 
@@ -328,12 +360,66 @@ private:
                 [this] { refreshMemory(); });
         connect(memory_address_, &QLineEdit::returnPressed, this,
                 [this] { refreshMemory(); });
-        makeTool(tr("Memory Viewer"), memory_panel);
+        memory_dock_ = makeTool(tr("Memory Viewer"), memory_panel);
 
         hle_view_ = new QPlainTextEdit;
         hle_view_->setReadOnly(true);
         hle_view_->setMinimumSize(400, 300);
-        makeTool(tr("HLE Activity"), hle_view_);
+        hle_dock_ = makeTool(tr("HLE Activity"), hle_view_);
+
+        auto* videocore_panel = new QWidget;
+        auto* videocore_layout = new QVBoxLayout(videocore_panel);
+        auto* videocore_controls = new QWidget(videocore_panel);
+        auto* videocore_control_layout = new QHBoxLayout(videocore_controls);
+        videocore_control_layout->setContentsMargins(0, 0, 0, 0);
+        videocore_trace_enabled_ = new QCheckBox(tr("Trace render-server calls"));
+        videocore_trace_enabled_->setChecked(true);
+        videocore_pause_on_call_ = new QCheckBox(tr("Pause after a call"));
+        auto* clear_videocore = new QPushButton(tr("Clear"), videocore_controls);
+        videocore_control_layout->addWidget(videocore_trace_enabled_);
+        videocore_control_layout->addWidget(videocore_pause_on_call_);
+        videocore_control_layout->addStretch();
+        videocore_control_layout->addWidget(clear_videocore);
+        videocore_layout->addWidget(videocore_controls);
+        auto* videocore_note = new QLabel(
+            tr("Watches ARM calls at the OpenGLES render-server boundary. "
+               "VideoCore instructions are not executed by this emulator."),
+            videocore_panel);
+        videocore_note->setWordWrap(true);
+        videocore_layout->addWidget(videocore_note);
+        videocore_table_ = new QTableWidget(0, 6, videocore_panel);
+        videocore_table_->setHorizontalHeaderLabels(
+            {tr("#"), tr("Frame"), tr("API"), tr("Return PC"),
+             tr("Arguments"), tr("Result")});
+        videocore_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        videocore_table_->setSelectionMode(QAbstractItemView::SingleSelection);
+        videocore_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        videocore_table_->horizontalHeader()->setStretchLastSection(true);
+        videocore_table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+        videocore_layout->addWidget(videocore_table_, 2);
+        videocore_detail_ = new QPlainTextEdit(videocore_panel);
+        videocore_detail_->setReadOnly(true);
+        videocore_detail_->setMaximumBlockCount(20);
+        videocore_detail_->setPlaceholderText(
+            tr("Select a call to inspect its arguments and payload."));
+        videocore_layout->addWidget(videocore_detail_, 1);
+        videocore_dock_ = makeTool(tr("RenderServer / VideoCore Watch"), videocore_panel);
+        connect(videocore_trace_enabled_, &QCheckBox::toggled, this,
+                [this](bool enabled) {
+                    if (emulator_) emulator_->set_videocore_trace_enabled(enabled);
+                });
+        connect(videocore_pause_on_call_, &QCheckBox::toggled, this,
+                [this](bool enabled) {
+                    if (emulator_) emulator_->set_videocore_pause_on_call(enabled);
+                });
+        connect(clear_videocore, &QPushButton::clicked, this, [this] {
+            if (emulator_) emulator_->clear_videocore_events();
+            videocore_last_sequence_ = 0;
+            videocore_table_->setRowCount(0);
+            videocore_detail_->clear();
+        });
+        connect(videocore_table_, &QTableWidget::itemSelectionChanged, this,
+                [this] { showSelectedVideoCoreEvent(); });
 
         map_view_ = new QPlainTextEdit;
         map_view_->setReadOnly(true);
@@ -357,6 +443,9 @@ private:
         frame_timer_->stop();
         emulator_.reset();
         current_game_.clear();
+        canvas_->setFrame({});
+        canvas_->setMessage(tr("Loading %1…").arg(QFileInfo(path).fileName()));
+        statusBar()->showMessage(tr("Loading %1…").arg(QFileInfo(path).fileName()));
         auto next = std::make_unique<Emulator>();
         next->display().set_headless(true);
         Emulator::Config config;
@@ -367,16 +456,27 @@ private:
             path_bytes, static_cast<std::size_t>(encoded_path.size())));
         std::string error;
         if (!next->load(std::move(config), &error)) {
+            const QString reason = QString::fromStdString(error);
+            const QString message = tr("Could not load %1\n\n%2")
+                                        .arg(QFileInfo(path).fileName(), reason);
+            canvas_->setMessage(message);
+            statusBar()->showMessage(message, 15000);
             appendLog(tr("Load failed: %1").arg(QString::fromStdString(error)));
             QMessageBox::critical(this, tr("Could Not Load Game"),
-                                  QString::fromStdString(error));
+                                  message);
             updateActions();
             return;
         }
         emulator_ = std::move(next);
+        emulator_->set_videocore_trace_enabled(videocore_trace_enabled_->isChecked());
+        emulator_->set_videocore_pause_on_call(videocore_pause_on_call_->isChecked());
+        videocore_last_sequence_ = 0;
+        videocore_table_->setRowCount(0);
+        videocore_detail_->clear();
         current_game_ = path;
         addRecent(path);
         canvas_->setFrame({});
+        canvas_->setMessage(tr("Game loaded. Waiting for the first frame…"));
         appendLog(tr("Loaded %1").arg(QFileInfo(path).fileName()));
         updateActions();
         resumeGame();
@@ -388,6 +488,7 @@ private:
         emulator_.reset();
         current_game_.clear();
         canvas_->setFrame({});
+        canvas_->setMessage({});
         statusBar()->showMessage(tr("Game closed"));
         updateActions();
         refreshTools();
@@ -400,6 +501,9 @@ private:
     void pauseGame() {
         if (!emulator_) return;
         frame_timer_->stop();
+        if (emulator_->audio() != nullptr) {
+            emulator_->audio()->set_paused(true);
+        }
         paused_ = true;
         statusBar()->showMessage(tr("Paused"));
         updateActions();
@@ -408,6 +512,9 @@ private:
     void resumeGame() {
         if (!emulator_) return;
         paused_ = false;
+        if (emulator_->audio() != nullptr) {
+            emulator_->audio()->set_paused(false);
+        }
         frame_timer_->start();
         statusBar()->showMessage(tr("Running — F5 pauses, F6 resumes"));
         updateActions();
@@ -436,7 +543,7 @@ private:
         refreshTools();
         u64 frames = 0;
         u64 draws = 0;
-        clickhle::gles_statistics(frames, draws);
+        clickhle::gles_statistics(*emulator_, frames, draws);
         (void)frames;
         ++fps_window_frames_;
         const qint64 fps_elapsed_ms = fps_timer_.elapsed();
@@ -460,6 +567,24 @@ private:
                 ? QString::fromStdString(emulator_->last_missing_import())
                 : QString::fromStdString(result.fault);
             appendLog(tr("Stopped: %1").arg(message));
+            statusBar()->showMessage(tr("Stopped: %1").arg(message));
+            if (!emulator_->last_missing_import().empty() && hle_dock_) {
+                hle_dock_->show();
+                hle_dock_->raise();
+            }
+            updateActions();
+        }
+        if (auto event = emulator_->take_videocore_break()) {
+            frame_timer_->stop();
+            if (emulator_->audio() != nullptr) emulator_->audio()->set_paused(true);
+            paused_ = true;
+            statusBar()->showMessage(
+                tr("Paused after %1 at %2")
+                    .arg(QString::fromStdString(event->name), hex(event->return_pc)));
+            appendLog(tr("Render-server trigger: %1 at %2")
+                          .arg(QString::fromStdString(event->name), hex(event->return_pc)));
+            videocore_dock_->show();
+            videocore_dock_->raise();
             updateActions();
         }
         updateActions();
@@ -471,6 +596,7 @@ private:
             hle_view_->setPlainText(tr("No game loaded"));
             map_view_->setPlainText(tr("No game loaded"));
             memory_view_->setPlainText(tr("No game loaded"));
+            videocore_detail_->setPlainText(tr("No game loaded"));
             return;
         }
         if (const auto* cpu = emulator_->cpu()) {
@@ -536,10 +662,78 @@ private:
                          ? tr(" → %1").arg(hex(region->mirror_source)) : QString());
         }
         map_view_->setPlainText(map);
+        refreshVideoCoreEvents();
+    }
+
+    void refreshVideoCoreEvents() {
+        const auto& events = emulator_->videocore_events();
+        bool added_event = false;
+        for (const auto& event : events) {
+            if (event.sequence <= videocore_last_sequence_) continue;
+            const int row = videocore_table_->rowCount();
+            videocore_table_->insertRow(row);
+            QString arguments;
+            for (u8 i = 0; i < event.arg_count; ++i) {
+                if (!arguments.isEmpty()) arguments += QStringLiteral(", ");
+                arguments += hex(event.args[i]);
+            }
+            const QStringList columns{
+                QString::number(event.sequence), QString::number(event.frame),
+                QString::fromStdString(event.name), hex(event.return_pc), arguments,
+                hex(event.result)};
+            for (int column = 0; column < columns.size(); ++column) {
+                videocore_table_->setItem(
+                    row, column, new QTableWidgetItem(columns[column]));
+            }
+            videocore_last_sequence_ = event.sequence;
+            added_event = true;
+            while (videocore_table_->rowCount() > 1024)
+                videocore_table_->removeRow(0);
+        }
+        if (videocore_table_->rowCount() > 0 &&
+            videocore_table_->currentRow() < 0)
+            videocore_table_->selectRow(videocore_table_->rowCount() - 1);
+        if (added_event && videocore_pause_on_call_->isChecked() &&
+            videocore_table_->rowCount() > 0)
+            videocore_table_->selectRow(videocore_table_->rowCount() - 1);
+    }
+
+    void showSelectedVideoCoreEvent() {
+        if (!emulator_ || videocore_table_->currentRow() < 0) return;
+        const auto* item =
+            videocore_table_->item(videocore_table_->currentRow(), 0);
+        if (!item) return;
+        bool ok = false;
+        const u64 sequence = item->text().toULongLong(&ok);
+        if (!ok) return;
+        for (const auto& event : emulator_->videocore_events()) {
+            if (event.sequence != sequence) continue;
+            QString detail = tr("%1\nFrame: %2   Instruction: %3\nReturn PC: %4\n")
+                .arg(QString::fromStdString(event.name)).arg(event.frame)
+                .arg(event.instructions).arg(hex(event.return_pc));
+            for (u8 i = 0; i < event.arg_count; ++i)
+                detail += tr("r%1 = %2\n").arg(i).arg(hex(event.args[i]));
+            detail += tr("Result: %1\nPayload size: %2 bytes")
+                .arg(hex(event.result)).arg(event.payload_size);
+            if (event.payload_prefix_size != 0) {
+                detail += tr("\nPayload prefix:");
+                for (u8 i = 0; i < event.payload_prefix_size; ++i) {
+                    if (i % 16 == 0) detail += QLatin1Char('\n');
+                    detail += QStringLiteral("%1 ").arg(event.payload_prefix[i], 2, 16,
+                                                         QLatin1Char('0'));
+                }
+            }
+            videocore_detail_->setPlainText(detail);
+            return;
+        }
+        videocore_detail_->setPlainText(tr("Event has aged out of the trace buffer."));
     }
 
     void refreshMemory() {
-        if (!emulator_) return;
+        if (!emulator_) {
+            memory_view_->setPlainText(tr("No game loaded"));
+            return;
+        }
         QString value = memory_address_->text().trimmed();
         if (!value.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive))
             value.prepend(QStringLiteral("0x"));
@@ -643,18 +837,29 @@ private:
     QPlainTextEdit* cpu_view_ = nullptr;
     QPlainTextEdit* memory_view_ = nullptr;
     QPlainTextEdit* hle_view_ = nullptr;
+    QDockWidget* hle_dock_ = nullptr;
+    QDockWidget* memory_dock_ = nullptr;
+    QDockWidget* videocore_dock_ = nullptr;
     QPlainTextEdit* map_view_ = nullptr;
     QPlainTextEdit* log_view_ = nullptr;
     QLineEdit* memory_address_ = nullptr;
+    QTableWidget* videocore_table_ = nullptr;
+    QPlainTextEdit* videocore_detail_ = nullptr;
+    QCheckBox* videocore_trace_enabled_ = nullptr;
+    QCheckBox* videocore_pause_on_call_ = nullptr;
+    u64 videocore_last_sequence_ = 0;
 };
 
 }  // namespace
 
 int main(int argc, char** argv) {
+    const QString startup_game = argc > 1 ? QString::fromLocal8Bit(argv[1])
+                                          : QString{};
+    clickhle::log::set_level(clickhle::log::Level::Warn);
     QApplication application(argc, argv);
     QCoreApplication::setOrganizationName(QStringLiteral("ClickHLE"));
     QCoreApplication::setApplicationName(QStringLiteral("ClickHLE"));
-    MainWindow window;
+    MainWindow window(startup_game);
     window.show();
     return application.exec();
 }

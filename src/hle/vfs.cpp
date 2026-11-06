@@ -121,7 +121,7 @@ std::filesystem::path Vfs::resolve_under(const std::filesystem::path& root,
     return current;
 }
 
-u32 Vfs::open(const std::string& guest_path, Mode mode) {
+u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write) {
     // Writes never touch the game directory. Resolving first and then writing
     // wherever the file happened to be found would modify the user's copy the
     // moment a title saved over something it shipped with.
@@ -155,7 +155,8 @@ u32 Vfs::open(const std::string& guest_path, Mode mode) {
             return 0;
         }
         const u32 handle = next_handle_++;
-        files_[handle] = OpenFile{file, guest_path, mode};
+        files_[handle] = OpenFile{file, guest_path, mode,
+                                  allow_write && mode != Mode::kRead};
         CLICKHLE_DEBUG(kCategory)
             << "write '" << guest_path << "' -> " << host.string();
         return handle;
@@ -196,7 +197,8 @@ u32 Vfs::open(const std::string& guest_path, Mode mode) {
         return 0;
     }
     const u32 handle = next_handle_++;
-    files_[handle] = OpenFile{file, guest_path, mode};
+    files_[handle] = OpenFile{file, guest_path, mode,
+                              allow_write && mode != Mode::kRead};
     CLICKHLE_DEBUG(kCategory)
         << "open '" << guest_path << "' -> handle " << handle;
     return handle;
@@ -223,11 +225,16 @@ i64 Vfs::read(u32 handle, void* buffer, u32 length) {
 
 i64 Vfs::write(u32 handle, const void* buffer, u32 length) {
     const auto it = files_.find(handle);
-    if (it == files_.end()) {
+    if (it == files_.end() || !it->second.allow_write) {
         return -1;
     }
     return static_cast<i64>(
         std::fwrite(buffer, 1, length, it->second.handle));
+}
+
+bool Vfs::writable(u32 handle) const {
+    const auto it = files_.find(handle);
+    return it != files_.end() && it->second.allow_write;
 }
 
 i64 Vfs::size(u32 handle) const {

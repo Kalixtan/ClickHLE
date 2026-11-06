@@ -41,6 +41,7 @@ struct Options {
     std::filesystem::path screenshot;
     std::string cpu_backend;
     unsigned long clock_hz = 0;
+    bool deterministic_system_clock = false;
     unsigned long scale = 0;
     std::vector<unsigned long> watches;
     std::vector<unsigned long> read_watches;
@@ -62,6 +63,7 @@ struct Options {
     std::string auto_press;
     unsigned long auto_press_interval = 60;
     std::string input_script;
+    std::filesystem::path input_file;
     unsigned long frames = 0;
     unsigned long long instructions = 0;
     bool list_missing = true;
@@ -125,6 +127,7 @@ Options:
                         one guest instruction what hardware spent millions of
                         cycles on, so the true rate runs games in slow motion.
                         Raise it for timing accuracy, lower it to skip intros
+  --deterministic-clock Use emulated time for system-clock API calls
   --scale <n>           Integer window scale over the 320x240 panel
                         (default 2). Ignored with --headless, which always
                         renders at 1x since nobody is looking at it
@@ -175,6 +178,8 @@ Options:
                           --input 2600+right,2900-right,2905+south,2910-south
                         walks right for 300 frames, then jumps. Order does not
                         matter; frames are sorted. Same button names as --press
+  --input-file <file>   Read replay syntax from a text file; lines may contain
+                        comma-separated transitions and # comments
   --screenshot <file>   Write every presented frame to <file> as a BMP, so the
                         file ends up holding the last frame drawn
   --probe <Lib#n>       Log every call to an ordinal, with its arguments, and
@@ -386,12 +391,18 @@ bool parse_options(int argc, char** argv, Options& options) {
             const std::string value = value_for("--clock-hz");
             if (value.empty()) return false;
             options.clock_hz = std::stoul(value);
+        } else if (arg == "--deterministic-clock") {
+            options.deterministic_system_clock = true;
         } else if (arg == "--press") {
             options.auto_press = value_for("--press");
             if (options.auto_press.empty()) return false;
         } else if (arg == "--input") {
             options.input_script = value_for("--input");
             if (options.input_script.empty()) return false;
+        } else if (arg == "--input-file") {
+            const std::string value = value_for("--input-file");
+            if (value.empty()) return false;
+            options.input_file = value;
         } else if (arg == "--press-every") {
             const std::string value = value_for("--press-every");
             if (value.empty()) return false;
@@ -420,6 +431,29 @@ bool parse_options(int argc, char** argv, Options& options) {
             std::cerr << "unexpected argument '" << arg << "'\n";
             return false;
         }
+    }
+    if (!options.input_file.empty()) {
+        if (!options.input_script.empty()) {
+            std::cerr << "use either --input or --input-file, not both\n";
+            return false;
+        }
+        std::ifstream replay(options.input_file);
+        if (!replay) {
+            std::cerr << "cannot open replay file '" << options.input_file.string()
+                      << "'\n";
+            return false;
+        }
+        std::string line;
+        while (std::getline(replay, line)) {
+            const std::size_t comment = line.find('#');
+            if (comment != std::string::npos) line.resize(comment);
+            const auto first = line.find_first_not_of(" \t\r");
+            if (first == std::string::npos) continue;
+            const auto last = line.find_last_not_of(" \t\r");
+            if (!options.input_script.empty()) options.input_script.push_back(',');
+            options.input_script.append(line, first, last - first + 1);
+        }
+        // An empty replay is useful for a deterministic idle smoke run.
     }
     return true;
 }
@@ -701,6 +735,7 @@ int main(int argc, char** argv) {
     if (options.clock_hz != 0) {
         config.emulated_hz = options.clock_hz;
     }
+    config.deterministic_system_clock = options.deterministic_system_clock;
 
     clickhle::Emulator emulator;
     emulator.set_screenshot_path(options.screenshot);
@@ -999,7 +1034,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "\ndraws by texture:\n";
-        for (const auto& [texture, count] : clickhle::gles_draws_by_texture()) {
+        for (const auto& [texture, count] : clickhle::gles_draws_by_texture(emulator)) {
             std::cout << "  " << std::setw(9) << count << "  texture "
                       << texture << "\n";
         }
@@ -1037,7 +1072,7 @@ int main(int argc, char** argv) {
                       << " unimplemented)\n";
             clickhle::u64 frames = 0;
             clickhle::u64 draws = 0;
-            clickhle::gles_statistics(frames, draws);
+            clickhle::gles_statistics(emulator, frames, draws);
             std::cout << "rendered " << frames << " frames, " << draws
                       << " draw calls\n";
             report_instruments(options, emulator);

@@ -132,6 +132,10 @@ struct WheelState {
 
     [[nodiscard]] u32 position() const { return wheel_position_for_raw(raw); }
 
+    [[nodiscard]] u32 raw_word() const {
+        return static_cast<u32>(raw) | (touched ? kWheelTouched : 0u);
+    }
+
     [[nodiscard]] u32 packed() const {
         // Contact is bit 30, passed through untouched and NOT part of the
         // transform -- the oracle measured 0x40000000 and 0x00 giving the same
@@ -150,16 +154,34 @@ struct WheelState {
     }
 };
 
-WheelState g_wheel;
+/// Mirror the wheel worker that feeds InputEvents#0's self-consuming counter.
+void update_wheel_counter(Emulator::InputState& state, u32 current_word) {
+    const u32 previous_word = state.previous_raw_wheel;
+    state.previous_raw_wheel = current_word;
+    if ((current_word & kWheelTouched) == 0 ||
+        (previous_word & kWheelTouched) == 0) {
+        return;
+    }
 
-/// The RAW encoder byte at the previous poll (NOT the transformed position --
-/// see the sign note below). out_a is movement SINCE the last poll and the
-/// call consumes it, so this is the snapshot the firmware keeps at
-/// block[0x1c]/block[0x14].
-u32 g_wheel_snapshot = 0;
+    i32 delta = static_cast<i32>(current_word & kWheelPositionMask) -
+                static_cast<i32>(previous_word & kWheelPositionMask);
+    if (delta > 48) {
+        delta -= 96;
+    } else if (delta < -48) {
+        delta += 96;
+    }
 
-/// Buttons the guest sees as held, in the second word of a poll.
-u32 g_buttons = 0;
+    if (std::abs(delta) < static_cast<i32>(state.wheel_threshold)) {
+        state.wheel_accumulator += delta;
+        if (state.wheel_accumulator < -3 || state.wheel_accumulator > 3) {
+            state.wheel_threshold = 0;
+            state.wheel_accumulator = 0;
+        }
+    } else if (delta >= -35 && delta <= 35) {
+        state.wheel_event_counter += static_cast<u32>(delta);
+        state.wheel_accumulator = 0;
+    }
+}
 
 /// Which controls are currently held, indexed by Button.
 ///
@@ -167,10 +189,19 @@ u32 g_buttons = 0;
 /// advances for as long as a spin is held rather than once per press. Nothing
 /// else in the tree was draining the event queue, so this is also where guest
 /// input begins to exist at all.
-bool g_held[static_cast<std::size_t>(Button::Count)] = {};
-
 /// Added to the record type when sweeping for the id->type mapping.
 u32 g_event_type_base = 0;
+
+/// The guest event list carries both transitions from the host input queue:
+/// phase 2 for press and phase 1 for release. `edge` and `held` remain useful
+/// probe modes, but `both` is the default because RetailOS queues transitions.
+std::string_view button_record_mode() {
+    static const std::string_view mode = [] {
+        const char* value = std::getenv("CLICKHLE_RECORD_MODE");
+        return std::string_view(value != nullptr ? value : "both");
+    }();
+    return mode;
+}
 
 /// Which 12-byte record type each control posts.
 ///
@@ -263,13 +294,14 @@ u8 button_event_id(Button button) {
 /// Only under CLICKHLE_RECORD_MODE=held. Real hardware posts on transitions, so
 /// this is a deliberate deviation kept for screens that appear to want a level
 /// rather than an edge.
-void repost_held(Emulator& emulator, std::string_view mode,
+void repost_held(Emulator& emulator, Emulator::InputState& state,
+                 std::string_view mode,
                  u8 (*id_of)(Button)) {
     if (mode != "held") {
         return;
     }
     for (std::size_t i = 0; i < static_cast<std::size_t>(Button::Count); ++i) {
-        if (!g_held[i]) {
+        if (!state.held_buttons[i]) {
             continue;
         }
         const u8 id = id_of(static_cast<Button>(i));
@@ -281,13 +313,15 @@ void repost_held(Emulator& emulator, std::string_view mode,
 }
 
 void drain_input(Emulator& emulator) {
+    auto& input_state = emulator.input_state();
     Display& display = emulator.display();
     InputEvent event;
     while (display.next_input(event)) {
         if (event.button == Button::Count) {
             continue;
         }
-        g_held[static_cast<std::size_t>(event.button)] = event.pressed;
+        input_state.held_buttons[static_cast<std::size_t>(event.button)] =
+            event.pressed;
         CLICKHLE_DEBUG(kCategory)
             << "button " << static_cast<int>(event.button)
             << (event.pressed ? " down" : " up");
@@ -360,15 +394,14 @@ void drain_input(Emulator& emulator) {
         //     test exercised a separate value-dependent XOR over a pending
         //     bitmask at input_object+0xc, not the record path.
         //
-        // CLICKHLE_RECORD_MODE=edge  -> one record on press only        (oracle)
-        // CLICKHLE_RECORD_MODE=both  -> press type 2, release type 1    (LLE)
+        // CLICKHLE_RECORD_MODE=edge  -> one record on press only        (probe)
+        // CLICKHLE_RECORD_MODE=both  -> press phase 2, release phase 1  (RetailOS)
         //
-        // Default is `edge`. Not because I have adjudicated -- I cannot -- but
-        // because it is the cadence real hardware produces for a tap either way,
-        // and under LLE's model a press-only stream still sets the bit.
+        // Default is `both`: the frame driver publishes the transitions it
+        // receives from the OS event queue. `edge` is available for probing
+        // guests that appear to consume only the press transition.
         static const std::string_view record_mode = [] {
-            const char* m = std::getenv("CLICKHLE_RECORD_MODE");
-            return std::string_view(m != nullptr ? m : "both");
+            return button_record_mode();
         }();
         const bool post_release = record_mode == "both" || record_mode == "held";
         if (!event.pressed && !post_release) {
@@ -400,8 +433,8 @@ void drain_input(Emulator& emulator) {
     }
 }
 
-[[nodiscard]] bool held(Button button) {
-    return g_held[static_cast<std::size_t>(button)];
+[[nodiscard]] bool held(const Emulator::InputState& state, Button button) {
+    return state.held_buttons[static_cast<std::size_t>(button)];
 }
 
 }  // namespace
@@ -424,7 +457,6 @@ u32 g_forced_wheel = 0;
 /// LLE track has not read yet, so the offset is unknown and swept rather than
 /// guessed.
 u32 g_forced_period = 0;
-u64 g_poll_count = 0;
 }  // namespace
 
 void set_forced_buttons(u32 mask, u32 period) {
@@ -457,17 +489,16 @@ void register_input(HleRegistry& registry) {
         // only moves when a key is pressed and released would deliver a single
         // step no matter how long it was held.
         drain_input(f.emulator);
+        auto& input_state = f.emulator.input_state();
         {
-            static const std::string_view mode = [] {
-                const char* m = std::getenv("CLICKHLE_RECORD_MODE");
-                return std::string_view(m != nullptr ? m : "both");
-            }();
-            repost_held(f.emulator, mode, &button_event_id);
+            static const std::string_view mode = button_record_mode();
+            repost_held(f.emulator, input_state, mode, &button_event_id);
         }
-        const bool clockwise = held(Button::ActionEast);
-        const bool anticlockwise = held(Button::ActionWest);
-        const bool was_touched = g_wheel.touched;
-        g_wheel.touched = clockwise || anticlockwise;
+        WheelState wheel{input_state.wheel_raw, input_state.wheel_touched};
+        const bool clockwise = held(input_state, Button::ActionEast);
+        const bool anticlockwise = held(input_state, Button::ActionWest);
+        const bool was_touched = wheel.touched;
+        wheel.touched = clockwise || anticlockwise;
         if (clockwise != anticlockwise) {
             // kSpinStep is one physical detent, which is correct per poll ONLY
             // if polls happen at hardware rate. Headless we poll as fast as the
@@ -483,7 +514,7 @@ void register_input(HleRegistry& registry) {
                 const i32 n = v != nullptr ? std::atoi(v) : 1;
                 return n > 0 ? n : 1;
             }();
-            g_wheel.spin((clockwise ? kSpinStep : -kSpinStep) * multiplier);
+            wheel.spin((clockwise ? kSpinStep : -kSpinStep) * multiplier);
         }
         // A finger leaving the wheel ZEROES the raw word, it does not merely
         // clear bit 30.
@@ -497,22 +528,28 @@ void register_input(HleRegistry& registry) {
         // This module's own header already said why that matters: "releasing
         // must clear it, or the next press reads as one enormous jump". The
         // rule was written down and only half implemented.
-        if (was_touched && !g_wheel.touched) {
-            g_wheel.raw = 0;
-            g_wheel_snapshot = g_wheel.raw;
+        if (was_touched && !wheel.touched) {
+            wheel.raw = 0;
+            input_state.wheel_threshold = 3;
+            input_state.wheel_accumulator = 0;
             CLICKHLE_DEBUG(kCategory) << "wheel released, raw word zeroed";
         }
 
-        if (g_wheel.touched) {
+        if (wheel.touched) {
             CLICKHLE_DEBUG(kCategory)
-                << "wheel " << g_wheel.position() << (g_wheel.touched ? " touched" : "");
+                << "wheel " << wheel.position() << (wheel.touched ? " touched" : "");
         }
-        u32 wheel_word = g_wheel.packed();
+        input_state.wheel_raw = wheel.raw;
+        input_state.wheel_touched = wheel.touched;
+        const u32 raw_wheel_word = wheel.raw_word();
+        u32 wheel_word = wheel.packed();
+        u32 counter_source = raw_wheel_word;
         if (g_forced_wheel != 0 && g_forced_period != 0 &&
-            (g_poll_count / g_forced_period) % 2 == 0) {
+            (input_state.poll_count / g_forced_period) % 2 == 0) {
             wheel_word |= g_forced_wheel;
+            counter_source |= g_forced_wheel;
         }
-        f.store<u32>(out_b, wheel_word);
+        update_wheel_counter(input_state, counter_source);
         // THE BUG THAT COST DAYS ON ZUMA'S STAGE/INSTRUCTIONS SCREENS.
         //
         // This whole block used to be here: a stale, pre-id/type-model loop
@@ -523,9 +560,9 @@ void register_input(HleRegistry& registry) {
         // above, which is the actual, correct delivery path -- this ran IN
         // PARALLEL with it and was never removed.
         //
-        // Its computed output (`events` -> `g_buttons`) never reached the
-        // guest: `out_a` is written from the wheel delta below, not from
-        // `g_buttons`, which nothing ever reads. So the loop was doing
+        // Its computed output (`events`) never reached the guest: `out_a` is
+        // written from the firmware counter below, not from a button mask.
+        // So the loop was doing
         // nothing useful and, on every Select press, injecting an UNINTENDED
         // second record -- `taps[4] = ActionNorth`, `2 + (4 % 4) = 2` -- right
         // alongside the real one.
@@ -544,11 +581,9 @@ void register_input(HleRegistry& registry) {
         // the menu's presumably looser check and never once satisfied
         // whatever the Instructions screen tests.
         //
-        // `g_forced_buttons`/`--force-buttons` is inert as of this fix for the
-        // same reason `g_buttons` was already inert: nothing reads it. Left
-        // declared (CLI-facing API) rather than torn out in the same pass that
-        // fixes the corruption; a follow-up should either wire it through
-        // `button_event_id`'s real path or remove it.
+        // `g_forced_buttons`/`--force-buttons` remains inert: this API has no
+        // button-mask output. It should be removed from the CLI or redirected
+        // to the real event path in a separate change.
 
         // The first word is a SIGNED EVENT COUNT, not a button mask.
         //
@@ -570,23 +605,14 @@ void register_input(HleRegistry& registry) {
         //
         // The stale comment here said "the first word carries the buttons",
         // which is what this code was originally built on and is wrong.
-        if (g_forced_buttons != 0 && g_forced_period != 0) {
-            // ADD, never OR. --force-buttons exists to drive this word for
-            // bisection, and ORing a mask into a count is the very bug the
-            // count replaced: it manufactures a huge iteration count out of a
-            // bit pattern. Adding keeps it a count and still moves it.
-            if ((g_poll_count / g_forced_period) % 2 == 0) {
-                g_buttons += g_forced_buttons;
-            }
-        }
-        ++g_poll_count;
-        // out_a is WHEEL MOVEMENT since the last poll, and nothing else.
+        ++input_state.poll_count;
+        // out_a is the self-consuming firmware wheel-event counter delta,
+        // not a button mask or a direct wheel-position delta.
         //
-        // LLE, 2026-09-18: `InputEvents#0` carries ONLY the wheel. Buttons do
-        // not come through here at all -- they arrive on the published event
-        // list at app+0x30. So an event count in this word was never going to
-        // mean anything to a caller, and a button mask (what it held before
-        // that) even less.
+        // LLE, 2026-09-18: `InputEvents#0` consumes block[0x10] - block[0x14].
+        // The wheel worker feeds that counter after checking contact, wrapping
+        // raw deltas across 96 positions, applying a small deadband, and
+        // discarding steps beyond +/-35. Buttons do not come through here.
         //
         //     *out_delta = block[0x10] - block[0x14];   movement since last poll
         //     block[0x14] = block[0x10];                consumed by the call
@@ -595,32 +621,21 @@ void register_input(HleRegistry& registry) {
         // signed, so it can be negative -- the oracle measured 2 - 9 giving
         // 0xfffffff9 rather than a saturate or a wrap.
         //
-        // LLE, 2026-09-18, from 0x100dc0b4: the two wheel out-parameters have
-        // OPPOSITE signs BY DESIGN. `*out_b` (position) is
-        // `((0x77-raw)<<3)/3` -- a decreasing function of raw, confirmed by
-        // oracle. `*out_a` (this delta) is `block[0x10] += (cur_raw -
-        // prev_raw)` -- the SAME sign as the raw encoder, i.e. the opposite
-        // direction to the position. Computing this delta from the already-
-        // inverted position (as before) silently flipped it. Delta is taken
-        // on the raw byte directly, with the firmware's own 96-step
-        // wraparound normalization (half-range 48) so a wrap-crossing move
-        // doesn't read as a near-full-circle jump.
-        //
-        // NOT implemented here, deliberately: the firmware's sub-threshold
-        // accumulate-and-hold-off and its discard of any single-poll delta
-        // outside +-35 (both also read from 0x100dc0b4). Those are a
-        // separate, more invasive behavior change with no title-specific
-        // verification yet -- this fix is scoped to the sign only.
-        i32 delta = static_cast<i32>(g_wheel.raw) -
-                    static_cast<i32>(g_wheel_snapshot);
-        if (delta > 48) {
-            delta -= 96;
-        } else if (delta < -48) {
-            delta += 96;
+        const u32 counter_delta = input_state.wheel_event_counter -
+                                  input_state.wheel_counter_snapshot;
+        // Keep the firmware's store order: it writes the counter result before
+        // transforming the wheel word, then consumes the snapshot and clears
+        // the pending byte only after both output stores succeed.
+        if (!f.store<u32>(out_a, counter_delta)) {
+            f.cpu.request_stop();
+            return;
         }
-        g_wheel_snapshot = g_wheel.raw;
-        f.store<u32>(out_a, static_cast<u32>(delta));
-        f.ret(0);
+        if (!f.store<u32>(out_b, wheel_word)) {
+            f.cpu.request_stop();
+            return;
+        }
+        input_state.wheel_counter_snapshot = input_state.wheel_event_counter;
+        input_state.pending_event_flag = 0;
     });
 
     // #1(event) -- OUTBOUND. The game posting an event to the OS, not the OS
@@ -653,8 +668,12 @@ void register_input(HleRegistry& registry) {
         const GuestAddr event = f.args.next_ptr();
         const auto type = f.memory.read<u8>(event);
         const auto gate = f.memory.read<u8>(event + 1);
-        if (!type.has_value() || !gate.has_value() || *gate != 1) {
-            f.ret(0);
+        if (!type.has_value() || !gate.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*gate != 1) {
+            f.ret_void();
             return;
         }
         u32 message = 0;
@@ -669,13 +688,13 @@ void register_input(HleRegistry& registry) {
                 // warning -- but it is worth knowing if one ever appears.
                 CLICKHLE_DEBUG(kCategory)
                     << "post_event: unhandled type " << static_cast<u32>(*type);
-                f.ret(0);
+                f.ret_void();
                 return;
         }
         CLICKHLE_DEBUG(kCategory)
             << "post_event type " << static_cast<u32>(*type) << " -> message 0x"
             << std::hex << message << std::dec;
-        f.ret(0);
+        f.ret_void();
     });
 
     CLICKHLE_DEBUG(kCategory) << kModule << ": wheel poll and event post registered";

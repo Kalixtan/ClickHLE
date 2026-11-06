@@ -36,6 +36,14 @@ public:
     /// Queues PCM for playback. Returns false if the device is not open.
     [[nodiscard]] virtual bool queue(const void* data, u32 bytes) = 0;
 
+    /// Starts or replaces one keyed PCM voice. Input PCM is converted to the
+    /// device format before playback. The key is the guest SFX handle.
+    [[nodiscard]] virtual bool play(u32 key, const void* data, u32 bytes,
+                                    u32 sample_rate, u16 channels,
+                                    u16 bits_per_sample, bool loop) = 0;
+    virtual void stop_voice(u32 key) = 0;
+    virtual void pause_voice(u32 key, bool paused) = 0;
+
     /// Bytes queued but not yet played. This is what tells us which of the
     /// guest's buffers have finished, so it must be honest.
     [[nodiscard]] virtual u64 queued_bytes() const = 0;

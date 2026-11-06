@@ -8,6 +8,8 @@
 
 namespace clickhle {
 
+class Emulator;
+
 class HleRegistry;
 struct HleCallFrame;
 
@@ -60,7 +62,10 @@ void register_all_modules(HleRegistry& registry);
 
 /// Frames presented and draw calls issued so far. Zero until the renderer is
 /// wired up.
-void gles_statistics(u64& frames, u64& draws);
+void gles_statistics(Emulator& emulator, u64& frames, u64& draws);
+
+/// Present one emulated frame through the configured display backend.
+void gles_present_frame(HleCallFrame& frame);
 
 /// Draw calls attributed to each bound texture name.
 ///
@@ -68,6 +73,6 @@ void gles_statistics(u64& frames, u64& draws);
 /// show a static screen. This says which textures those quads actually used, so
 /// "drawn but invisible" and "never drawn" can be told apart -- which a
 /// screenshot cannot do.
-[[nodiscard]] const std::map<u32, u64>& gles_draws_by_texture();
+[[nodiscard]] const std::map<u32, u64>& gles_draws_by_texture(Emulator& emulator);
 
 }  // namespace clickhle

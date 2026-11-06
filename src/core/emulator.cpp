@@ -17,6 +17,27 @@ namespace {
 
 constexpr std::string_view kCategory = "emu";
 
+bool is_videocore_boundary_call(const HleFunction& function) {
+    if (function.module != "OpenGLES" || !function.has_ordinal) return false;
+    // Known render-server control/data exports, plus the uniform packet
+    // exports confirmed as inputs to rserver's command queue.
+    switch (function.ordinal) {
+        case 147:
+        case 148:
+        case 149:
+        case 152:
+        case 153:
+        case 155:
+        case 156:
+        case 158:
+        case 160:
+        case 164:
+            return true;
+        default:
+            return false;
+    }
+}
+
 /// Leaves a little headroom below the top of the stack region so that a guest
 /// prologue writing above sp cannot immediately fall off the mapping.
 constexpr u32 kStackHeadroom = 64;
@@ -156,6 +177,16 @@ void fail(std::string* error, std::string message) {
 
 bool Emulator::load(Config config, std::string* error) {
     config_ = std::move(config);
+    system_clock_start_ = std::chrono::steady_clock::now();
+    last_system_clock_us_ = 0;
+    metadata_state_ = {};
+    audio_state_ = {};
+    input_state_ = {};
+    misc_state_ = {};
+    filesystem_state_ = {};
+    gles_state_.reset();
+    gles_ordinal_state_.reset();
+    next_gles_texture_name_ = 0;
     game_driver_ready_ = false;
     single_frame_mode_ = false;
     game_main_vector_ = 0;
@@ -163,6 +194,9 @@ bool Emulator::load(Config config, std::string* error) {
     game_event_pool_ = 0;
     game_io_pool_ = 0;
     game_frame_index_ = 0;
+    videocore_sequence_ = 0;
+    videocore_events_.clear();
+    videocore_break_event_.reset();
 
     content_root_ = config_.content_root;
     if (content_root_.empty()) {
@@ -607,6 +641,46 @@ bool Emulator::on_svc(u32 immediate) {
         entry->function->name;
     call_history_next_ = (call_history_next_ + 1) % kCallHistory;
 
+    std::optional<VideoCoreEvent> videocore_event;
+    if (videocore_trace_enabled_ &&
+        is_videocore_boundary_call(*entry->function)) {
+        VideoCoreEvent event;
+        event.sequence = ++videocore_sequence_;
+        event.frame = game_frame_index_;
+        event.instructions = cpu_->instruction_count();
+        event.return_pc = cpu_->lr();
+        event.ordinal = entry->function->ordinal;
+        event.name = entry->function->name;
+        event.arg_count = std::min<u8>(entry->function->arity, 4);
+        for (u8 i = 0; i < event.arg_count; ++i) {
+            event.args[i] = cpu_->reg(i);
+        }
+
+        GuestAddr data = 0;
+        switch (event.ordinal) {
+            case 148: data = event.args[2]; event.payload_size = 16; break;
+            case 149: data = event.args[3]; event.payload_size = 64; break;
+            case 160:
+                data = event.args[2];
+                event.payload_size = event.args[1];
+                break;
+            case 164:
+                data = event.args[1];
+                event.payload_size = event.args[2];
+                break;
+            default: break;
+        }
+        if (data != 0 && event.payload_size != 0) {
+            event.payload_prefix_size = static_cast<u8>(
+                std::min<u32>(event.payload_size, event.payload_prefix.size()));
+            if (!memory_.read_bytes(data, event.payload_prefix.data(),
+                                    event.payload_prefix_size)) {
+                event.payload_prefix_size = 0;
+            }
+        }
+        videocore_event = std::move(event);
+    }
+
     // A handler may switch threads (Sleep and the WaitFor* family do). If it
     // does, the CPU is now running a different context whose pc is already
     // correct, and forcing pc = lr below would overwrite it with the *new*
@@ -655,6 +729,17 @@ bool Emulator::on_svc(u32 immediate) {
     current_thunk_ = entry->address;
     entry->function->handler(frame);
     current_thunk_ = thunk_before;
+    if (videocore_event.has_value()) {
+        videocore_event->result = cpu_->reg(reg::kR0);
+        videocore_events_.push_back(*videocore_event);
+        constexpr std::size_t kVideoCoreHistory = 1024;
+        if (videocore_events_.size() > kVideoCoreHistory) {
+            videocore_events_.pop_front();
+        }
+        if (videocore_pause_on_call_) {
+            videocore_break_event_ = *videocore_event;
+        }
+    }
     if (!frame.args.ok()) {
         CLICKHLE_WARN(kCategory)
             << entry->function->name
@@ -958,30 +1043,30 @@ std::string Emulator::load_state(const std::filesystem::path& path) {
 }
 
 AudioDevice* Emulator::open_audio(u32 sample_rate, u16 channels, u16 bits) {
-    // Reopen if a title changes format mid-run. Every corpus asset is
-    // 22050/16/stereo, so this is defensive rather than observed -- but a
-    // device left open at the wrong rate would resample silently and the
-    // mistake would be inaudible rather than obvious.
-    if (audio_ && (audio_rate_ != sample_rate || audio_channels_ != channels ||
-                   audio_bits_ != bits)) {
-        audio_->close();
-        audio_.reset();
-    }
+    // Mix all voices in one stable host format. Each source is converted by
+    // AudioDevice before it enters the mixer, so a title can play different
+    // WAV rates and channel layouts without reopening the output device.
+    (void)sample_rate;
+    (void)channels;
+    (void)bits;
+    constexpr u32 kMixRate = 44100;
+    constexpr u16 kMixChannels = 2;
+    constexpr u16 kMixBits = 16;
     if (!audio_) {
         auto device = AudioDevice::create();
         if (!device) {
             return nullptr;
         }
-        if (!device->open(sample_rate, channels, bits)) {
+        if (!device->open(kMixRate, kMixChannels, kMixBits)) {
             return nullptr;
         }
         audio_ = std::move(device);
-        audio_rate_ = sample_rate;
-        audio_channels_ = channels;
-        audio_bits_ = bits;
+        audio_rate_ = kMixRate;
+        audio_channels_ = kMixChannels;
+        audio_bits_ = kMixBits;
         CLICKHLE_INFO(kCategory)
-            << "audio opened " << sample_rate << " Hz, " << channels
-            << " ch, " << bits << "-bit (" << audio_->backend() << ")";
+            << "audio opened " << kMixRate << " Hz, " << kMixChannels
+            << " ch, " << kMixBits << "-bit mix (" << audio_->backend() << ")";
     }
     return audio_.get();
 }
@@ -1040,13 +1125,13 @@ RunResult Emulator::run_game(u64 max_instructions) {
     // reads a field back expecting something, this becomes wrong and the fault
     // will say where. Sized generously because the cost of being short is a
     // silent overwrite of whatever follows.
-        game_app_block_ = heap_.allocate(kAppBlockBytes);
-        if (game_app_block_ == kNullGuest) {
+    game_app_block_ = heap_.allocate(kAppBlockBytes);
+    if (game_app_block_ == kNullGuest) {
         total.status = RunStatus::Fault;
         total.fault = "could not allocate the vector[4] argument block";
         return total;
-        }
-        const GuestAddr app_block = game_app_block_;
+    }
+    const GuestAddr app_block = game_app_block_;
     for (u32 offset = 0; offset < kAppBlockBytes; offset += 4) {
         (void)memory_.write<u32>(app_block + offset, 0);
     }
@@ -1114,18 +1199,19 @@ RunResult Emulator::run_game(u64 max_instructions) {
     // Nodes come from a fixed pool rather than the guest heap: the firmware
     // allocates and frees each one per frame, and reproducing that churn would
     // fragment a heap we do not need to fragment.
-        game_event_pool_ = heap_.allocate(kEventRecordBytes * kMaxEventsPerFrame);
     constexpr u32 kIoNodeBytes = 0x20;
-        game_io_pool_ = heap_.allocate(kIoNodeBytes * kMaxEventsPerFrame);
     constexpr u32 kIoPathBytes = 128;
-        (void)heap_.allocate(kIoPathBytes * kMaxEventsPerFrame);
-        const GuestAddr io_pool = game_io_pool_;
+    game_event_pool_ =
+        heap_.allocate(kEventRecordBytes * kMaxEventsPerFrame);
+    game_io_pool_ = heap_.allocate(kIoNodeBytes * kMaxEventsPerFrame);
+    (void)heap_.allocate(kIoPathBytes * kMaxEventsPerFrame);
+    const GuestAddr io_pool = game_io_pool_;
 
     CLICKHLE_INFO(kCategory)
         << "app_block 0x" << std::hex << app_block << " io_pool 0x" << io_pool
         << " event_pool 0x" << game_event_pool_ << std::dec;
 
-        game_driver_ready_ = true;
+    game_driver_ready_ = true;
     } else {
         total.status = RunStatus::Stopped;
     }
@@ -1262,6 +1348,7 @@ RunResult Emulator::run_game(u64 max_instructions) {
         // frame, 57 draws down to 1. Whatever these titles want, it is not
         // "as soon as possible".
         deliver_completions(max_instructions);
+        last_guest_call_failure_.clear();
         const auto result =
             call_guest(main_vector, {app_block, arg_block}, max_instructions);
         // An unserviced import stops the run before the callback can reach the
@@ -1286,13 +1373,16 @@ RunResult Emulator::run_game(u64 max_instructions) {
             // look broken.
             u64 presented = 0;
             u64 draws = 0;
-            gles_statistics(presented, draws);
+            gles_statistics(*this, presented, draws);
             if (frame_limit_ != 0 && presented >= frame_limit_) {
                 game_frame_index_ = frames + 1;
                 total.status = RunStatus::Stopped;
                 break;
             }
             total.status = RunStatus::Fault;
+            if (total.fault.empty() && !last_guest_call_failure_.empty()) {
+                total.fault = last_guest_call_failure_;
+            }
             if (total.fault.empty()) {
                 // Where it was is the whole diagnostic. A callback that never
                 // returns is either spinning or waiting, and the pc says which
@@ -1318,7 +1408,7 @@ RunResult Emulator::run_game(u64 max_instructions) {
 RunResult Emulator::run_game_frame(u64 max_instructions) {
     u64 presented = 0;
     u64 draws = 0;
-    gles_statistics(presented, draws);
+    gles_statistics(*this, presented, draws);
     frame_limit_ = presented + 1;
     single_frame_mode_ = true;
     RunResult result = run_game(max_instructions);
@@ -1512,6 +1602,13 @@ std::optional<u32> Emulator::call_guest(GuestAddr function,
     std::optional<u32> value;
     if (return_sentinel_hit_) {
         value = cpu_->reg(reg::kR0);
+    } else if (result.status == RunStatus::BudgetExhausted) {
+        std::ostringstream message;
+        message << "guest callback exceeded its instruction budget ("
+                << result.instructions_executed << " instructions; pc 0x"
+                << std::hex << cpu_->pc() << ", lr 0x" << cpu_->reg(14) << ')';
+        last_guest_call_failure_ = message.str();
+        CLICKHLE_ERROR(kCategory) << message.str();
     } else if (result.status == RunStatus::Stopped) {
         // Asked to stop, so of course it did not reach the sentinel.
         //
@@ -1533,7 +1630,13 @@ std::optional<u32> Emulator::call_guest(GuestAddr function,
     }
 
     --call_depth_;
-    cpu_->restore_context(saved);
+    // A returned host call is transparent to its caller, so put the saved
+    // context back. If guest code faulted or exhausted its budget, keep the
+    // live context: restoring it here hid the actual stop PC and registers
+    // from the frame runner and debugger.
+    if (return_sentinel_hit_) {
+        cpu_->restore_context(saved);
+    }
     return_sentinel_hit_ = saved_sentinel;
     return value;
 }
@@ -1598,6 +1701,21 @@ u64 Emulator::microsecond_count() const {
                        hle_calls_ * config_.hle_call_cycles + idle_cycles_;
     const u64 hz = config_.emulated_hz == 0 ? 1 : config_.emulated_hz;
     return cycles * 1'000'000ull / hz;
+}
+
+u64 Emulator::system_clock_microsecond_count() {
+    u64 measured = 0;
+    if (config_.deterministic_system_clock) {
+        measured = microsecond_count();
+    } else {
+        const auto elapsed = std::chrono::steady_clock::now() - system_clock_start_;
+        measured = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count());
+    }
+    // Some titles divide by the delta between consecutive reads. Keep the
+    // timer strictly increasing when polls land in the same host microsecond.
+    last_system_clock_us_ = std::max(measured, last_system_clock_us_ + 1);
+    return last_system_clock_us_;
 }
 
 u32 Emulator::tick_count() const {

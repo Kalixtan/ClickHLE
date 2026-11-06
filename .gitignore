@@ -1,5 +1,6 @@
 # Build output
 /build*/
+/build-gui
 /cmake-build-*/
 /CMakeFiles/
 /CMakeCache.txt
@@ -12,6 +13,49 @@
 /run-logs/
 /saves/
 /.cache/
+
+# Local notes and reverse-engineering material
+/docs/
+/work/
+/VideoCore_docs/
+**/docs/
+**/documentation/
+**/reference/
+**/references/
+**/agent-comms/
+**/work/
+**/VideoCore_docs/
+
+# Game, firmware, and other reference assets
+**/Games/
+**/iPod_Control/
+**/assets/
+**/Data/
+**/Firmware/
+**/firmware/
+**/Resources/
+*.bin
+*.exe
+*.eapp
+*.elf
+*.ipsw
+*.rom
+*.iso
+*.vll
+*.dfu
+*.fw
+*.pdf
+*.aac
+*.m4a
+*.mp3
+*.wav
+*.bmp
+*.gif
+*.jpeg
+*.jpg
+*.png
+*.zip
+*.7z
 
 # Editor and OS files
 .DS_Store

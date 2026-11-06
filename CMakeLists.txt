@@ -74,6 +74,7 @@ add_library(clickhle_core
     src/hle/modules/audio.cpp
     src/hle/modules/metadata.cpp
     src/audio/audio_device.cpp
+    src/audio/audio_decoder.cpp
     src/video/display.cpp
 )
 
@@ -95,6 +96,20 @@ target_compile_definitions(clickhle_core PUBLIC
 # ever includes SDL, and only src/hle/modules/gles.cpp ever calls GL.
 
 option(CLICKHLE_WITH_VIDEO "Build the SDL3/OpenGL video backend" ON)
+
+# Bundled iPod games also use AAC/MP3 streams. PCM WAV playback has an internal
+# decoder; FFmpeg is optional and enables the compressed formats when installed.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG QUIET IMPORTED_TARGET
+        libavformat libavcodec libavutil libswresample)
+endif()
+if(FFMPEG_FOUND)
+    target_link_libraries(clickhle_core PRIVATE PkgConfig::FFMPEG)
+    target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_FFMPEG=1)
+else()
+    target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_FFMPEG=0)
+endif()
 
 set(CLICKHLE_VIDEO_ENABLED OFF)
 if(CLICKHLE_WITH_VIDEO)

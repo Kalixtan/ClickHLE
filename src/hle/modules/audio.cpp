@@ -20,8 +20,10 @@
 
 #include "clickhle/hle/modules.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <set>
 #include <fstream>
 #include <map>
 #include <string>
@@ -29,6 +31,7 @@
 
 #include "clickhle/common/log.h"
 #include "clickhle/audio/audio_device.h"
+#include "clickhle/audio/audio_decoder.h"
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/call_frame.h"
 #include "clickhle/hle/registry.h"
@@ -39,37 +42,70 @@ namespace {
 constexpr std::string_view kCategory = "audio";
 constexpr const char* kModule = "Audio";
 
-/// One sound-effect object. The fields are named by their offset in the guest's
-/// own structure because that is all that was established about most of them --
-/// the setters are distinguishable by ordinal, not by meaning.
-struct Sound {
-    u32 buffer = 0;
-    u32 repeat = 0;
-    u32 state = 0;
-    /// obj[+0x40] -- the observer-list head that #17 walks.
-    ///
-    /// Written by #21 (oracle, measured 2026-09-19: #21 is the only slot that
-    /// writes +0x40, which makes it the missing link in this chain and almost
-    /// certainly audio_sfx_set_next). 0 on a fresh object, so #17 degenerates
-    /// to a plain setter until something links a chain.
-    u32 next = 0;
-    /// Latched so one configured voice is queued once, not on every
-    /// subsequent property write.
-    bool started = false;
-    std::map<u32, u32> fields;  ///< by the ordinal that set it
-};
+using Sound = Emulator::AudioState::Sound;
+constexpr u32 kMusicVoiceKey = 0xFFFFFFFFu;
 
-std::map<u32, Sound> g_sounds;
-/// The firmware's handle is a **table index**, so 0 is a perfectly valid one and
-/// the failure value is -1, never 0 (LLE, AUDIO.md: `0x10292820` returns the
-/// index or -1). The comment here used to say zero was the failure value, which
-/// is the opposite of the truth.
-///
-/// Starting at 1 anyway, and deliberately: nothing in the corpus depends on the
-/// numbering, and a handle that is never 0 keeps our own `find`-miss paths
-/// distinguishable from a real handle. Where it matters is the failure value,
-/// which is now -1 below.
-u32 g_next_sound = 1;
+bool valid_sound_handle(HleCallFrame& f, u32 handle) {
+    const auto& sounds = f.emulator.audio_state().sounds;
+    if (sounds.contains(handle)) {
+        return true;
+    }
+    CLICKHLE_ERROR(kCategory) << "invalid SFX handle " << handle
+                              << " (RetailOS table lookup returns null)";
+    // The firmware callers immediately dereference the lookup result. Stop at
+    // that boundary rather than silently manufacturing a new sound object.
+    f.cpu.request_stop();
+    return false;
+}
+
+template <typename T>
+std::optional<T> read_sound_member(HleCallFrame& f, u32 handle, u32 offset) {
+    if (!valid_sound_handle(f, handle)) return std::nullopt;
+    const GuestAddr object =
+        f.emulator.audio_state().sounds.at(handle).guest_object;
+    const auto value = f.memory.read<T>(object + offset);
+    if (!value) {
+        CLICKHLE_ERROR(kCategory) << "unreadable SFX field at 0x" << std::hex
+                                  << object + offset;
+        f.cpu.request_stop();
+    }
+    return value;
+}
+
+void set_sound_state(HleCallFrame& f, std::map<u32, Sound>& sounds,
+                     u32 handle, u32 state) {
+    const auto first = sounds.find(handle);
+    if (first == sounds.end()) return;
+    const GuestAddr root = first->second.guest_object;
+    GuestAddr current = root;
+    std::set<GuestAddr> visited;
+    while (current != 0 && !visited.contains(current)) {
+        visited.insert(current);
+        if (!f.memory.write<u8>(current + 0x3d, static_cast<u8>(state))) {
+            CLICKHLE_ERROR(kCategory) << "invalid SFX chain pointer 0x"
+                                      << std::hex << current;
+            f.cpu.request_stop();
+            return;
+        }
+        for (auto& [id, sound] : sounds) {
+            (void)id;
+            if (sound.guest_object == current) {
+                sound.state = state & 0xffu;
+                if (state == 3) sound.started = false;
+                break;
+            }
+        }
+        const auto next = f.memory.read<u32>(current + 0x40);
+        if (!next) {
+            CLICKHLE_ERROR(kCategory) << "unreadable SFX chain link at 0x"
+                                      << std::hex << current + 0x40;
+            f.cpu.request_stop();
+            return;
+        }
+        current = *next;
+        if (current == root) break;
+    }
+}
 
 }  // namespace
 
@@ -140,70 +176,74 @@ void append_wav_dump(const void* pcm, u32 bytes, u32 rate, u16 channels,
 
 }  // namespace
 
-/// Start a voice once it has BOTH a buffer and a length -- whichever arrives
-/// last wins.
-///
-/// The order is not the same across titles, which is why this cannot live in
-/// one ordinal. Tetris configures fields, attaches the buffer, then sets the
-/// state. PAC-MAN sets the state FIRST and attaches the buffer afterwards, so
-/// triggering only on the state write plays nothing at all for it.
-///
-/// Guarded so a voice is started once: `started` latches, and is cleared when
-/// the voice is stopped or re-pointed at a new buffer.
-void try_start_voice(HleCallFrame& f, u32 handle) {
-    // OPT-IN until the timing is right. The format is decoded and verified,
-    // but WHEN to read the PCM is not: the guest registers a buffer before
-    // filling it, and reuses the same addresses across sounds, so reading at
-    // the trigger captures stale bytes. Verified by comparison -- none of
-    // Tetris's eleven assets appears verbatim in what we queue, even though
-    // every declared length matches its asset exactly.
-    //
-    // Playing the wrong bytes is worse than silence: it sounds like working
-    // audio while being wrong, which is the hardest kind of bug to notice.
-    // So default behaviour is unchanged and this is behind CLICKHLE_AUDIO=1
-    // for continued work.
-    static const bool enabled = [] {
-        const char* v = std::getenv("CLICKHLE_AUDIO");
-        return v != nullptr && *v == '1';
-    }();
-    if (!enabled) {
-        return;
-    }
-    const auto it = g_sounds.find(handle);
-    if (it == g_sounds.end()) {
-        return;
+/// Decode and queue the registered WAV when the guest explicitly starts a
+/// sound. Audio#7 stores a firmware buffer descriptor, not a PCM pointer; the
+/// corresponding asset is associated with the SFX handle when its WAV header
+/// is opened through AsyncFileIO.
+bool try_start_voice(HleCallFrame& f, u32 handle) {
+    auto& sounds = f.emulator.audio_state().sounds;
+    const auto it = sounds.find(handle);
+    if (it == sounds.end()) {
+        return false;
     }
     Sound& snd = it->second;
-    if (snd.started || snd.state != 1 || snd.buffer == 0) {
-        return;
+    if (snd.asset_path.empty()) {
+        return false;
     }
-    const auto get = [&snd](u32 k, u32 fallback) {
-        const auto f2 = snd.fields.find(k);
-        return f2 != snd.fields.end() ? f2->second : fallback;
-    };
-    const u32 bytes = get(kFieldLength, 0);
-    const u32 rate = get(kFieldRate, 22050);
-    const auto channels = static_cast<u16>(get(kFieldChannels, 2));
-    const auto bits = static_cast<u16>(get(kFieldBits, 16));
-    if (bytes == 0 || channels == 0 || bits == 0) {
-        return;
-    }
-    const void* pcm = f.memory.host_ptr(snd.buffer, bytes);
-    if (pcm == nullptr) {
+    const auto length = snd.fields.find(kFieldLength);
+    const u32 maximum_bytes = length == snd.fields.end() ? 0 : length->second;
+    auto wav = decode_game_audio(snd.asset_path, maximum_bytes);
+    if (!wav) {
         CLICKHLE_WARN(kCategory)
-            << "sfx handle=" << handle << ": " << bytes << " bytes at 0x"
-            << std::hex << snd.buffer << std::dec
-            << " are not mapped; not played";
-        return;
+            << "sfx handle=" << handle << ": unsupported or unreadable WAV "
+            << snd.asset_path.string();
+        return false;
+    }
+    AudioDevice* dev = f.emulator.open_audio(
+        wav->sample_rate, wav->channels, wav->bits_per_sample);
+    if (dev == nullptr ||
+        !dev->play(handle, wav->pcm.data(),
+                   static_cast<u32>(wav->pcm.size()), wav->sample_rate,
+                   wav->channels, wav->bits_per_sample, false)) {
+        return false;
     }
     snd.started = true;
-    if (AudioDevice* dev = f.emulator.open_audio(rate, channels, bits)) {
-        (void)dev->queue(pcm, bytes);
-    }
-    append_wav_dump(pcm, bytes, rate, channels, bits);
+    set_sound_state(f, sounds, handle, 1);
+    append_wav_dump(wav->pcm.data(), static_cast<u32>(wav->pcm.size()),
+                    wav->sample_rate, wav->channels, wav->bits_per_sample);
     CLICKHLE_DEBUG(kCategory)
-        << "sfx play handle=" << handle << " " << bytes << " bytes @" << rate
-        << "/" << bits << "/" << channels;
+        << "sfx play handle=" << handle << " " << wav->pcm.size()
+        << " PCM bytes @" << wav->sample_rate << "/"
+        << wav->bits_per_sample << "/" << wav->channels << " from "
+        << snd.asset_path.string();
+    return true;
+}
+
+bool start_stream(HleCallFrame& f, u32 index) {
+    auto& state = f.emulator.audio_state();
+    if (index >= state.stream_assets.size() || state.stream_assets[index].empty()) {
+        return false;
+    }
+    auto audio = decode_game_audio(state.stream_assets[index]);
+    if (!audio) {
+        CLICKHLE_WARN(kCategory)
+            << "stream " << index << ": unsupported or unreadable audio "
+            << state.stream_assets[index].string();
+        return false;
+    }
+    AudioDevice* device = f.emulator.open_audio(
+        audio->sample_rate, audio->channels, audio->bits_per_sample);
+    if (device == nullptr ||
+        !device->play(kMusicVoiceKey, audio->pcm.data(),
+                      static_cast<u32>(audio->pcm.size()), audio->sample_rate,
+                      audio->channels, audio->bits_per_sample,
+                      state.stream_repeat_internal_mode != 0)) {
+        return false;
+    }
+    CLICKHLE_INFO(kCategory)
+        << "music stream " << index << " started from "
+        << state.stream_assets[index].string();
+    return true;
 }
 
 void register_audio(HleRegistry& registry) {
@@ -213,35 +253,76 @@ void register_audio(HleRegistry& registry) {
                      std::move(handler));
     };
 
-    fn(0, "sfx_create", 2, [](HleCallFrame& f) {
-        const u32 handle = g_next_sound++;
-        g_sounds[handle] = Sound{};
+    fn(0, "sfx_create", 0, [](HleCallFrame& f) {
+        auto& sounds = f.emulator.audio_state().sounds;
+        u32 handle = 0;
+        while (sounds.contains(handle) && handle != 0xFFFFFFFFu) {
+            ++handle;
+        }
+        if (handle == 0xFFFFFFFFu) {
+            f.ret(0xFFFFFFFFu);
+            return;
+        }
+        Sound sound{};
+        sound.guest_object = f.emulator.heap().allocate(0x4c);
+        if (sound.guest_object == 0) {
+            CLICKHLE_ERROR(kCategory) << "sfx_create could not allocate guest object";
+            f.cpu.request_stop();
+            return;
+        }
+        for (u32 offset = 0; offset < 0x4c; offset += 4) {
+            f.store<u32>(sound.guest_object + offset, 0);
+        }
+        f.store<u32>(sound.guest_object, 0x0066d260);
+        f.store<u32>(sound.guest_object + 0x10, 0xac44);
+        f.store<u32>(sound.guest_object + 0x14, 1);
+        f.store<u32>(sound.guest_object + 0x18, 0x10);
+        f.store<u32>(sound.guest_object + 0x1c, 0x7fff);
+        f.store<u32>(sound.guest_object + 0x20, 1000);
+        f.store<u32>(sound.guest_object + 0x30, 0x7fff);
+        f.store<u32>(sound.guest_object + 0x38, 1);
+        f.store<u32>(sound.guest_object + 0x44, 0x7fff);
+        f.store<u32>(sound.guest_object + 0x48, 0);
+        sounds.emplace(handle, sound);
+        f.emulator.audio_state().pending_sfx_assets.push_back(handle);
         CLICKHLE_DEBUG(kCategory) << "sfx_create -> " << handle;
         f.ret(handle);
     });
 
     fn(1, "sfx_release", 1, [](HleCallFrame& f) {
-        g_sounds.erase(f.args.next_u32());
-        f.ret(0);
+        auto& sounds = f.emulator.audio_state().sounds;
+        const u32 handle = f.args.next_u32();
+        const auto it = sounds.find(handle);
+        if (it != sounds.end()) {
+            if (AudioDevice* device = f.emulator.audio()) {
+                device->stop_voice(handle);
+            }
+            (void)f.emulator.heap().release(it->second.guest_object);
+            sounds.erase(it);
+        }
+        auto& pending = f.emulator.audio_state().pending_sfx_assets;
+        pending.erase(std::remove(pending.begin(), pending.end(), handle),
+                      pending.end());
+        f.ret_void();
     });
 
     fn(2, "sfx_play", 1, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        // Marked playing so #39 can answer honestly. Inference, not firmware:
-        // #39 tests state == 1 and #4 writes 1, so a voice that has been told
-        // to play should read back as playing. Without this, a title that
-        // starts a sound and then asks whether it is running is told no.
-        const auto it = g_sounds.find(handle);
-        if (it != g_sounds.end()) {
-            it->second.state = 1;
+        auto& sounds = f.emulator.audio_state().sounds;
+        if (!valid_sound_handle(f, handle)) {
+            return;
         }
+        // #2 is the explicit SFX play operation. #17 only changes the state
+        // byte and is commonly used while registering a voice.
+        const bool started = try_start_voice(f, handle);
         // Everything the guest configured on this voice before starting it.
         // Implementing real playback needs a PCM pointer, a LENGTH and a
         // format, and only the pointer is currently identified -- the length
         // has to be one of the unnamed field setters (8-15, 18), so print
         // them all at the moment they matter and let the values say which.
+        const auto it = sounds.find(handle);
         if (std::getenv("CLICKHLE_DUMP_SFXPLAY") != nullptr &&
-            it != g_sounds.end()) {
+            it != sounds.end()) {
             std::string fields;
             for (const auto& [ordinal, value] : it->second.fields) {
                 char t[48];
@@ -254,8 +335,9 @@ void register_audio(HleRegistry& registry) {
                 << it->second.buffer << std::dec
                 << " repeat=" << it->second.repeat << " fields:" << fields;
         }
-        CLICKHLE_DEBUG(kCategory) << "sfx_play " << handle << " (silent)";
-        f.ret(0);
+        CLICKHLE_DEBUG(kCategory) << "sfx_play " << handle
+                                  << (started ? " (played)" : " (no WAV source)");
+        f.ret_void();
     });
 
     // The voice-state family. #4 writes 1, #3 writes 2, #5 writes 3, and #39
@@ -269,9 +351,7 @@ void register_audio(HleRegistry& registry) {
     // track flagged that it cannot be resolved from the firmware alone, and it
     // is not resolvable from this side either while nothing is audible.
     //
-    // We keep one state per handle rather than a ring: no title dereferences a
-    // framework return value (section 49), so the ring's layout is not visible
-    // to a game and a scalar is indistinguishable from it.
+    // Keep the state byte on every object in the linked ring, as RetailOS does.
     constexpr u32 kVoicePlaying = 1;
     constexpr u32 kVoicePaused = 2;
     constexpr u32 kVoiceStopped = 3;
@@ -279,11 +359,20 @@ void register_audio(HleRegistry& registry) {
     const auto set_state = [](u32 state) {
         return [state](HleCallFrame& f) {
             const u32 handle = f.args.next_u32();
-            const auto it = g_sounds.find(handle);
-            if (it != g_sounds.end()) {
-                it->second.state = state;
+            if (!valid_sound_handle(f, handle)) {
+                return;
             }
-            f.ret(1);
+            set_sound_state(f, f.emulator.audio_state().sounds, handle, state);
+            if (AudioDevice* device = f.emulator.audio()) {
+                if (state == kVoicePaused) {
+                    device->pause_voice(handle, true);
+                } else if (state == kVoicePlaying) {
+                    device->pause_voice(handle, false);
+                } else if (state == kVoiceStopped) {
+                    device->stop_voice(handle);
+                }
+            }
+            f.ret_void();
         };
     };
 
@@ -294,27 +383,55 @@ void register_audio(HleRegistry& registry) {
     // Reads the state byte and answers "is this voice playing?".
     fn(39, "sfx_is_playing", 1, [kVoicePlaying](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        const auto it = g_sounds.find(handle);
-        f.ret(it != g_sounds.end() && it->second.state == kVoicePlaying ? 1u
-                                                                       : 0u);
+        const auto state = read_sound_member<u8>(f, handle, 0x3d);
+        if (state) f.ret(*state == kVoicePlaying ? 1u : 0u);
     });
 
-    // #37(handle) -- a property of a sub-object hung off `+0x34`, returning
-    // that object's `+0x2c`, or 0 when there is no sub-object.
-    //
-    // Answered as "there is none". We do not model the sub-object and we do not
-    // know which property it holds, so 0 is the firmware's own answer for the
-    // case we are actually in rather than a fabricated value.
+    // #37 returns zero when no sub-object is attached; otherwise it reads the
+    // word at subobject+0x2c. Keep the guest pointer traversal intact even
+    // though Audio#0 initializes the attachment pointer to null.
     fn(37, "sfx_get_attached_property", 1, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        f.ret(0);
+        const u32 handle = f.args.next_u32();
+        if (!valid_sound_handle(f, handle)) {
+            return;
+        }
+        const GuestAddr object =
+            f.emulator.audio_state().sounds.at(handle).guest_object;
+        const auto attached = read_sound_member<u32>(f, handle, 0x34);
+        if (!attached) {
+            CLICKHLE_ERROR(kCategory) << "unreadable SFX attachment pointer at 0x"
+                                      << std::hex << object + 0x34;
+            f.cpu.request_stop();
+            return;
+        }
+        if (*attached == 0) {
+            f.ret(0);
+            return;
+        }
+        const auto property = f.memory.read<u32>(*attached + 0x2c);
+        if (!property) {
+            CLICKHLE_ERROR(kCategory) << "invalid SFX attachment pointer 0x"
+                                      << std::hex << *attached;
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret(*property);
     });
 
     fn(7, "sfx_set_buffer", 2, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
         const u32 buffer = f.args.next_u32();
-        g_sounds[handle].buffer = buffer;
-        g_sounds[handle].started = false;  // re-pointed: allow it to play again
+        auto& sounds = f.emulator.audio_state().sounds;
+        if (!valid_sound_handle(f, handle)) {
+            return;
+        }
+        Sound& sound = sounds.at(handle);
+        sound.buffer = buffer;
+        f.store<u32>(sound.guest_object + 0x04, buffer);
+        sound.started = false;  // re-pointed: allow it to play again
+        if (AudioDevice* device = f.emulator.audio()) {
+            device->stop_voice(handle);
+        }
         // Is the "buffer" a guest pointer to PCM, or an opaque id? Everything
         // about implementing real audio depends on which, so look rather than
         // assume: print the value and, if it is mapped, the first bytes there.
@@ -336,19 +453,38 @@ void register_audio(HleRegistry& registry) {
                 << std::hex << buffer << std::dec << " bytes: " << head
                 << " |" << ascii << "|";
         }
-        try_start_voice(f, handle);
-        f.ret(0);
+        f.ret_void();
     });
 
     // The unnamed property setters. All take (handle, value) and are told apart
     // only by ordinal, so that is how the value is filed -- inventing names for
     // fields whose meaning is unknown would read as knowledge we do not have.
-    for (const u32 ordinal : {8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u, 18u}) {
+    // RetailOS declares #9's value as a byte and stores it at +0x0c. Keep the
+    // same byte-width behavior for the other byte properties, #17 (+0x3d) and
+    // #18 (+0x3e), rather than retaining bits that the firmware discards.
+    for (const u32 ordinal : {8u, 9u, 10u, 11u, 12u, 13u, 14u, 15u,
+                              18u, 19u, 20u}) {
         fn(ordinal, "sfx_set_field_" + std::to_string(ordinal), 2,
            [ordinal](HleCallFrame& f) {
                const u32 handle = f.args.next_u32();
-               const u32 value = f.args.next_u32();
-               g_sounds[handle].fields[ordinal] = value;
+               u32 value = f.args.next_u32();
+               if (!valid_sound_handle(f, handle)) {
+                   return;
+               }
+               if (ordinal == 9 || ordinal == 18) {
+                   value &= 0xFFu;
+               }
+               f.emulator.audio_state().sounds.at(handle).fields[ordinal] = value;
+               const u32 offset = ordinal == 8 ? 0x08 : ordinal == 9 ? 0x0c :
+                   ordinal == 10 ? 0x10 : ordinal == 11 ? 0x14 :
+                   ordinal == 12 ? 0x18 : ordinal == 13 ? 0x1c :
+                   ordinal == 14 ? 0x24 : ordinal == 15 ? 0x20 :
+                   ordinal == 18 ? 0x3e : ordinal == 19 ? 0x2c : 0x28;
+               if (ordinal == 9 || ordinal == 18)
+                   f.store<u8>(f.emulator.audio_state().sounds.at(handle).guest_object + offset,
+                               static_cast<u8>(value));
+               else
+                   f.store<u32>(f.emulator.audio_state().sounds.at(handle).guest_object + offset, value);
                // #7's pointer is now known to be raw 16-bit PCM with the RIFF
                // header stripped, so the remaining unknown for real playback
                // is the LENGTH -- which has to arrive through one of these
@@ -360,14 +496,19 @@ void register_audio(HleRegistry& registry) {
                        << " value=" << value << " (0x" << std::hex << value
                        << std::dec << ")";
                }
-               f.ret(0);
+               f.ret_void();
            });
     }
 
     fn(16, "sfx_set_repeat", 2, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        g_sounds[handle].repeat = f.args.next_u32();
-        f.ret(0);
+        const u32 repeat = f.args.next_u32();
+        if (!valid_sound_handle(f, handle)) {
+            return;
+        }
+        f.emulator.audio_state().sounds.at(handle).repeat = repeat;
+        f.store<u32>(f.emulator.audio_state().sounds.at(handle).guest_object + 0x38, repeat);
+        f.ret_void();
     });
 
     // #17 stores the state byte at obj[+0x3d] and then WALKS the observer list
@@ -388,35 +529,17 @@ void register_audio(HleRegistry& registry) {
     // the state byte 1=playing / 2=paused / 3=stopped.
     fn(17, "sfx_set_state", 2, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        const u32 state = f.args.next_u32();
+        const u32 state = f.args.next_u32() & 0xFFu;
+        if (!valid_sound_handle(f, handle)) {
+            return;
+        }
         if (std::getenv("CLICKHLE_DUMP_SFXFIELDS") != nullptr) {
             CLICKHLE_INFO(kCategory)
                 << "sfx_set_state handle=" << handle << " state=" << state
                 << (state == 1 ? "  <- PLAYING" : "");
         }
-        if (state == 1) {
-            try_start_voice(f, handle);
-        }
-        // Bounded by the table size: the firmware's guard is "not the object
-        // itself", which does not protect against a longer cycle, but we can
-        // afford to be safer than the hardware here.
-        u32 current = handle;
-        for (std::size_t steps = 0; steps <= g_sounds.size(); ++steps) {
-            const auto it = g_sounds.find(current);
-            if (it == g_sounds.end()) {
-                break;
-            }
-            it->second.state = state;
-            if (state != 1) {
-                it->second.started = false;
-            }
-            const u32 next = it->second.next;
-            if (next == 0 || next == handle) {
-                break;  // the firmware's own two stop conditions
-            }
-            current = next;
-        }
-        f.ret(0);
+        set_sound_state(f, f.emulator.audio_state().sounds, handle, state);
+        f.ret_void();
     });
 
     // #21 writes obj[+0x40], the list head #17 walks. Measured by oracle as the
@@ -428,8 +551,31 @@ void register_audio(HleRegistry& registry) {
     // its link silently dropped.
     fn(21, "sfx_set_next", 2, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        g_sounds[handle].next = f.args.next_u32();
-        f.ret(0);
+        const u32 next = f.args.next_u32();
+        if (!valid_sound_handle(f, handle)) {
+            return;
+        }
+        auto& sound = f.emulator.audio_state().sounds.at(handle);
+        sound.next = next;
+        f.store<u32>(sound.guest_object + 0x40, next);
+        f.ret_void();
+    });
+
+    // #22 stores two words at +0x44 and +0x48. The first is initialized to
+    // 0x7fff by #0; neither field has a recovered public getter.
+    fn(22, "sfx_set_auxiliary", 3, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        const u32 first = f.args.next_u32();
+        const u32 second = f.args.next_u32();
+        if (!valid_sound_handle(f, handle)) {
+            return;
+        }
+        auto& sound = f.emulator.audio_state().sounds.at(handle);
+        sound.fields[22] = first;
+        sound.auxiliary_48 = second;
+        f.store<u32>(sound.guest_object + 0x44, first);
+        f.store<u32>(sound.guest_object + 0x48, second);
+        f.ret_void();
     });
 
     // #7 and #23 are a ROUND-TRIP ON THE SAME WORD, and this returned the wrong
@@ -452,14 +598,50 @@ void register_audio(HleRegistry& registry) {
     // state getter. It is not; it is the buffer getter.
     fn(23, "sfx_get_buffer", 1, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
-        const auto it = g_sounds.find(handle);
-        f.ret(it == g_sounds.end() ? 0 : it->second.buffer);
+        const auto value = read_sound_member<u32>(f, handle, 0x04);
+        if (value) f.ret(*value);
+    });
+
+    // Field readers mirror the direct loads in RetailOS. Names remain neutral
+    // where the property's meaning is not established by game use.
+    for (const auto& [ordinal, offset] :
+         {std::pair<u32, u32>{24, 0x08}, {25, 0x0c}, {26, 0x10},
+          {27, 0x14}, {28, 0x18}, {29, 0x1c}, {30, 0x20},
+          {32, 0x24}, {34, 0x3e}, {35, 0x2c}, {36, 0x28}}) {
+        fn(ordinal, "sfx_get_field_" + std::to_string(ordinal), 1,
+           [ordinal, offset](HleCallFrame& f) {
+               const u32 handle = f.args.next_u32();
+               if (ordinal == 25 || ordinal == 34) {
+                   const auto value = read_sound_member<u8>(f, handle, offset);
+                   if (value) f.ret(*value);
+               } else {
+                   const auto value = read_sound_member<u32>(f, handle, offset);
+                   if (value) f.ret(*value);
+               }
+           });
+    }
+    fn(31, "sfx_get_repeat", 1, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        const auto value = read_sound_member<u32>(f, handle, 0x38);
+        if (value) f.ret(*value);
+    });
+    fn(33, "sfx_get_state", 1, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        const auto value = read_sound_member<u8>(f, handle, 0x3d);
+        if (value) f.ret(*value);
+    });
+    fn(38, "sfx_get_next", 1, [](HleCallFrame& f) {
+        const u32 handle = f.args.next_u32();
+        const auto value = read_sound_member<u32>(f, handle, 0x40);
+        if (value) f.ret(*value);
     });
 
     // The music stream. Registered once, then driven.
-    // #40(name, a, b, c) -- registers a named stream and posts it to the audio
-    // server. The FIRST ARGUMENT IS A STRING and the firmware strlen/strcpys
-    // it; the third is a byte, not a word.
+    // #40(name, a, b, c) -- copies the name into a message, then posts it to
+    // the audio server. The first argument is a string; the third argument is
+    // a byte. Ghidra's ARM decompilation also shows a 64-bit return made from
+    // (arg1, arg0), so preserve both result registers even though the companion
+    // emulator models this as a stream index.
     //
     // We had this at arity 0 returning a constant 1, which discarded all four
     // arguments including the name -- a title registering a named stream was
@@ -502,14 +684,40 @@ void register_audio(HleRegistry& registry) {
         CLICKHLE_INFO(kCategory)
             << "stream_register \"" << name << "\" (" << a << ", " << b << ", "
             << c << ")";
-        f.ret(1);
+        auto& audio = f.emulator.audio_state();
+        std::filesystem::path asset = audio.pending_stream_asset;
+        audio.pending_stream_asset.clear();
+        if (asset.empty() && !name.empty()) {
+            const std::string extension =
+                std::filesystem::path(name).extension().string();
+            if (extension == ".m4a" || extension == ".mp3" ||
+                extension == ".aac" || extension == ".mp4") {
+                asset = f.emulator.vfs().resolve(name);
+            }
+        }
+        audio.stream_assets.push_back(std::move(asset));
+        // RetailOS queues one registration record per call. Its message task
+        // is not modeled, but Metadata#134 exposes the resulting stream count.
+        if (audio.registered_stream_count != 0xFFFFFFFFu) {
+            ++audio.registered_stream_count;
+        }
+        f.ret64((static_cast<u64>(a) << 32) | name_address);
     });
 
-    // #41(a) and #44(a, b) -- marshal their arguments into a heap block and
-    // post it to the audio server. Fire-and-forget: the int they return is the
-    // result of the *post*, not of the work, so 0 is success.
+    // These wrappers post audio-server messages and return the server's post
+    // status. The firmware dispatcher applies its state changes before the
+    // queue status is produced. The audio engine itself is still absent.
     fn(41, "audio_post_1", 1, [](HleCallFrame& f) {
-        CLICKHLE_DEBUG(kCategory) << "audio_post_1 " << f.args.next_u32();
+        auto& state = f.emulator.audio_state();
+        const u32 command = f.args.next_u32();
+        // RetailOS message 0x6600000e moves to the preceding stream when a
+        // stream index is selected. Its -1 sentinel delegates to the player
+        // service, which ClickHLE does not emulate.
+        if (state.stream_index > 0) {
+            --state.stream_index;
+        }
+        CLICKHLE_DEBUG(kCategory) << "audio previous-stream " << command
+                                  << " -> " << state.stream_index;
         f.ret(0);
     });
     fn(44, "audio_post_2", 2, [](HleCallFrame& f) {
@@ -519,26 +727,144 @@ void register_audio(HleRegistry& registry) {
         f.ret(0);
     });
     // #43(a) and #48(a) marshal their argument into a heap block and post it
-    // to the audio server, exactly like #41/#44. Discarding the argument makes
-    // a title that starts a stream look like one that never asked.
+    // to the audio server, exactly like #41/#44. The local RetailOS dispatcher
+    // ignores #43's payload when updating context+0x114; the player-service
+    // interpretation of that payload as a stream index is corroborated by the
+    // comparison emulator, so retain it as host-side player state.
     fn(43, "stream_play", 1, [](HleCallFrame& f) {
-        CLICKHLE_DEBUG(kCategory) << "stream_play " << f.args.next_u32();
+        auto& state = f.emulator.audio_state();
+        state.stream_index = static_cast<i64>(f.args.next_u32());
+        // The RetailOS dispatcher for message 0x66000011 sets context+0x114
+        // to 1. The host plays a registered bundled audio asset when one was
+        // identified through the game's resource-name lookup.
+        state.stream_control = 1;
+        if (state.stream_index >= 0) {
+            static_cast<void>(start_stream(
+                f, static_cast<u32>(state.stream_index)));
+        }
+        CLICKHLE_DEBUG(kCategory) << "stream_play " << state.stream_index;
         f.ret(0);
     });
     fn(48, "stream_repeat", 1, [](HleCallFrame& f) {
-        CLICKHLE_DEBUG(kCategory) << "stream_repeat " << f.args.next_u32();
+        const u32 raw = f.args.next_u32();
+        // The wrapper posts the raw word; the player task consumes its low
+        // byte and clamps unsupported modes to "all" (2), as observed in the
+        // independent emulator. It stores one/all in the inverse internal
+        // representation exposed by #47 (RetailOS maps internal 1 -> public 2
+        // and internal 2 -> public 1). The consumer itself is outside this
+        // firmware image, so this mapping follows comparison research.
+        const u32 public_mode = std::min(raw & 0xFFu, 2u);
+        f.emulator.audio_state().stream_repeat_internal_mode =
+            public_mode == 1 ? 2u : (public_mode == 2 ? 1u : 0u);
+        CLICKHLE_DEBUG(kCategory) << "stream_repeat " << raw;
         f.ret(0);
     });
     fn(50, "set_shuffle", 1, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
+        f.emulator.audio_state().stream_shuffle = f.args.next_u32() != 0;
         f.ret(0);
+    });
+
+    // #54/#55 expose the stream service field at +0x14. The retail setter
+    // ignores values outside the unsigned 16-bit range; its constructor's
+    // initial value is still unknown, so the emulator starts at zero.
+    fn(54, "stream_get_level", 0, [](HleCallFrame& f) {
+        f.ret(f.emulator.audio_state().stream_level);
+    });
+    fn(55, "stream_set_level", 1, [](HleCallFrame& f) {
+        const u32 level = f.args.next_u32();
+        if (level < 0x8000u) {
+            f.emulator.audio_state().stream_level = level;
+        }
+        f.ret_void();
+    });
+
+    // #56 returns context+0x114 directly unless it contains the -1 fallback
+    // sentinel, in which case RetailOS queries the player service. The player
+    // service is absent here, so that fallback remains inactive.
+    fn(56, "stream_get_state", 0, [](HleCallFrame& f) {
+        const i32 control = f.emulator.audio_state().stream_control;
+        f.ret(control < 0 ? 0u : static_cast<u32>(control) & 0xFFu);
+    });
+
+    // #58 initializes the two-word audio-format result to (4, 1). This small
+    // exported helper's output is directly visible in the firmware body.
+    fn(58, "audio_format_defaults", 1, [](HleCallFrame& f) {
+        const GuestAddr out = f.args.next_ptr();
+        if (!f.store<u16>(out, 4) || !f.store<u16>(out + 2, 1)) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret_void();
     });
 
     // Constants. Named for what they answer, which is all that was established.
     fn(52, "query_ff", 0, [](HleCallFrame& f) { f.ret(0xFF); });
-    for (const u32 ordinal : {42u, 45u, 46u, 47u, 49u, 51u, 53u, 55u, 56u,
-                              60u}) {
-        fn(ordinal, "zero", 0, [](HleCallFrame& f) { f.ret(0); });
+    // #53 posts the player-volume message. RetailOS clamps the input to 255
+    // and scales it against a player-owned quantity before dispatch. Keep the
+    // clamped request observable, but return the common successful-post status
+    // while the player task is absent.
+    fn(53, "set_player_volume", 1, [](HleCallFrame& f) {
+        const u32 volume = std::min(f.args.next_u32(), 0xFFu);
+        CLICKHLE_DEBUG(kCategory) << "set_player_volume " << volume
+                                  << " (player task unavailable)";
+        f.ret(0);
+    });
+    fn(42, "stream_select_first", 0, [](HleCallFrame& f) {
+        // Message 0x66000010 resets the selected stream index to zero.
+        f.emulator.audio_state().stream_index = 0;
+        f.ret(0);
+    });
+    fn(45, "stream_stop", 0, [](HleCallFrame& f) {
+        // Message 0x66000015 clears context+0x114.
+        f.emulator.audio_state().stream_control = 0;
+        if (AudioDevice* device = f.emulator.audio()) {
+            device->stop_voice(kMusicVoiceKey);
+        }
+        f.ret(0);
+    });
+    fn(46, "stream_toggle_pause", 0, [](HleCallFrame& f) {
+        auto& control = f.emulator.audio_state().stream_control;
+        // Message 0x66000013 switches 1 <-> 2; other states are unchanged.
+        if (control == 1) {
+            control = 2;
+        } else if (control == 2) {
+            control = 1;
+        }
+        if (AudioDevice* device = f.emulator.audio()) {
+            device->pause_voice(kMusicVoiceKey, control == 2);
+        }
+        f.ret(0);
+    });
+    fn(47, "stream_get_repeat", 0, [](HleCallFrame& f) {
+        const u32 internal =
+            f.emulator.audio_state().stream_repeat_internal_mode;
+        f.ret(internal == 1 ? 2u : (internal == 2 ? 1u : 0u));
+    });
+    // #49 reads player fields: inactive -> 0; active -> 1 normally, 2 when
+    // shuffle is enabled. The player object is absent, so derive activity and
+    // shuffle from the stream commands modeled above (#43/#45/#46/#50).
+    fn(49, "stream_get_play_mode", 0, [](HleCallFrame& f) {
+        const auto& state = f.emulator.audio_state();
+        if (state.stream_control <= 0) {
+            f.ret(0);
+        } else {
+            f.ret(state.stream_shuffle ? 2u : 1u);
+        }
+    });
+    // #51 needs the absent player service's position and duration. #60 reads
+    // the player position, clamped to duration, and is zero while inactive.
+    // Keep these at their measured inactive-player value until a stream clock
+    // is implemented rather than returning synthetic position data.
+    for (const u32 ordinal : {51u, 60u}) {
+        fn(ordinal, "zero", 0, [ordinal](HleCallFrame& f) {
+            if (std::getenv("CLICKHLE_AUDIO_CALL_TRACE") != nullptr) {
+                CLICKHLE_INFO(kCategory)
+                    << "Audio#" << ordinal << " registers r0-r3=0x" << std::hex
+                    << f.cpu.reg(0) << ",0x" << f.cpu.reg(1) << ",0x"
+                    << f.cpu.reg(2) << ",0x" << f.cpu.reg(3) << std::dec;
+            }
+            f.ret(0);
+        });
     }
 
     CLICKHLE_DEBUG(kCategory) << "audio registered (silent)";

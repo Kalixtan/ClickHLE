@@ -2,6 +2,13 @@
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <vector>
+
 #include "clickhle/audio/audio_device.h"
 #include "clickhle/common/log.h"
 
@@ -30,8 +37,9 @@ public:
         // waveOut only ever offers 8-bit unsigned or 16-bit signed PCM.
         spec.format = bits_per_sample == 8 ? SDL_AUDIO_U8 : SDL_AUDIO_S16LE;
 
+        spec_ = spec;
         stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-                                            &spec, nullptr, nullptr);
+                                            &spec, fill_stream, this);
         if (stream_ == nullptr) {
             CLICKHLE_WARN(kCategory)
                 << "SDL_OpenAudioDeviceStream: " << SDL_GetError();
@@ -39,8 +47,6 @@ public:
         }
         SDL_ResumeAudioStreamDevice(stream_);
 
-        frame_bytes_ = static_cast<u32>(spec.channels) *
-                       (bits_per_sample == 8 ? 1u : 2u);
         CLICKHLE_INFO(kCategory) << "opened " << sample_rate << " Hz, "
                                << spec.channels << " channel(s), "
                                << bits_per_sample << "-bit";
@@ -52,6 +58,8 @@ public:
             SDL_DestroyAudioStream(stream_);
             stream_ = nullptr;
         }
+        std::lock_guard lock(voices_mutex_);
+        voices_.clear();
     }
 
     [[nodiscard]] bool is_open() const override { return stream_ != nullptr; }
@@ -63,6 +71,59 @@ public:
         return SDL_PutAudioStreamData(stream_, data, static_cast<int>(bytes));
     }
 
+    [[nodiscard]] bool play(u32 key, const void* data, u32 bytes,
+                            u32 sample_rate, u16 channels,
+                            u16 bits_per_sample, bool loop) override {
+        if (stream_ == nullptr || data == nullptr || bytes == 0 ||
+            sample_rate == 0 || channels == 0 || channels > 2 ||
+            (bits_per_sample != 8 && bits_per_sample != 16)) {
+            return false;
+        }
+
+        SDL_AudioSpec source{};
+        source.freq = static_cast<int>(sample_rate);
+        source.channels = channels;
+        source.format = bits_per_sample == 8 ? SDL_AUDIO_U8 : SDL_AUDIO_S16LE;
+        Uint8* converted = nullptr;
+        int converted_size = 0;
+        if (!SDL_ConvertAudioSamples(&source,
+                                    static_cast<const Uint8*>(data),
+                                    static_cast<int>(bytes), &spec_, &converted,
+                                    &converted_size)) {
+            CLICKHLE_WARN(kCategory) << "SDL_ConvertAudioSamples: "
+                                     << SDL_GetError();
+            return false;
+        }
+        if (converted_size < 0 || converted_size % 4 != 0) {
+            SDL_free(converted);
+            return false;
+        }
+        Voice voice;
+        voice.samples.resize(static_cast<std::size_t>(converted_size) / 2);
+        std::memcpy(voice.samples.data(), converted,
+                    static_cast<std::size_t>(converted_size));
+        SDL_free(converted);
+        voice.loop = loop;
+        {
+            std::lock_guard lock(voices_mutex_);
+            voices_[key] = std::move(voice);
+        }
+        return true;
+    }
+
+    void stop_voice(u32 key) override {
+        std::lock_guard lock(voices_mutex_);
+        voices_.erase(key);
+    }
+
+    void pause_voice(u32 key, bool paused) override {
+        std::lock_guard lock(voices_mutex_);
+        const auto it = voices_.find(key);
+        if (it != voices_.end()) {
+            it->second.paused = paused;
+        }
+    }
+
     [[nodiscard]] u64 queued_bytes() const override {
         if (stream_ == nullptr) {
             return 0;
@@ -72,6 +133,10 @@ public:
     }
 
     void flush() override {
+        {
+            std::lock_guard lock(voices_mutex_);
+            voices_.clear();
+        }
         if (stream_ != nullptr) {
             SDL_ClearAudioStream(stream_);
         }
@@ -89,8 +154,68 @@ public:
     }
 
 private:
+    struct Voice {
+        std::vector<std::int16_t> samples;
+        std::size_t frame = 0;
+        bool loop = false;
+        bool paused = false;
+    };
+
+    static void SDLCALL fill_stream(void* userdata, SDL_AudioStream* stream,
+                                    int additional_amount, int) {
+        auto* self = static_cast<SdlAudioDevice*>(userdata);
+        if (self == nullptr || additional_amount <= 0) {
+            return;
+        }
+        const int aligned_size = additional_amount - (additional_amount % 4);
+        if (aligned_size <= 0) {
+            return;
+        }
+        const std::size_t frames = static_cast<std::size_t>(aligned_size) / 4;
+        std::vector<std::int32_t> mix(frames * 2, 0);
+        {
+            std::lock_guard lock(self->voices_mutex_);
+            for (auto it = self->voices_.begin(); it != self->voices_.end();) {
+                Voice& voice = it->second;
+                if (voice.paused || voice.samples.empty()) {
+                    ++it;
+                    continue;
+                }
+                for (std::size_t frame = 0; frame < frames; ++frame) {
+                    if (voice.frame >= voice.samples.size() / 2) {
+                        if (voice.loop) {
+                            voice.frame = 0;
+                        } else {
+                            break;
+                        }
+                    }
+                    mix[frame * 2] += voice.samples[voice.frame * 2];
+                    mix[frame * 2 + 1] += voice.samples[voice.frame * 2 + 1];
+                    ++voice.frame;
+                }
+                if (!voice.loop && voice.frame >= voice.samples.size() / 2) {
+                    it = self->voices_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        std::vector<std::int16_t> output(mix.size());
+        std::transform(mix.begin(), mix.end(), output.begin(),
+                       [](std::int32_t value) {
+            return static_cast<std::int16_t>(
+                std::clamp(value, -32768, 32767));
+        });
+        if (!SDL_PutAudioStreamData(stream, output.data(), aligned_size)) {
+            CLICKHLE_WARN(kCategory) << "SDL_PutAudioStreamData: "
+                                     << SDL_GetError();
+        }
+    }
+
     SDL_AudioStream* stream_ = nullptr;
-    u32 frame_bytes_ = 4;
+    SDL_AudioSpec spec_{};
+    std::mutex voices_mutex_;
+    std::map<u32, Voice> voices_;
 };
 
 }  // namespace

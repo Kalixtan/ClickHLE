@@ -3,16 +3,21 @@
 // report which import a game needs.
 
 #include <cstdlib>
+#include <algorithm>
 #include "clickhle/hle/modules.h"
 
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <fstream>
+#include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 // gles_statistics() lives with the renderer that counts frames, in gles.cpp
 // (or gles_stub.cpp when no video backend is compiled in).
@@ -37,25 +42,49 @@ constexpr const char* kModule = "OpenGLES";
 /// denominator is before any image has been loaded.
 constexpr u32 kOrdinalCount = 179;
 
-/// Whether the firmware's drawing subsystem has been started. We have no such
-/// subsystem -- the inherited GL layer is the renderer -- but the games wait on
-/// it, so the flag exists to answer them.
-bool g_render_server_running = false;
+struct Matrix4 {
+    float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+};
 
-/// Dimensions of each uploaded texture, by texture name.
-///
-/// Needed because the games give texture coordinates in **texels**, not in
-/// GL's normalised [0,1]. Bejeweled's first sheet is 322x242 and its
-/// coordinates run (1,1) to (321,241) -- a 320x240 window inside it, inset by
-/// the half-texel border. GL samples that as (1,1) in normalised space, which
-/// is one texel in the far corner, so every quad came out a flat colour.
-///
-/// The firmware's pipeline took texels; ES 1.x reaches the same place with a
-/// texture matrix scaled by 1/width, 1/height.
-std::map<u32, std::pair<u32, u32>> g_texture_size;
+struct RenderServerBuffer {
+    std::array<u8, 0x1c> descriptor{};
+    std::vector<u8> payload;
+};
 
-/// The texture bound to the active unit, so an upload knows what it is sizing.
-u32 g_bound_texture = 0;
+struct RenderServerSlot {
+    RenderServerBuffer first;
+    RenderServerBuffer second;
+};
+
+struct OrdinalGlState {
+    bool render_server_running = false;
+    std::vector<u8> render_server_image;
+    std::size_t render_server_image_cursor = 0;
+    std::map<u32, std::pair<u32, u32>> texture_size;
+    u32 bound_texture = 0;
+    u32 bound_target = 0;
+    std::map<GuestAddr, u32> matrix_mode;
+    u32 g167_calls = 0;
+    u32 other_transform_calls = 0;
+    std::map<GuestAddr, Matrix4> matrix_store;
+    std::set<GuestAddr> geometry_objects;
+    std::set<GuestAddr> consumed_since_build;
+    std::set<GuestAddr> composed_by_175;
+    GuestAddr upload_scratch = 0;
+    bool screen_projection_set = false;
+    GuestAddr screen_matrix = 0;
+    bool pending_guest_projection = false;
+    Matrix4 pending_guest_ortho{};
+    GuestAddr ortho_scratch = 0;
+    std::set<u32> texturing_enabled;
+    bool blending_configured = false;
+    bool shape_projection_installed = false;
+    std::array<RenderServerSlot, 8> render_server_slots{};
+};
+
+thread_local OrdinalGlState* active_ordinal_gl_state = nullptr;
+
+OrdinalGlState& ordinal_gl_state() { return *active_ordinal_gl_state; }
 
 /// The click-wheel panel. 320x240 on the 5G/5.5G, which is the only generation
 /// this corpus covers.
@@ -116,7 +145,19 @@ void register_opengles(HleRegistry& registry) {
     const auto fn = [&registry](u32 ordinal, std::string name, u8 arity,
                                 HleHandler handler) {
         registry.add(kModule, ordinal, std::move(name), arity,
-                     std::move(handler));
+            [handler = std::move(handler)](HleCallFrame& f) {
+                auto& storage = f.emulator.gles_ordinal_state_storage();
+                if (!storage.has_value()) storage.emplace<OrdinalGlState>();
+                OrdinalGlState* previous = active_ordinal_gl_state;
+                active_ordinal_gl_state =
+                    &std::any_cast<OrdinalGlState&>(storage);
+                struct RestoreState {
+                    OrdinalGlState*& slot;
+                    OrdinalGlState* previous;
+                    ~RestoreState() { slot = previous; }
+                } restore{active_ordinal_gl_state, previous};
+                handler(f);
+            });
     };
 
     // Forward an ordinal to the named GL ES entry point that implements it.
@@ -173,36 +214,19 @@ void register_opengles(HleRegistry& registry) {
         }
     };
 
-    // The firmware's texture target.
-    //
-    // It is 0x84F5, not GL's own GL_TEXTURE_2D (0x0DE1) -- Apple used its own
-    // number and the games pass it. An untranslated 0x84F5 reaches the GL layer
-    // as an unknown target and every bind and upload is quietly dropped, which
-    // is why Bejeweled uploaded four textures, bound them 130 times, and still
-    // came out 99% white.
-    constexpr u32 kFirmwareTexture2D = 0x84F5;
-    constexpr u32 kGlTexture2D = 0x0DE1;
     const HleFunction* gl_matrix_mode_p = registry.find("gl", "glMatrixMode");
     const HleFunction* gl_texture_scale_p = registry.find("gl", "glScalef");
     const HleFunction* gl_texture_identity_p = registry.find("gl", "glLoadIdentity");
 
     const auto map_target = [](u32 target) {
-        // LOG the raw target, because what these titles actually pass decides
-        // whether the mapping below is a translation or a silent retarget.
-        //
-        // LLE corrected this on 2026-09-19: 0x84F5 is NOT a spelling of
-        // GL_TEXTURE_2D. The firmware's validator (0x10106460) accepts
-        // 0x0DE1 GL_TEXTURE_2D, 0x84F5 GL_TEXTURE_RECTANGLE and 0x8513
-        // GL_TEXTURE_CUBE_MAP side by side -- three distinct targets.
-        //
-        // That matters here: RECTANGLE takes UNNORMALISED texel coordinates
-        // natively, which is exactly the convention these games use, and is the
-        // natural fit for their NPOT sheets (322x242, 512x45, 220x22).
+        // The firmware accepts GL_TEXTURE_2D, GL_TEXTURE_RECTANGLE, and
+        // GL_TEXTURE_CUBE_MAP as distinct targets. Preserve the enum: mapping
+        // rectangle to 2D changes its coordinate and sampling semantics.
         if (getenv("CLICKHLE_LOG_TEX_TARGET") != nullptr) {
             CLICKHLE_INFO(kCategory)
                 << "texture target 0x" << std::hex << target << std::dec;
         }
-        return target == kFirmwareTexture2D ? kGlTexture2D : target;
+        return target;
     };
 
     // Installs the texel -> normalised texture matrix for whatever texture is
@@ -227,26 +251,30 @@ void register_opengles(HleRegistry& registry) {
     const auto install_texel_scale = [gl_matrix_mode_p, gl_texture_scale_p,
                                       gl_texture_identity_p,
                                       call_with](HleCallFrame& f) {
-        const auto size = g_texture_size.find(g_bound_texture);
-        if (size == g_texture_size.end() || size->second.first == 0 ||
-            size->second.second == 0 || gl_matrix_mode_p == nullptr ||
+        if (gl_matrix_mode_p == nullptr ||
             gl_texture_scale_p == nullptr || gl_texture_identity_p == nullptr) {
             return;
         }
-        float inset = 0.0f;
-        if (const char* v = std::getenv("CLICKHLE_TEXEL_INSET")) {
-            inset = static_cast<float>(std::atof(v));
-        }
-        const float dw = static_cast<float>(size->second.first) - inset;
-        const float dh = static_cast<float>(size->second.second) - inset;
         constexpr u32 kTextureMode = 0x1702;
         constexpr u32 kModelviewMode = 0x1700;
         call_with(f, gl_matrix_mode_p, {kTextureMode});
         call_with(f, gl_texture_identity_p, {});
-        call_with(f, gl_texture_scale_p,
-                  {endian::float_to_bits(dw != 0.0f ? 1.0f / dw : 1.0f),
-                   endian::float_to_bits(dh != 0.0f ? 1.0f / dh : 1.0f),
-                   endian::float_to_bits(1.0f)});
+        if (ordinal_gl_state().bound_target == 0x0DE1) {
+            const auto size = ordinal_gl_state().texture_size.find(ordinal_gl_state().bound_texture);
+            if (size != ordinal_gl_state().texture_size.end() && size->second.first != 0 &&
+                size->second.second != 0) {
+                float inset = 0.0f;
+                if (const char* v = std::getenv("CLICKHLE_TEXEL_INSET")) {
+                    inset = static_cast<float>(std::atof(v));
+                }
+                const float dw = static_cast<float>(size->second.first) - inset;
+                const float dh = static_cast<float>(size->second.second) - inset;
+                call_with(f, gl_texture_scale_p,
+                          {endian::float_to_bits(dw != 0.0f ? 1.0f / dw : 1.0f),
+                           endian::float_to_bits(dh != 0.0f ? 1.0f / dh : 1.0f),
+                           endian::float_to_bits(1.0f)});
+            }
+        }
         call_with(f, gl_matrix_mode_p, {kModelviewMode});
     };
 
@@ -268,31 +296,21 @@ void register_opengles(HleRegistry& registry) {
     forward(12, "glClear", 1);
     forward(13, "glClearColor", 4);
 
-    // #157 takes two arguments, both literal zero, and sits in tail position --
-    // the last call a function makes before returning. Nine titles stop here
-    // immediately after their first clear, which is where a frame ends.
-    // `eglSwapBuffers(display, surface)` with null handles fits both the shape
-    // and the position.
-    //
-    // PROVISIONAL, and cheap to falsify: if this is right the frame counter
-    // starts moving and --frames begins to bound a run. If it is wrong the
-    // counter stays at zero and this line comes back out.
-    // gl_swap_buffers takes no arguments; we had declared two.
-    //
-    // It also returns 1, unconditionally, on its only return path
-    // (0x102615e0). Forwarding straight to the GL handler left r0 holding
-    // whatever that handler last wrote, which is not the same thing -- every
-    // title calls this every frame, so a stray zero here is read by any caller
-    // that tests it.
-    if (const HleFunction* swap = registry.find("gl", "eglSwapBuffers")) {
-        registry.add(kModule, 157, "eglSwapBuffers", 0, [swap](HleCallFrame& f) {
-            swap->handler(f);
+    // The export's firmware body takes no arguments, presents the queued
+    // render work, then returns 1. Call sites often leave two zeroes in r0/r1,
+    // but those registers are not part of the wrapper contract. Use the
+    // renderer's present operation directly instead of invoking the generic
+    // two-argument EGL entry point with stale register values.
+    if (registry.find("gl", "eglSwapBuffers") != nullptr) {
+        fn(157, "eglSwapBuffers", 0, [](HleCallFrame& f) {
+            gles_present_frame(f);
             f.ret(1);
         });
     }
 
-    // #35(cap) = glDisable. One argument, a GL capability; Sudoku passes
-    // 0x0B44, GL_CULL_FACE.
+    // #35(cap) = glDisable. One argument, a GL capability; corpus call sites
+    // pass 0x0B44 (GL_CULL_FACE) and 0x0B71 (GL_DEPTH_TEST). Do not run the
+    // value through map_target: it is a capability enum, not a texture target.
     //
     // We had this as glEnable, reasoning that GL_CULL_FACE is off by default
     // so calling it must be turning it on. Plausible, and wrong: a 2D title
@@ -300,8 +318,8 @@ void register_opengles(HleRegistry& registry) {
     // Corrected against the DogParty import map, which names it gl_disable.
     if (const HleFunction* gl_disable = registry.find("gl", "glDisable")) {
         fn(35, "glDisable", 1,
-           [gl_disable, map_target, call_with](HleCallFrame& f) {
-               call_with(f, gl_disable, {map_target(f.args.next_u32())});
+           [gl_disable, call_with](HleCallFrame& f) {
+               call_with(f, gl_disable, {f.args.next_u32()});
            });
     }
 
@@ -372,7 +390,6 @@ void register_opengles(HleRegistry& registry) {
     // because order is an accident of the title and behaviour is not. Tetris
     // uses two objects and gives ortho to the first; a title that did it the
     // other way round would still be read correctly.
-    static std::map<GuestAddr, u32> matrix_mode;
     constexpr u32 kProjection = 0x1701;
     constexpr u32 kModelview = 0x1700;
     // How many times #167 (glOrthof) has been called this run. LLE's
@@ -385,7 +402,6 @@ void register_opengles(HleRegistry& registry) {
     // it need to stand alone as its own full transform": a title with zero
     // #167 calls has no standing projection to share, in a corpus where
     // everyone else does. See #175's `else` branch below.
-    static u32 g167_calls = 0;
     // Counts #169/#171/#173/#175 calls -- any REAL transform path other than
     // #149. Sims Bowling/Sims Pool call #149 (paired 1:1 with #159) and
     // NONE of these, ever, in the whole recorded run (STATUS.md, blocker 2)
@@ -395,7 +411,6 @@ void register_opengles(HleRegistry& registry) {
     // specifically. This is the discriminator for a #149 attempt scoped to
     // exactly that shape, the same way g167_calls==0 scopes #125 to Texas
     // Hold'em alone.
-    static u32 g_other_transform_calls = 0;
 
     // --- one matrix per object, kept here ------------------------------------
     //
@@ -419,14 +434,9 @@ void register_opengles(HleRegistry& registry) {
     // by receiving a translate, scale or rotate: those are geometry transforms,
     // and an object that only ever gets load-identity and mult-matrix is
     // something else (a texture matrix, most likely).
-    struct Matrix4 {
-        float m[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    };
-    static std::map<GuestAddr, Matrix4> matrix_store;
     /// Objects that have received a translate, scale or rotate. Those are
     /// geometry transforms, so such an object is the modelview; one that only
     /// ever gets load-identity is something else.
-    static std::set<GuestAddr> geometry_objects;
     /// Objects #175 has read as a compose operand at least once since they
     /// were last built. Titles that reset a shared transform buffer with
     /// #165 before every rebuild never populate this (matrix_store[object]
@@ -442,7 +452,6 @@ void register_opengles(HleRegistry& registry) {
     /// #173 check this set and reset-then-clear on the first touch after a
     /// consume, which is a strictly narrower trigger than "every frame" and
     /// requires no frame-count plumbing across translation units.
-    static std::set<GuestAddr> consumed_since_build;
     /// Objects #175 has EVER read as a compose operand. LLE's reading of the
     /// real #169 firmware (2026-09-19): it takes the destination matrix as an
     /// explicit pointer argument and writes only that object -- "translate
@@ -460,7 +469,6 @@ void register_opengles(HleRegistry& registry) {
     /// then on. The first touch, before #175 has ever consumed it, still
     /// pushes directly, unchanged from today, because there is no way to
     /// know in advance which kind of object it will turn out to be.
-    static std::set<GuestAddr> composed_by_175;
 
     // Column-major, matching GL: result = a * b.
     const auto multiply = [](const Matrix4& a, const Matrix4& b) {
@@ -479,7 +487,6 @@ void register_opengles(HleRegistry& registry) {
 
     // Pushes an object's matrix into a GL matrix stack (GL_MODELVIEW or
     // GL_PROJECTION -- `gl_mode` is one of kModelview/kProjection).
-    static GuestAddr upload_scratch = 0;
     const auto load_matrix = [call_with](HleCallFrame& f, u32 gl_mode,
                                          const Matrix4& matrix) {
         const HleRegistry& registry_ref = f.emulator.registry();
@@ -488,6 +495,7 @@ void register_opengles(HleRegistry& registry) {
         if (mode == nullptr || load == nullptr) {
             return;
         }
+        GuestAddr& upload_scratch = ordinal_gl_state().upload_scratch;
         if (upload_scratch == 0) {
             upload_scratch = f.emulator.heap().allocate(16 * sizeof(u32));
         }
@@ -520,8 +528,6 @@ void register_opengles(HleRegistry& registry) {
     //
     // So we install the screen ortho once, as the firmware does, and let the
     // game's matrices be the modelview.
-    static bool screen_projection_set = false;
-    static GuestAddr screen_matrix = 0;
     // A projection the GUEST asked for via #167 before a GL context existed.
     //
     // #167 used to mark the projection "set" unconditionally and then issue a
@@ -541,8 +547,6 @@ void register_opengles(HleRegistry& registry) {
     // orientation, per the table below), and neither is substituting the
     // firmware default. So it is remembered and re-applied on the first draw
     // that has a context to put it in.
-    static bool pending_guest_projection = false;
-    static Matrix4 pending_guest_ortho{};
     const HleFunction* gl_matrix_mode = registry.find("gl", "glMatrixMode");
     const HleFunction* gl_load_matrix = registry.find("gl", "glLoadMatrixf");
     const auto ensure_screen_projection = [gl_matrix_mode, gl_load_matrix,
@@ -552,13 +556,13 @@ void register_opengles(HleRegistry& registry) {
             if (calls < 10) {
                 ++calls;
                 CLICKHLE_INFO(kCategory)
-                    << "ensure_screen_projection: set=" << screen_projection_set
+                    << "ensure_screen_projection: set=" << ordinal_gl_state().screen_projection_set
                     << " mode_null=" << (gl_matrix_mode == nullptr)
                     << " load_null=" << (gl_load_matrix == nullptr)
                     << " display_open=" << f.emulator.display().is_open();
             }
         }
-        if (screen_projection_set || gl_matrix_mode == nullptr ||
+        if (ordinal_gl_state().screen_projection_set || gl_matrix_mode == nullptr ||
             gl_load_matrix == nullptr) {
             return;
         }
@@ -575,7 +579,7 @@ void register_opengles(HleRegistry& registry) {
         if (!f.emulator.display().is_open()) {
             return;
         }
-        screen_projection_set = true;
+        ordinal_gl_state().screen_projection_set = true;
         constexpr u32 kProjectionMode = 0x1701;
         constexpr u32 kModelviewMode = 0x1700;
 
@@ -610,30 +614,30 @@ void register_opengles(HleRegistry& registry) {
             0.0f,           0.0f,          -1.0f,  0.0f,
            -1.0f,           1.0f,           0.0f,  1.0f,
         };
-        if (screen_matrix == 0) {
-            screen_matrix = f.emulator.heap().allocate(sizeof(matrix));
+        if (ordinal_gl_state().screen_matrix == 0) {
+            ordinal_gl_state().screen_matrix = f.emulator.heap().allocate(sizeof(matrix));
         }
-        if (screen_matrix == kNullGuest) {
+        if (ordinal_gl_state().screen_matrix == kNullGuest) {
             return;
         }
         // A projection the guest asked for itself wins over the default. It
         // was built before a context existed, so this is the first chance to
         // actually land it.
-        const bool use_guest = pending_guest_projection;
+        const bool use_guest = ordinal_gl_state().pending_guest_projection;
         for (u32 i = 0; i < 16; ++i) {
-            const float v = use_guest ? pending_guest_ortho.m[i] : matrix[i];
-            (void)f.memory.write<u32>(screen_matrix + 4 * i,
+            const float v = use_guest ? ordinal_gl_state().pending_guest_ortho.m[i] : matrix[i];
+            (void)f.memory.write<u32>(ordinal_gl_state().screen_matrix + 4 * i,
                                       endian::float_to_bits(v));
         }
         call_with(f, gl_matrix_mode, {kProjectionMode});
-        call_with(f, gl_load_matrix, {screen_matrix});
+        call_with(f, gl_load_matrix, {ordinal_gl_state().screen_matrix});
         call_with(f, gl_matrix_mode, {kModelviewMode});
         if (use_guest) {
-            pending_guest_projection = false;
+            ordinal_gl_state().pending_guest_projection = false;
             CLICKHLE_INFO(kCategory)
                 << "installed the GUEST's deferred #167 projection (diag "
-                << pending_guest_ortho.m[0] << ", "
-                << pending_guest_ortho.m[5] << ")";
+                << ordinal_gl_state().pending_guest_ortho.m[0] << ", "
+                << ordinal_gl_state().pending_guest_ortho.m[5] << ")";
         } else {
             CLICKHLE_INFO(kCategory)
                 << "installed the firmware's 320x240 screen projection";
@@ -666,9 +670,19 @@ void register_opengles(HleRegistry& registry) {
     // appeared to show the same numbers and was register residue; three IEEE
     // floats in a projection call are not.
     const HleFunction* gl_ortho = registry.find("gl", "glOrthof");
+    const auto store_matrix = [](HleCallFrame& f, GuestAddr address,
+                                 const Matrix4& matrix) {
+        for (u32 i = 0; i < 16; ++i) {
+            if (!f.store<u32>(address + 4 * i,
+                              endian::float_to_bits(matrix.m[i]))) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (gl_ortho != nullptr) {
-        fn(167, "glOrthof", 7, [](HleCallFrame& f) {
-            ++g167_calls;
+        fn(167, "glOrthof", 7, [store_matrix](HleCallFrame& f) {
+            ++ordinal_gl_state().g167_calls;
             const GuestAddr object = f.args.next_ptr();
             const float left = endian::bits_to_float(f.args.next_u32());
             const float right = endian::bits_to_float(f.args.next_u32());
@@ -691,8 +705,6 @@ void register_opengles(HleRegistry& registry) {
             // over the top forced every title to y-up, which is why Bejeweled
             // -- which explicitly asks for y-down with ortho(0, 320, 240, 0) --
             // was drawn upside down.
-            matrix_mode[object] = kProjection;
-
             // Built and loaded rather than forwarded to glOrtho.
             //
             // glOrtho *multiplies* the current matrix. Forwarding it applies
@@ -704,11 +716,6 @@ void register_opengles(HleRegistry& registry) {
             const float width = right - left;
             const float height = top - bottom;
             const float depth = far_plane - near_plane;
-            if (width == 0.0f || height == 0.0f || depth == 0.0f) {
-                CLICKHLE_WARN(kCategory) << "degenerate glOrthof; ignored";
-                f.ret(0);
-                return;
-            }
             Matrix4 ortho;
             ortho.m[0] = 2.0f / width;
             ortho.m[5] = 2.0f / height;
@@ -716,7 +723,12 @@ void register_opengles(HleRegistry& registry) {
             ortho.m[12] = -(right + left) / width;
             ortho.m[13] = -(top + bottom) / height;
             ortho.m[14] = -(far_plane + near_plane) / depth;
-            matrix_store[object] = ortho;
+            if (!store_matrix(f, object, ortho)) {
+                f.cpu.request_stop();
+                return;
+            }
+            ordinal_gl_state().matrix_mode[object] = kProjection;
+            ordinal_gl_state().matrix_store[object] = ortho;
 
             // No GL context yet: the load below would be silently discarded.
             // Remember it and let ensure_screen_projection apply it on the
@@ -725,33 +737,32 @@ void register_opengles(HleRegistry& registry) {
             // exactly what left iQuiz at GL's identity projection, black for
             // the whole run. See pending_guest_projection above.
             if (!f.emulator.display().is_open()) {
-                pending_guest_projection = true;
-                pending_guest_ortho = ortho;
+                ordinal_gl_state().pending_guest_projection = true;
+                ordinal_gl_state().pending_guest_ortho = ortho;
                 CLICKHLE_INFO(kCategory)
                     << "#167 before any GL context; deferring the guest's "
                        "projection until one exists";
-                f.ret(0);
+                f.ret_void();
                 return;
             }
-            screen_projection_set = true;
+            ordinal_gl_state().screen_projection_set = true;
 
             const HleRegistry& registry_ref = f.emulator.registry();
             const HleFunction* mode = registry_ref.find("gl", "glMatrixMode");
             const HleFunction* load = registry_ref.find("gl", "glLoadMatrixf");
             if (mode == nullptr || load == nullptr) {
-                f.ret(0);
+                f.ret_void();
                 return;
             }
-            static GuestAddr ortho_scratch = 0;
-            if (ortho_scratch == 0) {
-                ortho_scratch = f.emulator.heap().allocate(16 * sizeof(u32));
+            if (ordinal_gl_state().ortho_scratch == 0) {
+                ordinal_gl_state().ortho_scratch = f.emulator.heap().allocate(16 * sizeof(u32));
             }
-            if (ortho_scratch == kNullGuest) {
-                f.ret(0);
+            if (ordinal_gl_state().ortho_scratch == kNullGuest) {
+                f.ret_void();
                 return;
             }
             for (u32 i = 0; i < 16; ++i) {
-                (void)f.memory.write<u32>(ortho_scratch + 4 * i,
+                (void)f.memory.write<u32>(ordinal_gl_state().ortho_scratch + 4 * i,
                                           endian::float_to_bits(ortho.m[i]));
             }
             {
@@ -761,20 +772,63 @@ void register_opengles(HleRegistry& registry) {
             }
             {
                 HleCallFrame inner(f.cpu, f.memory, f.emulator);
-                inner.cpu.set_reg(0, ortho_scratch);
+                inner.cpu.set_reg(0, ordinal_gl_state().ortho_scratch);
                 load->handler(inner);
             }
-            f.ret(0);
+            f.ret_void();
+        });
+    } else {
+        fn(167, "matrix_ortho", 7, [store_matrix](HleCallFrame& f) {
+            const GuestAddr object = f.args.next_ptr();
+            const float left = endian::bits_to_float(f.args.next_u32());
+            const float right = endian::bits_to_float(f.args.next_u32());
+            const float bottom = endian::bits_to_float(f.args.next_u32());
+            const float top = endian::bits_to_float(f.args.next_u32());
+            const float near_plane = endian::bits_to_float(f.args.next_u32());
+            const float far_plane = endian::bits_to_float(f.args.next_u32());
+            const float width = right - left;
+            const float height = top - bottom;
+            const float depth = far_plane - near_plane;
+            Matrix4 matrix;
+            matrix.m[0] = 2.0f / width;
+            matrix.m[5] = 2.0f / height;
+            matrix.m[10] = -2.0f / depth;
+            matrix.m[12] = -(right + left) / width;
+            matrix.m[13] = -(top + bottom) / height;
+            matrix.m[14] = -(far_plane + near_plane) / depth;
+            if (!store_matrix(f, object, matrix)) {
+                f.cpu.request_stop();
+                return;
+            }
+            f.ret_void();
         });
     }
 
     // #165 gl_load_identity(object), #169 translate, #171 scale, #173 rotate.
     // Each selects the object's matrix mode, then applies the operation.
     const HleFunction* gl_identity = registry.find("gl", "glLoadIdentity");
+    const auto write_identity = [](HleCallFrame& f, GuestAddr address) {
+        constexpr u32 identity[16] = {
+            0x3f800000, 0, 0, 0, 0, 0x3f800000, 0, 0,
+            0, 0, 0x3f800000, 0, 0, 0, 0, 0x3f800000};
+        for (u32 i = 0; i < 16; ++i) {
+            if (!f.store<u32>(address + 4 * i, identity[i])) {
+                return false;
+            }
+        }
+        return true;
+    };
     if (gl_identity != nullptr) {
         fn(165, "glLoadIdentity", 1,
-           [load_modelview](HleCallFrame& f) {
+           [load_modelview, write_identity](HleCallFrame& f) {
                const GuestAddr object = f.args.next_ptr();
+               // The RetailOS export writes an identity matrix to the guest
+               // buffer. The host matrix stack is an additional renderer
+               // adaptation; it does not replace this observable memory write.
+               if (!write_identity(f, object)) {
+                   f.cpu.request_stop();
+                   return;
+               }
                // One-off (2026-09-19): is Texas Hold'em's shared transform
                // buffer (0x18059808) ever reset between objects, or does its
                // translate+rotate compose onto whatever the previous object
@@ -791,13 +845,23 @@ void register_opengles(HleRegistry& registry) {
                // the one driving geometry. Issuing glLoadIdentity here
                // unconditionally is what wiped Tetris's text cursor: the game
                // resets a different matrix between every glyph.
-               matrix_store[object] = Matrix4{};
-               consumed_since_build.erase(object);
-               if (geometry_objects.count(object) != 0) {
-                   load_modelview(f, matrix_store[object]);
+               ordinal_gl_state().matrix_store[object] = Matrix4{};
+               ordinal_gl_state().consumed_since_build.erase(object);
+               if (ordinal_gl_state().geometry_objects.count(object) != 0) {
+                   load_modelview(f, ordinal_gl_state().matrix_store[object]);
                }
-               f.ret(0);
-               return;
+               f.ret_void();
+           });
+    } else {
+        // This export is pure guest-memory matrix math and remains available in
+        // headless builds where the GL adapter registers no named functions.
+        fn(165, "matrix_identity", 1,
+           [write_identity](HleCallFrame& f) {
+               if (!write_identity(f, f.args.next_ptr())) {
+                   f.cpu.request_stop();
+                   return;
+               }
+               f.ret_void();
            });
     }
 
@@ -812,12 +876,12 @@ void register_opengles(HleRegistry& registry) {
                                MatrixOp{171, "glScalef", 4},
                                MatrixOp{173, "glRotatef", 5}}) {
         const HleFunction* target = registry.find("gl", op.name);
-        if (target == nullptr) {
+        if (target == nullptr && op.ordinal != 169) {
             continue;
         }
         fn(op.ordinal, op.name, op.arity,
            [op, multiply, load_modelview](HleCallFrame& f) {
-               ++g_other_transform_calls;
+               ++ordinal_gl_state().other_transform_calls;
                const GuestAddr object = f.args.next_ptr();
                u32 words[4] = {0, 0, 0, 0};
                const u32 count = op.arity - 1u;
@@ -843,9 +907,45 @@ void register_opengles(HleRegistry& registry) {
                const float y = endian::bits_to_float(words[1]);
                const float z = endian::bits_to_float(words[2]);
 
+               if (op.ordinal == 169) {
+                   // RetailOS #169 updates the caller's matrix in place. Its
+                   // soft-float body computes the new fourth column as
+                   // M * (x, y, z, 1); keep each multiply/add as a separate
+                   // single-precision step to match that helper sequence.
+                   constexpr u32 kMatrixBytes = 16u * 4u;
+                   if (object == kNullGuest ||
+                       object > std::numeric_limits<GuestAddr>::max() -
+                                    (kMatrixBytes - 1u)) {
+                       f.cpu.request_stop();
+                       return;
+                   }
+                   std::array<float, 16> guest_matrix{};
+                   for (u32 i = 0; i < 16; ++i) {
+                       const auto bits = f.memory.read<u32>(object + i * 4u);
+                       if (!bits.has_value()) {
+                           f.cpu.request_stop();
+                           return;
+                       }
+                       guest_matrix[i] = endian::bits_to_float(*bits);
+                   }
+                   for (u32 row = 0; row < 4; ++row) {
+                       const float x_term = guest_matrix[row] * x;
+                       const float y_term = guest_matrix[4 + row] * y;
+                       const float z_term = guest_matrix[8 + row] * z;
+                       const float xy = x_term + y_term;
+                       const float xyz = xy + z_term;
+                       const float translated = xyz + guest_matrix[12 + row];
+                       if (!f.store<u32>(object + (12 + row) * 4u,
+                                         endian::float_to_bits(translated))) {
+                           f.cpu.request_stop();
+                           return;
+                       }
+                   }
+               }
+
                // Receiving a geometry transform is what marks an object as the
                // modelview.
-               geometry_objects.insert(object);
+               ordinal_gl_state().geometry_objects.insert(object);
                // First touch since #175 last consumed this object: start the
                // next build fresh instead of composing onto what was already
                // handed off. A title that resets via #165 before every reuse
@@ -881,10 +981,10 @@ void register_opengles(HleRegistry& registry) {
                // all, a mechanism not yet understood. Reverted all three;
                // see STATUS.md for the full trail. Left exactly as shipped
                // below pending a correctly-implemented fix.
-               if (consumed_since_build.erase(object) != 0) {
-                   matrix_store[object] = Matrix4{};
+               if (ordinal_gl_state().consumed_since_build.erase(object) != 0) {
+                   ordinal_gl_state().matrix_store[object] = Matrix4{};
                }
-               Matrix4& current = matrix_store[object];
+               Matrix4& current = ordinal_gl_state().matrix_store[object];
 
                Matrix4 delta;
                if (op.ordinal == 169) {          // translate
@@ -951,15 +1051,15 @@ void register_opengles(HleRegistry& registry) {
                // title before trusting this, not just compat_table.py --
                // that already missed one real regression today.
                const bool gated =
-                   composed_by_175.count(object) != 0 || g167_calls == 0;
+                   ordinal_gl_state().composed_by_175.count(object) != 0 || ordinal_gl_state().g167_calls == 0;
                if (const char* watch = std::getenv("CLICKHLE_WATCH_OBJ")) {
                    if (std::strcmp(watch, "all") == 0 ||
                        object == std::strtoul(watch, nullptr, 0)) {
                        CLICKHLE_INFO(kCategory)
                            << "#" << op.ordinal << " on obj=0x" << std::hex
                            << object << std::dec << " gated=" << gated
-                           << " composed=" << (composed_by_175.count(object) != 0)
-                           << " g167_calls=" << g167_calls;
+                           << " composed=" << (ordinal_gl_state().composed_by_175.count(object) != 0)
+                           << " g167_calls=" << ordinal_gl_state().g167_calls;
                    }
                }
                if (std::getenv("CLICKHLE_DUMP_165") != nullptr &&
@@ -967,14 +1067,14 @@ void register_opengles(HleRegistry& registry) {
                    CLICKHLE_INFO(kCategory)
                        << "#" << op.ordinal << " on 0x18059808 gated="
                        << gated << " composed_by_175.size()="
-                       << composed_by_175.size();
+                       << ordinal_gl_state().composed_by_175.size();
                }
                if (op.ordinal == 169 && std::getenv("CLICKHLE_DUMP_CURSOR") != nullptr) {
                    CLICKHLE_INFO(kCategory)
                        << "#169 obj=0x" << std::hex << object << std::dec
                        << " gated=" << gated << " composed="
-                       << (composed_by_175.count(object) != 0)
-                       << " g167_calls=" << g167_calls;
+                       << (ordinal_gl_state().composed_by_175.count(object) != 0)
+                       << " g167_calls=" << ordinal_gl_state().g167_calls;
                }
                if (!gated) {
                    load_modelview(f, current);
@@ -1042,8 +1142,8 @@ void register_opengles(HleRegistry& registry) {
            });
     }
 
-    // Textures. #4 and #45 line up with GL's own argument order, so they
-    // forward directly.
+    // Textures. #4 binds one of the firmware-supported targets; #45 otherwise
+    // follows GL's own argument order.
     const HleFunction* gl_bind = registry.find("gl", "glBindTexture");
     const HleFunction* gl_enable_cap = registry.find("gl", "glEnable");
     const HleFunction* gl_texture_scale = registry.find("gl", "glScalef");
@@ -1058,7 +1158,8 @@ void register_opengles(HleRegistry& registry) {
             call_with](HleCallFrame& f) {
                const u32 target = map_target(f.args.next_u32());
                const u32 texture = f.args.next_u32();
-               g_bound_texture = texture;
+               ordinal_gl_state().bound_texture = texture;
+               ordinal_gl_state().bound_target = target;
                if (std::getenv("CLICKHLE_DUMP_GEN") != nullptr) {
                    CLICKHLE_INFO(kCategory)
                        << "#4 glBindTexture(target=0x" << std::hex << target
@@ -1093,20 +1194,22 @@ void register_opengles(HleRegistry& registry) {
                // silently stayed off for the *entire run*, and a colour-key
                // sprite sheet (opaque magenta behind the glyphs, meant to
                // blend to transparent) rendered as a solid magenta rectangle.
-               static bool texturing_enabled = false;
-               if (!texturing_enabled && gl_enable_cap != nullptr &&
+               const bool target_is_valid = target == 0x0DE1 ||
+                                            target == 0x84F5 ||
+                                            target == 0x8513;
+               if (target_is_valid && !ordinal_gl_state().texturing_enabled.contains(target) &&
+                   gl_enable_cap != nullptr && f.emulator.display().is_open()) {
+                   ordinal_gl_state().texturing_enabled.insert(target);
+                   call_with(f, gl_enable_cap, {target});
+                   CLICKHLE_INFO(kCategory) << "enabled texture target 0x"
+                                            << std::hex << target << std::dec;
+               }
+               if (!ordinal_gl_state().blending_configured && gl_enable_cap != nullptr &&
                    f.emulator.display().is_open()) {
-                   texturing_enabled = true;
-                   call_with(f, gl_enable_cap, {kGlTexture2D});
-                   CLICKHLE_INFO(kCategory) << "enabled texturing";
-
-                   // Blending is on by default for the same reason, and the
-                   // same evidence: the firmware exposes gl_disable and no
-                   // gl_enable, so a game that wants blending simply never
-                   // turns it off. ES 1.x defaults it off, and an alpha-only
-                   // texture drawn without it is a solid rectangle -- which is
-                   // what Tetris's fonts and menu panels were. A title that
-                   // genuinely wants it off still says so through #35.
+                   ordinal_gl_state().blending_configured = true;
+                   // ES 1.x defaults blending off. The game corpus relies on
+                   // alpha textures, and titles that disable blending route
+                   // through the explicit #35 capability call.
                    constexpr u32 kGlBlend = 0x0BE2;
                    constexpr u32 kSrcAlpha = 0x0302;
                    constexpr u32 kOneMinusSrcAlpha = 0x0303;
@@ -1118,17 +1221,6 @@ void register_opengles(HleRegistry& registry) {
                    CLICKHLE_INFO(kCategory) << "enabled alpha blending";
                }
                call_with(f, gl_bind, {target, texture});
-               // #4 returns 1. Measured by the oracle on both RetailOS images.
-               //
-               // Their caveat is the more useful half and I am recording it
-               // here because it applies to every return value in this file:
-               // #4 returns r0 = 1 for a LEGAL target (0x0DE1, 20 instructions)
-               // and r0 = 1 for an ILLEGAL one (0x0000, 17344 instructions).
-               // Same stop, same value, 866x the work. "It returned 1" is
-               // therefore not evidence the call did anything, and a return
-               // value alone cannot tell a success from a validated failure.
-               f.ret(1);
-
                // Clamp to edge, every bind.
                //
                // GL defaults to GL_REPEAT, and these sheets are NPOT (322x242,
@@ -1184,8 +1276,8 @@ void register_opengles(HleRegistry& registry) {
                // Rescale texel coordinates into GL's normalised space for
                // whatever is now bound. Done on bind rather than once, because
                // the divisor is the *texture's* size and every sheet differs.
-               const auto size = g_texture_size.find(texture);
-               if (size != g_texture_size.end() && gl_matrix_mode != nullptr &&
+               const auto size = ordinal_gl_state().texture_size.find(texture);
+               if (size != ordinal_gl_state().texture_size.end() && gl_matrix_mode != nullptr &&
                    gl_texture_scale != nullptr && gl_texture_identity != nullptr &&
                    size->second.first != 0 && size->second.second != 0) {
                    constexpr u32 kTextureMode = 0x1702;
@@ -1216,9 +1308,33 @@ void register_opengles(HleRegistry& registry) {
                               endian::float_to_bits(1.0f)});
                    call_with(f, gl_matrix_mode, {kModelviewMode});
                }
+               // #4 returns 1 for both a legal target (0x0DE1) and an
+               // invalid target (0x0000), measured on both RetailOS images.
+               // Write it after host-side state setup because call_with leaves
+               // the last GL arguments in r0, and this export's result is part
+               // of the public contract even when those calls are present.
+               f.ret(1);
            });
     }
-    forward(45, "glGenTextures", 2);
+    if (registry.find("gl", "glGenTextures") != nullptr) {
+        forward(45, "glGenTextures", 2);
+    } else {
+        // Texture names are firmware-side counters; generating them does not
+        // require a host GL context. Keep this export usable in headless builds.
+        fn(45, "glGenTextures", 2, [](HleCallFrame& f) {
+            const i32 count = f.args.next_i32();
+            const GuestAddr output = f.args.next_ptr();
+            if (count > 0) {
+                u32& next = f.emulator.next_gles_texture_name();
+                for (i32 i = 0; i < count; ++i) {
+                    ++next;
+                    static_cast<void>(f.store<u32>(
+                        output + static_cast<u32>(i) * 4u, next));
+                }
+            }
+            f.ret_void();
+        });
+    }
     forward(0, "glActiveTexture", 1);
     forward(84, "glPixelStorei", 2);
     // #90/#138: named by reading the firmware's own assert strings, not
@@ -1251,7 +1367,7 @@ void register_opengles(HleRegistry& registry) {
     if (registry.find("gl", "glLoadMatrixf") != nullptr) {
         fn(175, "gl_matrix_multiply", 3,
            [multiply, load_modelview, load_matrix](HleCallFrame& f) {
-               ++g_other_transform_calls;
+               ++ordinal_gl_state().other_transform_calls;
                const GuestAddr dest = f.args.next_ptr();
                const GuestAddr a = f.args.next_ptr();
                const GuestAddr b = f.args.next_ptr();
@@ -1265,11 +1381,11 @@ void register_opengles(HleRegistry& registry) {
                // data, which sampled an object header and decoded as a
                // convincing identity. Every draw was then positioned by an
                // identity matrix and no frame looked obviously wrong.
-               matrix_store[dest] = multiply(matrix_store[a], matrix_store[b]);
-               consumed_since_build.insert(a);
-               consumed_since_build.insert(b);
-               composed_by_175.insert(a);
-               composed_by_175.insert(b);
+               ordinal_gl_state().matrix_store[dest] = multiply(ordinal_gl_state().matrix_store[a], ordinal_gl_state().matrix_store[b]);
+               ordinal_gl_state().consumed_since_build.insert(a);
+               ordinal_gl_state().consumed_since_build.insert(b);
+               ordinal_gl_state().composed_by_175.insert(a);
+               ordinal_gl_state().composed_by_175.insert(b);
 
                // Ground truth, not the host-side cache: an operand this
                // session has never seen written through a tracked ordinal
@@ -1341,7 +1457,7 @@ void register_opengles(HleRegistry& registry) {
                            << "  mem_a=" << mem_a.m[0] << "," << mem_a.m[5]
                            << "," << mem_a.m[10] << "," << mem_a.m[15]
                            << " trans=" << mem_a.m[12] << "," << mem_a.m[13]
-                           << "," << mem_a.m[14] << " bound=" << g_bound_texture;
+                           << "," << mem_a.m[14] << " bound=" << ordinal_gl_state().bound_texture;
                    }
                }
 
@@ -1349,8 +1465,8 @@ void register_opengles(HleRegistry& registry) {
                // is the other operand -- the model transform. When neither
                // operand is the projection, the composed result is it.
                const auto role_of = [](GuestAddr object) {
-                   const auto it = matrix_mode.find(object);
-                   return it == matrix_mode.end() ? kModelview : it->second;
+                   const auto it = ordinal_gl_state().matrix_mode.find(object);
+                   return it == ordinal_gl_state().matrix_mode.end() ? kModelview : it->second;
                };
                // Sticky once seen: a title whose real projection was found by
                // shape has a standing projection now, same as if #167 had
@@ -1366,10 +1482,20 @@ void register_opengles(HleRegistry& registry) {
                    CLICKHLE_INFO(kCategory)
                        << "  a_is_ortho=" << a_is_ortho
                        << " b_is_ortho=" << b_is_ortho
-                       << " bound=" << g_bound_texture;
+                       << " bound=" << ordinal_gl_state().bound_texture;
                }
-               static bool shape_projection_installed = false;
-               if (a_is_ortho || b_is_ortho) {
+               // This override exists for Texas Hold'em's no-#167 render
+               // path, where #175 carries a complete screen ortho alongside
+               // an unrelated camera object. Titles that called #167 have
+               // already tagged the ortho operand as GL_PROJECTION; honor
+               // that role and keep the other operand as MODELVIEW. Tetris
+               // uses exactly that combination for its per-glyph cursor, so
+               // treating every ortho as the Hold'em case erased its text
+               // translation and stacked the glyphs at the origin.
+               const bool untagged_ortho_override =
+                   (a_is_ortho || b_is_ortho) &&
+                   ordinal_gl_state().g167_calls == 0;
+               if (untagged_ortho_override) {
                    // Unlike the perspective case below, the OTHER operand
                    // here is not a useful per-object transform -- it's
                    // Texas Hold'em's shared camera buffer (0x18059808),
@@ -1383,7 +1509,7 @@ void register_opengles(HleRegistry& registry) {
                    // and IDENTITY as GL_MODELVIEW (not the other operand --
                    // that's what makes this different from the perspective
                    // branch) is what a flat 2D screen-space quad needs.
-                   shape_projection_installed = true;
+                   ordinal_gl_state().shape_projection_installed = true;
                    load_matrix(f, kProjection, a_is_ortho ? mem_a : mem_b);
                    load_matrix(f, kModelview, Matrix4{});
                    // matrix_store[dest] was already set above to the stale
@@ -1396,10 +1522,10 @@ void register_opengles(HleRegistry& registry) {
                    // fix alone visibly took effect, then vanished by the
                    // time the draw actually ran, purely from #125 re-reading
                    // an inconsistent cache -- not a second rendering bug.
-                   matrix_store[dest] = Matrix4{};
+                   ordinal_gl_state().matrix_store[dest] = Matrix4{};
                } else if (a_is_projection || b_is_projection) {
-                   if (!shape_projection_installed) {
-                       shape_projection_installed = true;
+                   if (!ordinal_gl_state().shape_projection_installed) {
+                       ordinal_gl_state().shape_projection_installed = true;
                        CLICKHLE_INFO(kCategory)
                            << "#175: operand shape identifies a real "
                               "perspective projection outside #167 -- "
@@ -1414,25 +1540,25 @@ void register_opengles(HleRegistry& registry) {
                            << "#175 role_of(a)==Projection, pushing "
                               "matrix_store[b=0x"
                            << std::hex << b << "] as modelview, trans=("
-                           << matrix_store[b].m[12] << ","
-                           << matrix_store[b].m[13] << ","
-                           << matrix_store[b].m[14] << ")" << std::dec;
+                           << ordinal_gl_state().matrix_store[b].m[12] << ","
+                           << ordinal_gl_state().matrix_store[b].m[13] << ","
+                           << ordinal_gl_state().matrix_store[b].m[14] << ")" << std::dec;
                    }
-                   load_modelview(f, matrix_store[b]);
+                   load_modelview(f, ordinal_gl_state().matrix_store[b]);
                } else if (role_of(b) == kProjection) {
                    if (std::getenv("CLICKHLE_DUMP_MODE") != nullptr) {
                        CLICKHLE_INFO(kCategory)
                            << "#175 role_of(b)==Projection, pushing "
                               "matrix_store[a=0x"
                            << std::hex << a << "] as modelview, diag=("
-                           << matrix_store[a].m[0] << ","
-                           << matrix_store[a].m[5] << ","
-                           << matrix_store[a].m[10] << ") trans=("
-                           << matrix_store[a].m[12] << ","
-                           << matrix_store[a].m[13] << ","
-                           << matrix_store[a].m[14] << ")" << std::dec;
+                           << ordinal_gl_state().matrix_store[a].m[0] << ","
+                           << ordinal_gl_state().matrix_store[a].m[5] << ","
+                           << ordinal_gl_state().matrix_store[a].m[10] << ") trans=("
+                           << ordinal_gl_state().matrix_store[a].m[12] << ","
+                           << ordinal_gl_state().matrix_store[a].m[13] << ","
+                           << ordinal_gl_state().matrix_store[a].m[14] << ")" << std::dec;
                    }
-                   load_modelview(f, matrix_store[a]);
+                   load_modelview(f, ordinal_gl_state().matrix_store[a]);
                } else {
                    // Neither operand was ever tagged by #167, and neither
                    // looks like a projection by shape either -- across the
@@ -1467,7 +1593,7 @@ void register_opengles(HleRegistry& registry) {
                    // two known states, kept pending the actual answer: what
                    // is supposed to reset modelview to identity for a flat
                    // 2D overlay draw, and why isn't it happening.
-                   if (g167_calls == 0 && !shape_projection_installed &&
+                   if (ordinal_gl_state().g167_calls == 0 && !ordinal_gl_state().shape_projection_installed &&
                        f.emulator.display().is_open()) {
                        const HleRegistry& registry_ref = f.emulator.registry();
                        const HleFunction* mode =
@@ -1489,20 +1615,20 @@ void register_opengles(HleRegistry& registry) {
                        CLICKHLE_INFO(kCategory)
                            << "#175 else branch, pushing matrix_store[dest=0x"
                            << std::hex << dest << "] as modelview, diag=("
-                           << matrix_store[dest].m[0] << ","
-                           << matrix_store[dest].m[5] << ","
-                           << matrix_store[dest].m[10] << ") trans=("
-                           << matrix_store[dest].m[12] << ","
-                           << matrix_store[dest].m[13] << ","
-                           << matrix_store[dest].m[14] << ")" << std::dec;
+                           << ordinal_gl_state().matrix_store[dest].m[0] << ","
+                           << ordinal_gl_state().matrix_store[dest].m[5] << ","
+                           << ordinal_gl_state().matrix_store[dest].m[10] << ") trans=("
+                           << ordinal_gl_state().matrix_store[dest].m[12] << ","
+                           << ordinal_gl_state().matrix_store[dest].m[13] << ","
+                           << ordinal_gl_state().matrix_store[dest].m[14] << ")" << std::dec;
                        // LLE's ask (2026-09-12): does the shape-detector's
                        // guest-memory read (mem_a/mem_b) ever disagree with
                        // the host-side cache (matrix_store[a]/[b]) actually
                        // driving this push? If so, that's a second real bug
                        // (cache/guest-memory divergence, same architectural
                        // gap the Tetris ring-buffer thread was about).
-                       const Matrix4& cached_a = matrix_store[a];
-                       const Matrix4& cached_b = matrix_store[b];
+                       const Matrix4& cached_a = ordinal_gl_state().matrix_store[a];
+                       const Matrix4& cached_b = ordinal_gl_state().matrix_store[b];
                        const bool a_diverges =
                            std::fabs(mem_a.m[0] - cached_a.m[0]) > 0.0001f ||
                            std::fabs(mem_a.m[5] - cached_a.m[5]) > 0.0001f ||
@@ -1789,14 +1915,14 @@ void register_opengles(HleRegistry& registry) {
             if (std::getenv("CLICKHLE_DUMP_MODE") != nullptr) {
                 CLICKHLE_INFO(kCategory)
                     << "#125 source=0x" << std::hex << source << std::dec
-                    << " found=" << (matrix_store.count(source) != 0)
-                    << " bound=" << g_bound_texture
-                    << " g167_calls=" << g167_calls
-                    << " gated=" << (g167_calls != 0);
+                    << " found=" << (ordinal_gl_state().matrix_store.count(source) != 0)
+                    << " bound=" << ordinal_gl_state().bound_texture
+                    << " g167_calls=" << ordinal_gl_state().g167_calls
+                    << " gated=" << (ordinal_gl_state().g167_calls != 0);
             }
-            if (g167_calls == 0) {
-                const auto it = matrix_store.find(source);
-                if (it != matrix_store.end()) {
+            if (ordinal_gl_state().g167_calls == 0) {
+                const auto it = ordinal_gl_state().matrix_store.find(source);
+                if (it != ordinal_gl_state().matrix_store.end()) {
                     load_modelview(f, it->second);
                 }
             }
@@ -1804,67 +1930,79 @@ void register_opengles(HleRegistry& registry) {
         });
     }
 
-    // #148 gl_uniform_4xv(object, ?, pointer) -- the constant colour every
-    // quad is tinted by.
-    //
-    // The "v" matters: it is a *pointer* to four 16.16 values, and glColor4x
-    // takes four scalars. Handing it the pointer instead tinted every fragment
-    // with an address -- Pac-Man came out solid white and Bejeweled solid
-    // magenta, a whole screen of one colour with 3,249 draw calls behind it.
+    // #148 is the firmware's glUniform4xvAPPLE entry point. Ghidra shows
+    // (location, count, values): each item is one 16-byte vec4 upload. The
+    // desktop fixed-function backend has no shader-uniform store, so location
+    // 4 is approximated with glColor4x (as #120 does with glColor4f).
     const HleFunction* gl_color = registry.find("gl", "glColor4x");
     if (gl_color != nullptr) {
-        // The reference map names this gl_uniform_4xv, and the slot argument
-        // is real: Tetris drives slot 1 with both (0,0,0,1) and
-        // (0.8,0.8,0.9,1). Only slot 1 has ever been observed, so it is
-        // treated as the colour -- but the slot is read rather than skipped, so
-        // a title using a second slot shows up as a warning instead of
-        // silently repainting everything.
-        // Firmware's own name (LLE's assert-string extraction):
-        // **glUniform4xvAPPLE**. Same caveat as #149's rename above -- it is a
-        // per-program uniform upload, and treating it as unconditionally "the
-        // constant colour" is an assumption, not the name's meaning. That
-        // assumption is CORRECT for Cubis 2 / Tetris / Zuma / Bejeweled
-        // (proven: forcing it white turns Cubis 2's cubes grey and deletes its
-        // score text) and WRONG for Sims Bowling/Pool, whose near-black value
-        // crushes the whole scene. Unresolved -- see STATUS.md.
-        fn(148, "glUniform4xvAPPLE", 3, [gl_color, call_with](HleCallFrame& f) {
-            (void)f.args.next_ptr();   // the object
-            const u32 slot = f.args.next_u32();
-            const GuestAddr values = f.args.next_ptr();
-            u32 rgba[4] = {0, 0, 0, 0};
-            for (u32 i = 0; i < 4; ++i) {
-                rgba[i] = f.memory.read<u32>(values + 4 * i).value_or(0);
-            }
-            dump_uniform_packet(148, {rgba[0], rgba[1], rgba[2], rgba[3]});
-            if (std::getenv("CLICKHLE_DUMP_148") != nullptr) {
-                CLICKHLE_INFO(kCategory)
-                    << "#148 slot=" << slot << " raw=0x" << std::hex << rgba[0]
-                    << ",0x" << rgba[1] << ",0x" << rgba[2] << ",0x" << rgba[3]
-                    << std::dec << "  as16.16=" << (rgba[0] / 65536.0) << ","
-                    << (rgba[1] / 65536.0) << "," << (rgba[2] / 65536.0) << ","
-                    << (rgba[3] / 65536.0);
-            }
-            if (slot != 1) {
-                static std::set<u32> warned;
-                if (warned.insert(slot).second) {
-                    CLICKHLE_WARN(kCategory)
-                        << "#148 slot " << slot
-                        << " is not the colour slot; ignored";
-                }
-                f.ret(0);
-                return;
-            }
-            // EXPERIMENT (env-gated, not a fix): force the constant colour to
-            // opaque white to isolate whether #148's tint is what darkens the
-            // Sims titles. If the scene brightens to match the reference
-            // screenshot, the tint is being applied where it should not be.
-            if (std::getenv("CLICKHLE_EXP_148_WHITE") != nullptr) {
-                call_with(f, gl_color, {0x10000, 0x10000, 0x10000, 0x10000});
-                f.ret(0);
-                return;
-            }
-            call_with(f, gl_color, {rgba[0], rgba[1], rgba[2], rgba[3]});
-        });
+        fn(148, "glUniform4xvAPPLE", 3,
+           [gl_color, call_with](HleCallFrame& f) {
+               const u32 location = f.args.next_u32();
+               const i32 count = f.args.next_i32();
+               const GuestAddr values = f.args.next_ptr();
+               if (location == 0xffffffffu || count <= 0 || values == 0 ||
+                   location != 4) {
+                   f.ret_void();
+                   return;
+               }
+
+               u32 rgba[4]{};
+               for (u32 i = 0; i < 4; ++i) {
+                   const auto value = f.memory.read<u32>(values + i * 4u);
+                   if (!value.has_value()) {
+                       f.ret_void();
+                       return;
+                   }
+                   rgba[i] = *value;
+               }
+               dump_uniform_packet(148, {rgba[0], rgba[1], rgba[2], rgba[3]});
+               if (std::getenv("CLICKHLE_DUMP_148") != nullptr) {
+                   CLICKHLE_INFO(kCategory)
+                       << "#148 location=" << location << " count=" << count
+                       << " raw=0x" << std::hex << rgba[0] << ",0x" << rgba[1]
+                       << ",0x" << rgba[2] << ",0x" << rgba[3] << std::dec;
+               }
+               call_with(f, gl_color, {rgba[0], rgba[1], rgba[2], rgba[3]});
+           });
+    }
+
+    // #120 is the float-vector sibling of #148 (glUniform4xvAPPLE). Fliwheel
+    // decodes (location, count, values) and uses the first vec4 as the active
+    // draw colour. The desktop fixed-function backend has no matching shader
+    // uniform state, so feed that vec4 through glColor4f, as #148 does through
+    // glColor4x. This preserves the observed single-vector game path; arrays
+    // beyond the first element remain outside this renderer's current model.
+    const HleFunction* gl_color_float = registry.find("gl", "glColor4f");
+    if (gl_color_float != nullptr) {
+        fn(120, "glUniform4fv", 3,
+           [gl_color_float, call_with](HleCallFrame& f) {
+               const u32 location = f.args.next_u32();
+               const u32 count = f.args.next_u32();
+               const GuestAddr values = f.args.next_ptr();
+               if (count == 0 || values == 0) {
+                   f.ret_void();
+                   return;
+               }
+               if (location != 4) {
+                   f.ret_void();
+                   return;
+               }
+               u32 rgba[4]{};
+               for (u32 i = 0; i < 4; ++i) {
+                   const auto value = f.memory.read<u32>(values + i * 4);
+                   if (!value.has_value()) {
+                       f.ret_void();
+                       return;
+                   }
+                   float component = 0.0f;
+                   std::memcpy(&component, &*value, sizeof(component));
+                   component = std::clamp(component, 0.0f, 1.0f);
+                   std::memcpy(&rgba[i], &component, sizeof(component));
+               }
+               call_with(f, gl_color_float,
+                         {rgba[0], rgba[1], rgba[2], rgba[3]});
+           });
     }
 
     // #147 gl_uniform_4x_scalar(object, ?, x, y, z, w) -- the constant colour
@@ -1905,8 +2043,8 @@ void register_opengles(HleRegistry& registry) {
                 word = f.args.next_u32();
             }
             words[0] = map_target(words[0]);
-            if (g_bound_texture != 0) {
-                g_texture_size[g_bound_texture] = {words[3], words[4]};
+            if (ordinal_gl_state().bound_texture != 0) {
+                ordinal_gl_state().texture_size[ordinal_gl_state().bound_texture] = {words[3], words[4]};
             }
             // What a title actually uploads: format, size and where the pixels
             // are. The on-disk asset formats are known (.pix is BMP, .lcd5 is
@@ -1972,8 +2110,8 @@ void register_opengles(HleRegistry& registry) {
                 word = f.args.next_u32();
             }
             words[0] = map_target(words[0]);
-            if (g_bound_texture != 0) {
-                g_texture_size[g_bound_texture] = {words[3], words[4]};
+            if (ordinal_gl_state().bound_texture != 0) {
+                ordinal_gl_state().texture_size[ordinal_gl_state().bound_texture] = {words[3], words[4]};
             }
             // What a title actually uploads: format, size and where the pixels
             // are. The on-disk asset formats are known (.pix is BMP, .lcd5 is
@@ -2093,13 +2231,18 @@ void register_opengles(HleRegistry& registry) {
     // frames without moving on, and gating it on whether the render server has
     // started made no difference -- Tetris never calls #152 at all. So this is
     // not the thing being waited on, and the constant stands.
-    // #158(key, n) -- a KEYED QUERY, not a constant.
+    // #158(key, enabled) -- a keyed query, not a constant. RetailOS returns
+    // 0x3000 for 0x3f003/004 and 6 for 0x3f005; all three cases submit
+    // render-service commands. Those command side effects are not represented
+    // by host GL yet.
     //
     //     switch (key) {
     //       case 0x3f000: return 1;
     //       case 0x3f001: return 2;
     //       case 0x3f002: return 3;
-    //       case 0x3f003: <goes to hardware>
+    //       case 0x3f003: submit command; return 0x3000
+    //       case 0x3f004: submit command; return 0x3000
+    //       case 0x3f005: return 6
     //       default:      return <a global>;
     //     }
     //
@@ -2109,11 +2252,12 @@ void register_opengles(HleRegistry& registry) {
     // wrongly while letting the title run. Bejeweled polls this once per frame
     // after its audio stall and Mahjong calls it too.
     //
-    // Sweeping the *return* value changed nothing precisely because the key was
-    // being ignored: the answer has to depend on the question.
+    // The second argument controls a boolean in the render-service command.
+    // The default global's initial value is not identified in the firmware
+    // database; keep the previous inactive fallback of zero for other keys.
     fn(158, "gl_query", 2, [](HleCallFrame& f) {
         const u32 key = f.args.next_u32();
-        (void)f.args.next_u32();
+        const bool enabled = f.args.next_u32() > 0;
         {
             static std::set<u32> seen;
             if (seen.insert(key).second) {
@@ -2121,14 +2265,24 @@ void register_opengles(HleRegistry& registry) {
                     << "#158 key 0x" << std::hex << key << std::dec;
             }
         }
-        u32 answer = 0;
+        // Ghidra's uRam10261380 default is initialized to 0x300c in the
+        // firmware image. Unrecognized keys bypass the render command and
+        // return this value directly.
+        u32 answer = 0x300cu;
         switch (key) {
             case 0x3f000: answer = 1; break;
             case 0x3f001: answer = 2; break;
             case 0x3f002: answer = 3; break;
+            case 0x3f003:
+            case 0x3f004:
+                // RetailOS submits a renderer command whose effect is not
+                // represented in the host GL state. Preserve its known result.
+                (void)enabled;
+                answer = 0x3000;
+                break;
+            case 0x3f005: answer = 6; break;
             default:
-                // 0x3f003 goes to hardware and the default returns a global we
-                // do not model. Both are logged rather than guessed.
+                // The firmware returns the initialized default query result.
                 static std::set<u32> warned;
                 if (warned.insert(key).second) {
                     CLICKHLE_WARN(kCategory)
@@ -2140,38 +2294,14 @@ void register_opengles(HleRegistry& registry) {
         f.ret(answer);
     });
 
-    // #159(selector) -- switches on its one argument, reading a different
-    // global per case. Not a constant either, but which global each case reads
-    // is not established, so the previous answer of 1 is kept for the cases we
-    // cannot distinguish rather than replaced by a different invention.
+    // #159(selector) chooses one of fifty built-in pipelines. The firmware's
+    // common tail synchronizes the selected state and returns 1; the companion
+    // emulator independently identifies the same selector and return value.
+    // ClickHLE does not yet translate those co-processor state changes into
+    // host GL state, but its result must still match the firmware.
     fn(159, "gl_query_selected", 1, [](HleCallFrame& f) {
         const u32 selector = f.args.next_u32();
-        // LLE traced this (2026-09-13) and it is NOT a constant query: the
-        // firmware bounds-checks r0 against 50 cases and jumps a real table.
-        // Cases 1-41 pick a different PAIR of global objects each; 42-49 index
-        // two parallel arrays at 8-byte stride (8 entries -- plausibly per
-        // texture unit). The shared handler is a caching BIND: compare each
-        // chosen object against a cached slot, and on a miss enqueue a real
-        // hardware command through a sibling of the #148/#149 ring encoder,
-        // then branch on bit 0x10000 of the selected object.
-        //
-        // So the name is wrong and the hardcoded 1 ignores all of it. What is
-        // NOT yet established is whether any title depends on the returned
-        // integer, as opposed to the side effects -- and the side effects are
-        // hardware commands to a co-processor ClickHLE does not emulate at
-        // all, so they may be irrelevant here even though they are real.
-        //
-        // CLICKHLE_EXP_159 sweeps the answer so that question is settled by
-        // measurement rather than left open.
-        static const char* exp = std::getenv("CLICKHLE_EXP_159");
-        if (exp != nullptr) {
-            if (std::strcmp(exp, "selector") == 0) {
-                f.ret(selector);
-                return;
-            }
-            f.ret(static_cast<u32>(std::strtoul(exp, nullptr, 0)));
-            return;
-        }
+        CLICKHLE_DEBUG(kCategory) << "select built-in pipeline " << selector;
         f.ret(1);
     });
 
@@ -2205,7 +2335,7 @@ void register_opengles(HleRegistry& registry) {
                    CLICKHLE_INFO(kCategory)
                        << "#137 index=0 (position) pointer=0x" << std::hex
                        << pointer << std::dec << " size=" << size
-                       << " bound=" << g_bound_texture;
+                       << " bound=" << ordinal_gl_state().bound_texture;
                }
 
                // One-shot dump of the first position array: whether the
@@ -2243,7 +2373,10 @@ void register_opengles(HleRegistry& registry) {
                    CLICKHLE_WARN(kCategory)
                        << "#137 attribute index " << index
                        << " is unidentified; ignored";
-                   f.ret(0);
+                   // The firmware export is void; do not invent a zero
+                   // return for an attribute index the host adapter cannot
+                   // represent.
+                   f.ret_void();
                    return;
                }
                call_with(f, target, {size, type, stride, pointer});
@@ -2255,7 +2388,7 @@ void register_opengles(HleRegistry& registry) {
     //
     //   #152 gl_start_render_server(3)
     //   #164 gl_set_render_server_image(3)   -- hands it the loaded rserver.bin
-    //   #153 gl_stop_render_server(1)
+    //   #153 gl_stop_render_server()
     //   #158 gl_query_0x3000(0)              -- polled while waiting
     //
     // Accepted and reported started. We have no firmware render server and do
@@ -2264,42 +2397,101 @@ void register_opengles(HleRegistry& registry) {
     // sixty frames and gets no further, which is what waiting for a subsystem
     // that never starts looks like.
     fn(152, "start_render_server", 3, [](HleCallFrame& f) {
-        g_render_server_running = true;
+        (void)f.args.next_u32();  // unused selector
+        const GuestAddr out_a = f.args.next_ptr();
+        const GuestAddr out_b = f.args.next_ptr();
+        ordinal_gl_state().render_server_running = true;
+        // RetailOS initializes these two outputs after renderer and command
+        // ring setup succeeds. The host GL adapter treats setup as successful.
+        if (!f.store<u32>(out_a, 1) || !f.store<u32>(out_b, 2)) {
+            f.cpu.request_stop();
+            return;
+        }
         CLICKHLE_DEBUG(kCategory) << "render server started";
         f.ret(1);
     });
-    // Arguments are variable, so they carry state a real renderer would need:
-    // Ms. Pac-Man and Lost both call #164(1, r5, r4) from a wrapper, and TWA
-    // has a site passing (0, 0, 0). Logged rather than discarded, so the values
-    // themselves become the next piece of evidence.
-    // CORRECTED SIGNATURE (LLE, 2026-09-12, firmware 0x10261384): this is
-    // `(enable, image_data_ptr, byte_size)` -- a SOURCE IMAGE UPLOAD, not a
-    // target-size registration. The firmware gates on arg0 (null zeroes the
-    // rest), then resizes an internal buffer to `byte_size`, resets its write
-    // cursor, and memcpys the whole image into a persistent object. So
-    // discarding these arguments loses real pixel data, not an inert hint.
-    //
-    // CORRECTION (2026-09-12): the "SOURCE IMAGE UPLOAD" reading above is
-    // wrong, tested directly. Captured Sims Bowling's real #164 payload live
-    // (CLICKHLE_DUMP_164_RAW, 105020 bytes) and inspected it offline: it is
-    // NOT pixel data. The 512-byte lead-in is all zero (not a palette with
-    // real entries), and the body that follows is dominated by small,
-    // heavily-repeated byte values with an unmistakable command-stream
-    // signature -- e.g. the 4-byte pattern `XX 10 00 00` recurs 113 times
-    // with `XX` counting DOWN in clean runs (0xea,0xe9,0xe8,0xe7,0xe6,0xe5,
-    // 0xe0, then later 0x3a,0x3e,0x42,0x46,0x4a,0x4e...). No rendered image
-    // -- paletted, RGB565, or otherwise -- produces a monotonically
-    // descending opcode-sized field repeated like that; real pixel rows do
-    // not look like this. This is a GPU display list / command buffer for
-    // VideoCore II, the same coprocessor whose instruction encoding nobody
-    // has cracked (see research/11-the-videocore-runtime.md and the Vortex
-    // icon-texture investigation in agent-comms/STATUS.md). So #164 is not a
-    // routable "draw this bitmap" fix -- decoding it faithfully means
-    // interpreting an undocumented, NDA-only GPU ISA, the same wall Vortex's
-    // icons and #148's tint both hit. Left as a no-op; #152/#153/#164 remain
-    // acknowledgement stubs so titles that merely poll for the render server
-    // to be "ready" don't stall, which is the actual, achievable half of
-    // this ordinal's job.
+
+    // Copy one pair of render-server records into the per-slot state. RetailOS
+    // keeps each 0x1c-byte descriptor and its variable payload in separate
+    // allocations; retaining the same split lets a future renderer consume
+    // the uploaded records without keeping pointers into transient guest RAM.
+    fn(160, "upload_render_server_records", 3, [](HleCallFrame& f) {
+        const u32 slot = f.args.next_u32();
+        const u32 byte_size = f.args.next_u32();
+        const GuestAddr records = f.args.next_ptr();
+
+        // These are the firmware's three explicit validation branches and
+        // common error result at 0x10261018.
+        if (slot >= 8 || byte_size < 0x38 || records == 0) {
+            f.ret(0x300c);
+            return;
+        }
+
+        constexpr u32 kDescriptorSize = 0x1c;
+        constexpr u32 kPayloadLengthOffset = 0x18;
+        const auto copy_record = [&f](GuestAddr address,
+                                      RenderServerBuffer& output) {
+            const std::byte* descriptor =
+                f.memory.host_ptr(address, kDescriptorSize);
+            if (descriptor == nullptr) return false;
+
+            std::memcpy(output.descriptor.data(), descriptor, kDescriptorSize);
+            const auto size = f.memory.read<u32>(address + kPayloadLengthOffset);
+            if (!size.has_value()) return false;
+            const u32 payload_size = *size;
+            const u64 payload_address =
+                static_cast<u64>(address) + kDescriptorSize;
+            if (payload_address > std::numeric_limits<GuestAddr>::max()) {
+                return false;
+            }
+            const auto* payload = f.memory.host_ptr(
+                static_cast<GuestAddr>(payload_address), payload_size);
+            if (payload == nullptr && payload_size != 0) return false;
+            if (payload_size == 0) {
+                output.payload.clear();
+            } else {
+                const auto* bytes = reinterpret_cast<const u8*>(payload);
+                output.payload.assign(bytes, bytes + payload_size);
+            }
+            return true;
+        };
+
+        if (records > std::numeric_limits<GuestAddr>::max() -
+                          kPayloadLengthOffset) {
+            f.cpu.request_stop();
+            return;
+        }
+        const auto first_size =
+            f.memory.read<u32>(records + kPayloadLengthOffset);
+        if (!first_size.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        const u64 second_address = static_cast<u64>(records) + kDescriptorSize +
+                                   *first_size;
+        if (second_address > std::numeric_limits<GuestAddr>::max()) {
+            f.cpu.request_stop();
+            return;
+        }
+
+        RenderServerSlot uploaded;
+        if (!copy_record(records, uploaded.first) ||
+            !copy_record(static_cast<GuestAddr>(second_address),
+                         uploaded.second)) {
+            // The RetailOS memcpy would fault on an unmapped guest range.
+            f.cpu.request_stop();
+            return;
+        }
+
+        ordinal_gl_state().render_server_slots[slot] = std::move(uploaded);
+        f.ret(0x3000);
+    });
+
+    // RetailOS#164 is a gated upload: when enabled, it copies `size` bytes
+    // from the guest pointer into a persistent image buffer and resets that
+    // buffer's write cursor. The Ghidra trace follows the wrapper through its
+    // resize, cursor reset, and memcpy helpers. This retains the uploaded
+    // rserver image even though its VideoCore command stream is not decoded.
     fn(164, "set_render_server_image", 3, [](HleCallFrame& f) {
         const u32 enable = f.args.next_u32();
         const GuestAddr image = f.args.next_ptr();
@@ -2307,9 +2499,27 @@ void register_opengles(HleRegistry& registry) {
         CLICKHLE_DEBUG(kCategory)
             << "render server image enable=" << enable << " 0x" << std::hex
             << image << std::dec << ", " << size << " bytes";
-        // Characterise the payload we are currently throwing away: its size
-        // against plausible full-screen formats, and whether it holds real
-        // varied pixels rather than zeroes.
+        if (enable != 0 && image != kNullGuest &&
+            static_cast<i32>(size) > 0 &&
+            static_cast<i32>(image) > 0) {
+            auto& state = ordinal_gl_state();
+            try {
+                state.render_server_image.resize(size);
+            } catch (const std::bad_alloc&) {
+                state.render_server_image_cursor = 0;
+                f.ret(0);
+                return;
+            }
+            state.render_server_image_cursor = 0;
+            const auto* source = f.memory.host_ptr(image, size);
+            if (source == nullptr) {
+                f.cpu.request_stop();
+                return;
+            }
+            std::memcpy(state.render_server_image.data(), source, size);
+        }
+        // Optional diagnostics describe the uploaded payload; retaining the
+        // bytes above does not interpret the VideoCore image format.
         if (std::getenv("CLICKHLE_DUMP_164") != nullptr) {
             const char* guess = "?";
             if (size == 320u * 240u * 2u) guess = "320x240 16bpp";
@@ -2349,24 +2559,20 @@ void register_opengles(HleRegistry& registry) {
         }
         f.ret(1);
     });
-    // Every one of the 8 call sites across TWA and Lost passes a literal 0, and
-    // the return value is dead at all of them -- r0 is overwritten by the next
-    // instruction or the next call's argument setup. So 0 is returned rather
-    // than 1: nothing observes it, and changing it would be an unmotivated
-    // behaviour change dressed up as a fix.
-    //
-    // The warning is the falsification test. If a title ever passes something
-    // other than 0, there is more than one render server and this is wrong.
-    fn(153, "stop_render_server", 1, [](HleCallFrame& f) {
-        const u32 which = f.args.next_u32();
-        if (which != 0) {
-            CLICKHLE_WARN(kCategory)
-                << "#153 called with " << which << ", not 0 -- more than one "
-                << "render server, and this reading is wrong";
-        }
-        g_render_server_running = false;
-        f.ret(0);
+    // RetailOS takes no arguments here and returns 1 after shutting down the
+    // render service. Call sites may leave a stale value in r0, but the export
+    // never reads it; the firmware return contract takes precedence over those
+    // callers' dead-result behavior.
+    fn(153, "stop_render_server", 0, [](HleCallFrame& f) {
+        ordinal_gl_state().render_server_running = false;
+        f.ret(1);
     });
+
+    // These exports are literal return-value helpers in the firmware.
+    fn(155, "render_server_zero", 0,
+       [](HleCallFrame& f) { f.ret(0); });
+    fn(156, "render_server_one", 0,
+       [](HleCallFrame& f) { f.ret(1); });
 
     // Both #152 and #153 were misread once: #152 as a screen-size query writing
     // 320x240 through what were taken for out-pointers, #153 as a no-op

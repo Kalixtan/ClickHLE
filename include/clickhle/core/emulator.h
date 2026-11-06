@@ -1,6 +1,9 @@
 #pragma once
 
 #include <array>
+#include <any>
+#include <chrono>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -27,6 +30,24 @@ namespace clickhle {
 /// buildable and testable with nothing but a compiler.
 class Emulator {
 public:
+    /// One observed call at the ARM-to-render-server boundary. VideoCore
+    /// execution is not implemented; this records the host-visible API traffic
+    /// and any small input prefix that can help reverse its contract.
+    struct VideoCoreEvent {
+        u64 sequence = 0;
+        u64 frame = 0;
+        u64 instructions = 0;
+        GuestAddr return_pc = 0;
+        u32 ordinal = 0;
+        std::string name;
+        std::array<u32, 4> args{};
+        u8 arg_count = 0;
+        u32 result = 0;
+        u32 payload_size = 0;
+        std::array<u8, 64> payload_prefix{};
+        u8 payload_prefix_size = 0;
+    };
+
     struct Config {
         std::filesystem::path executable;
 
@@ -53,8 +74,8 @@ public:
         ///
         /// ARBITRARY, inherited, and not yet calibrated against any
         /// click-wheel title -- 20 MHz was tuned for a different platform. It
-        /// is safe because nothing in hand reads a clock yet; revisit the
-        /// moment one does.
+        /// controls the deterministic virtual scheduler clock. RetailOS
+        /// miscTBD#9 uses a separate system clock for elapsed-time queries.
         u64 emulated_hz = 20'000'000;
 
         /// Cycles charged for each HLE call.
@@ -69,6 +90,11 @@ public:
         /// reads a clock. The number to replace it with is whatever the
         /// firmware's own cheapest export costs, once one is timed.
         u64 hle_call_cycles = 200;
+
+        /// Use emulated guest time for RetailOS system-clock reads. The
+        /// default follows the host's monotonic clock; deterministic mode is
+        /// useful for replay and bitmap regression runs.
+        bool deterministic_system_clock = false;
 
         /// Host directory the guest filesystem is rooted at. Empty means the
         /// executable's own directory, which is what a game shipped on an SD
@@ -180,6 +206,99 @@ public:
         u32 heap_size = 48u * 1024u * 1024u;
     };
 
+    struct MetadataState {
+        std::vector<bool> music_library_slots;
+        std::vector<bool> artwork_library_slots;
+        GuestAddr service_object = 0;
+    };
+
+    struct AudioState {
+        struct Sound {
+            GuestAddr guest_object = 0;
+            std::filesystem::path asset_path;
+            u32 buffer = 0;
+            u32 repeat = 1;
+            u32 state = 0;
+            u32 next = 0;
+            u32 auxiliary_48 = 0;
+            bool started = false;
+            std::map<u32, u32> fields = {
+                {8, 0}, {9, 0}, {10, 0xAC44}, {11, 1}, {12, 0x10},
+                {13, 0x7FFF}, {14, 0}, {15, 1000}, {18, 0}, {19, 0},
+                {20, 0}, {22, 0x7FFF}};
+        };
+
+        // Audio#54/#55 expose the stream service's 16-bit level at +0x14.
+        // Its constructor default is not yet identified in the firmware.
+        u32 stream_level = 0;
+        // Number of stream-registration messages submitted through Audio#40.
+        // Metadata#134 reports whether this count is nonzero.
+        u32 registered_stream_count = 0;
+        std::vector<std::filesystem::path> stream_assets;
+        std::filesystem::path pending_stream_asset;
+        // State changed by the Audio stream-command messages. The -1 values
+        // represent the firmware's "defer to the player service" sentinel;
+        // that service is not present in ClickHLE, so its initial fallback is
+        // reported as idle by the HLE getter.
+        i64 stream_index = -1;
+        i32 stream_control = -1;
+        u32 stream_repeat_internal_mode = 0;
+        bool stream_shuffle = false;
+        std::deque<u32> pending_sfx_assets;
+        std::map<u32, Sound> sounds;
+    };
+
+    struct InputState {
+        u8 pending_event_flag = 0;
+        u32 previous_raw_wheel = 0;
+        u32 wheel_event_counter = 0;
+        u32 wheel_counter_snapshot = 0;
+        u32 wheel_threshold = 3;
+        i32 wheel_accumulator = 0;
+        u8 wheel_raw = 0;
+        bool wheel_touched = false;
+        std::array<bool, static_cast<std::size_t>(Button::Count)> held_buttons{};
+        u64 poll_count = 0;
+    };
+
+    struct MiscState {
+        u32 device_level = 0;
+        u8 device_level_flag = 0;
+    };
+
+    struct FilesystemState {
+        struct DirectoryEntry {
+            std::string name;
+            u8 type = 0;
+        };
+
+        struct DirectoryRequest {
+            std::string path;
+            std::vector<DirectoryEntry> entries;
+            u32 next_entry = 0;
+            bool completed = false;
+            u8 mode = 0;
+            u8 flags = 0;
+        };
+
+        struct StoreSlot {
+            std::string path;
+            u32 references = 0;
+            u32 size = 0;
+            u32 position = 0;
+            std::vector<u8> data;
+        };
+
+        std::array<u32, 10> handles{};
+        // AsyncFileIO's save store is a four-entry indexed table, distinct
+        // from the host VFS handles used by Filesytem#0-#3.
+        std::array<StoreSlot, 4> stores{};
+        u32 store_bytes = 0;
+        // AsyncFileIO#7 stores directory-operation objects in a separate
+        // per-context table and publishes their zero-based slot in +0x2c.
+        std::vector<DirectoryRequest> directories;
+    };
+
     Emulator() = default;
     Emulator(const Emulator&) = delete;
     Emulator& operator=(const Emulator&) = delete;
@@ -274,6 +393,22 @@ public:
     [[nodiscard]] HleRegistry& registry() noexcept { return registry_; }
     [[nodiscard]] ThunkTable& thunks() noexcept { return thunks_; }
     [[nodiscard]] GuestHeap& heap() noexcept { return heap_; }
+    [[nodiscard]] MetadataState& metadata_state() noexcept {
+        return metadata_state_;
+    }
+    [[nodiscard]] AudioState& audio_state() noexcept { return audio_state_; }
+    [[nodiscard]] InputState& input_state() noexcept { return input_state_; }
+    [[nodiscard]] MiscState& misc_state() noexcept { return misc_state_; }
+    [[nodiscard]] FilesystemState& filesystem_state() noexcept {
+        return filesystem_state_;
+    }
+    [[nodiscard]] std::any& gles_state_storage() noexcept { return gles_state_; }
+    [[nodiscard]] std::any& gles_ordinal_state_storage() noexcept {
+        return gles_ordinal_state_;
+    }
+    [[nodiscard]] u32& next_gles_texture_name() noexcept {
+        return next_gles_texture_name_;
+    }
     [[nodiscard]] Scheduler& scheduler() noexcept { return scheduler_; }
     [[nodiscard]] Vfs& vfs() noexcept { return vfs_; }
 
@@ -395,6 +530,9 @@ public:
     /// millisecond interval would always see zero elapsed and never progress.
     [[nodiscard]] u64 microsecond_count() const;
 
+    /// Strictly increasing host monotonic time for RetailOS system-clock APIs.
+    [[nodiscard]] u64 system_clock_microsecond_count();
+
 
     /// Microsoft CRT rand() state.
     ///
@@ -416,6 +554,22 @@ public:
 
     /// Total HLE calls dispatched, and calls that hit an unimplemented import.
     [[nodiscard]] u64 hle_call_count() const noexcept { return hle_calls_; }
+
+    [[nodiscard]] const std::deque<VideoCoreEvent>& videocore_events() const noexcept {
+        return videocore_events_;
+    }
+    void clear_videocore_events() { videocore_events_.clear(); }
+    void set_videocore_trace_enabled(bool enabled) noexcept {
+        videocore_trace_enabled_ = enabled;
+    }
+    void set_videocore_pause_on_call(bool enabled) noexcept {
+        videocore_pause_on_call_ = enabled;
+    }
+    [[nodiscard]] std::optional<VideoCoreEvent> take_videocore_break() {
+        auto event = std::move(videocore_break_event_);
+        videocore_break_event_.reset();
+        return event;
+    }
 
     /// What framework calls hand back, classified.
     ///
@@ -491,6 +645,14 @@ private:
     HleRegistry registry_;
     ThunkTable thunks_;
     GuestHeap heap_;
+    MetadataState metadata_state_;
+    AudioState audio_state_;
+    InputState input_state_;
+    MiscState misc_state_;
+    FilesystemState filesystem_state_;
+    std::any gles_state_;
+    std::any gles_ordinal_state_;
+    u32 next_gles_texture_name_ = 0;
     Scheduler scheduler_;
     Vfs vfs_;
     /// Address of the SVC thunk being serviced, so block_thread() can send the
@@ -522,6 +684,11 @@ private:
     u32 last_error_ = 0;
     std::string last_missing_import_;
     u64 hle_calls_ = 0;
+    u64 videocore_sequence_ = 0;
+    std::deque<VideoCoreEvent> videocore_events_;
+    std::optional<VideoCoreEvent> videocore_break_event_;
+    bool videocore_trace_enabled_ = true;
+    bool videocore_pause_on_call_ = false;
     std::vector<GuestAddr> pending_completions_;
 
 public:
@@ -576,6 +743,7 @@ private:
     static constexpr std::size_t kCallHistory = 24;
     std::array<std::string, kCallHistory> call_history_;
     std::size_t call_history_next_ = 0;
+    std::string last_guest_call_failure_;
     bool return_sentinel_hit_ = false;
     /// Set when a thread exited with nothing runnable, so run() knows the stop
     /// is resumable rather than terminal.
@@ -585,6 +753,9 @@ private:
     /// Emulated cycles credited for time the guest spent entirely asleep. See
     /// the idle handling in Emulator::run.
     u64 idle_cycles_ = 0;
+    std::chrono::steady_clock::time_point system_clock_start_ =
+        std::chrono::steady_clock::now();
+    u64 last_system_clock_us_ = 0;
     /// Seeded to 1, as the MS CRT does before any srand().
     u32 random_seed_ = 1;
     /// Tick at which every thread became blocked; 0 when something is runnable.

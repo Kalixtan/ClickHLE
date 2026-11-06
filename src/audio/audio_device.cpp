@@ -25,6 +25,12 @@ public:
     [[nodiscard]] bool is_open() const override { return open_; }
 
     [[nodiscard]] bool queue(const void*, u32) override { return open_; }
+    [[nodiscard]] bool play(u32, const void*, u32, u32, u16, u16,
+                            bool) override {
+        return open_;
+    }
+    void stop_voice(u32) override {}
+    void pause_voice(u32, bool) override {}
 
     // Always empty, so every buffer completes immediately and the game's
     // streaming loop keeps turning.

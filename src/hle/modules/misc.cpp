@@ -15,6 +15,10 @@
 #include <string>
 #include <utility>
 
+#if defined(CLICKHLE_HAVE_SDL)
+#include <SDL3/SDL.h>
+#endif
+
 #include "clickhle/common/log.h"
 #include "clickhle/hle/format.h"
 #include "clickhle/core/emulator.h"
@@ -27,6 +31,27 @@ namespace {
 
 constexpr std::string_view kCategory = "misc";
 constexpr const char* kModule = "miscTBD";
+
+u32 host_battery_percent() {
+    if (const char* configured = std::getenv("CLICKHLE_BATTERY_PERCENT")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(configured, &end, 10);
+        if (end != configured && *end == '\0') {
+            return static_cast<u32>(std::clamp(parsed, 0l, 100l));
+        }
+    }
+#if defined(CLICKHLE_HAVE_SDL)
+    int seconds = -1;
+    int percent = -1;
+    const SDL_PowerState state = SDL_GetPowerInfo(&seconds, &percent);
+    if (state != SDL_POWERSTATE_ERROR && state != SDL_POWERSTATE_UNKNOWN &&
+        percent >= 0) {
+        return static_cast<u32>(std::min(percent, 100));
+    }
+#endif
+    // A desktop without a readable battery has effectively unlimited power.
+    return 100;
+}
 
 
 
@@ -119,7 +144,7 @@ void register_misc(HleRegistry& registry) {
     fn(1, "free", 1, [](HleCallFrame& f) {
         const GuestAddr block = f.args.next_ptr();
         if (block == kNullGuest) {
-            f.ret(0);
+            f.ret_void();
             return;
         }
         if (!f.emulator.heap().release(block)) {
@@ -127,10 +152,10 @@ void register_misc(HleRegistry& registry) {
                 << "free(0x" << std::hex << block << std::dec
                 << ") does not name a live block";
         }
-        f.ret(0);
+        f.ret_void();
     });
 
-    // read_time(u32* out) -- writes one word and returns nothing useful.
+    // read_time(u32* out) -- writes one word and returns the clock value.
     //
     // Evidence: every one of the 88 call sites across all 16 titles is the same
     // three instructions, `mov r0, sp; bl <#9>; ldr r0, [sp]`. Several zero the
@@ -140,8 +165,9 @@ void register_misc(HleRegistry& registry) {
     // vector[4] asks for in 15 of 16 titles, both of which fit a clock and very
     // little else.
     //
-    // Backed by the emulated tick, which is derived from work the guest has
-    // done rather than from the host clock, so runs stay reproducible.
+    // Backed by a strictly increasing host monotonic clock. RetailOS time
+    // advances independently of emulated instruction throughput, and the
+    // comparison emulator uses the same basis for this API.
     //
     // Microseconds, not milliseconds, and that is evidence rather than taste.
     // Reporting milliseconds made Sims Bowling and Sims Pool die in the armcc
@@ -156,8 +182,12 @@ void register_misc(HleRegistry& registry) {
     // a game run fast or slow rather than fail.
     fn(9, "read_time?", 1, [](HleCallFrame& f) {
         const GuestAddr out = f.args.next_ptr();
-        const u32 value = static_cast<u32>(f.emulator.microsecond_count());
-        f.store<u32>(out, value);
+        const u32 value = static_cast<u32>(
+            f.emulator.system_clock_microsecond_count());
+        if (!f.store<u32>(out, value)) {
+            f.cpu.request_stop();
+            return;
+        }
         // LLE's disassembly and oracle's read of the call chain agree: real
         // firmware returns the value in r0 AS WELL AS writing it to *out --
         // both, not either. Every known call site reads the out-parameter,
@@ -220,26 +250,40 @@ void register_misc(HleRegistry& registry) {
     fn(2, "realloc", 2, [](HleCallFrame& f) {
         const GuestAddr block = f.args.next_ptr();
         const u32 size = f.args.next_u32();
-        // GuestHeap has no resize, so this is allocate-copy-release. The old
-        // size bounds the copy; without it there is no way to know how much of
-        // the new block is meaningful.
+        if (size == 0) {
+            (void)f.emulator.heap().release(block);
+            f.ret(kNullGuest);
+            return;
+        }
+        if (block == kNullGuest) {
+            f.ret(f.emulator.heap().allocate(size));
+            return;
+        }
+        const auto old = f.emulator.heap().size_of(block);
+        if (!old.has_value()) {
+            f.ret(kNullGuest);
+            return;
+        }
+        // Reuse a block that already has enough payload space. This matches
+        // realloc's observable pointer/content contract and avoids needless
+        // heap growth for the titles that append one byte at a time.
+        if (size <= *old) {
+            f.ret(block);
+            return;
+        }
         const GuestAddr fresh = f.emulator.heap().allocate(size);
         if (fresh == kNullGuest) {
             f.ret(kNullGuest);
             return;
         }
-        if (block != kNullGuest) {
-            const auto old = f.emulator.heap().size_of(block);
-            const u32 copy = old.has_value() ? std::min(*old, size) : 0;
-            for (u32 i = 0; i < copy; ++i) {
-                const auto byte = f.memory.read<u8>(block + i);
-                if (!byte.has_value()) {
-                    break;
-                }
-                (void)f.memory.write<u8>(fresh + i, *byte);
+        for (u32 i = 0; i < *old; ++i) {
+            const auto byte = f.memory.read<u8>(block + i);
+            if (!byte.has_value()) {
+                break;
             }
-            (void)f.emulator.heap().release(block);
+            (void)f.memory.write<u8>(fresh + i, *byte);
         }
+        (void)f.emulator.heap().release(block);
         f.ret(fresh);
     });
 
@@ -247,15 +291,14 @@ void register_misc(HleRegistry& registry) {
     // get are a matched pair over one value the firmware would own; nothing
     // reads it but the game itself, so remembering what it was told is the
     // whole contract.
-    static u32 device_level = 0;
     fn(5, "device_level_set", 1, [](HleCallFrame& f) {
         // LLE's decompile: `if (level > 100) level = 100; else if (level < 0)
         // level = 0;` before storing. A title writing 150 and reading back
         // through #6 gets 100 on real hardware, not 150.
         const i32 requested = static_cast<i32>(f.args.next_u32());
         const i32 clamped = std::clamp(requested, 0, 100);
-        device_level = static_cast<u32>(clamped);
-        f.ret(0);
+        f.emulator.misc_state().device_level = static_cast<u32>(clamped);
+        f.ret_void();
     });
     // #3(format, ...) -- the games' own printf.
     //
@@ -305,115 +348,158 @@ void register_misc(HleRegistry& registry) {
         f.ret(static_cast<u32>(text.size()));
     });
 
-    fn(6, "device_level_get", 0, [](HleCallFrame& f) { f.ret(device_level); });
+    fn(6, "device_level_get", 0,
+       [](HleCallFrame& f) { f.ret(f.emulator.misc_state().device_level); });
 
     // Constants. Named for what they return because that is all that was ever
     // established about them -- and among the busiest ordinals in the API,
     // #10 at 105 call sites and #11 at 90, so answering them is close to free
     // and unblocks a great deal.
-    fn(7, "zero", 0, [](HleCallFrame& f) { f.ret(0); });
+    // RetailOS conditionally notifies a system observer, then stores the low
+    // byte of the flag at singleton+4. The observer is not part of the
+    // game-facing HLE, so its return value is unavailable on that path.
+    fn(7, "device_level_flag_set", 4, [](HleCallFrame& f) {
+        const u32 enabled = f.args.next_u32();
+        (void)f.args.next_u32();  // forwarded observer context
+        (void)f.args.next_u32();  // forwarded observer value
+        (void)f.args.next_u32();  // forwarded observer flags
+
+        const u32 level = f.emulator.misc_state().device_level;
+        const bool notify_observer = enabled == 0 || level >= 21;
+        if (notify_observer) {
+            CLICKHLE_DEBUG(kCategory)
+                << "device level observer update requested (flag=" << enabled
+                << ", level=" << level << "); system observer is unavailable";
+        }
+        f.emulator.misc_state().device_level_flag =
+            static_cast<u8>(enabled);
+        // On the no-notification path r0 still holds the level loaded from
+        // the singleton. The observer's result is unavailable in this HLE.
+        f.ret(notify_observer ? 0u : level);
+    });
     fn(10, "thousand", 0, [](HleCallFrame& f) { f.ret(1000); });
     fn(11, "zero", 0, [](HleCallFrame& f) { f.ret(0); });
 
-    // Wall-clock time, as a Unix timestamp.
-    //
-    // This used to write `microsecond_count() / 1e6` -- seconds since the
-    // emulator STARTED, not a time of day. A title drawing a clock from it
-    // therefore rendered nonsense: musika's status bar read **95:95**, an
-    // impossible time, static across the whole run (identical at frame 7000
-    // and 8000) because it reads this once.
-    //
-    // PAC-MAN was briefly a counter-example -- it calls #12 and looked fine --
-    // but that was a misread on my part: its top-left shows "TOT 17", a game
-    // counter, not a clock. Zoomed and confirmed. It has no clock to be wrong,
-    // so it is no evidence that elapsed-seconds was right.
-    //
-    // A Unix timestamp, base + emulated elapsed -- the right KIND of value
-    // for an ordinal named host_time, in place of the old "seconds since the
-    // emulator started" (which made musika's status bar read the impossible
-    // **95:95**, and would misrender any title's clock the same way).
-    //
-    // NOT the real host clock, deliberately. Two reasons:
-    //   1. Reproducibility is a standing property here (see --clock-hz: guest
-    //      time comes from work the guest has done, never the wall), and this
-    //      project compares screenshots -- a host-clock base makes any frame
-    //      containing a clock differ between runs.
-    //   2. #12 turned out NOT to be musika's clock source after all --
-    //      tested, returning a real timestamp left its status bar unchanged
-    //      at 95:95 -- so there was nothing to gain from real time yet, only
-    //      determinism to lose.
-    //
-    // So the default is a fixed, PLAUSIBLE, recognisable time: deliberately
-    // 12:34:56 on a fixed date, chosen to be obviously a placeholder (nobody
-    // mistakes 12:34 for a real capture) while still being a legitimate time
-    // a title can format and do arithmetic on. Swap kPlaceholderEpoch for
-    // std::time(nullptr) if/when a title is confirmed to actually read this
-    // for display and real time is wanted -- CLICKHLE_EPOCH below already
-    // supports that per-run without a code change.
-    //
-    //   CLICKHLE_EPOCH=<unix-seconds>  pin to a specific time
-    //   CLICKHLE_EPOCH=now             use the real host clock
+    // Fill the six-word local-time structure observed at Minigolf's call site:
+    // seconds, minutes, 12-hour hour, day, month, year. The firmware helper
+    // returns 1 after filling it. Host local time is the closest available
+    // substitute for the device RTC; CLICKHLE_EPOCH pins an epoch for repeatable
+    // runs, advancing from it with the emulated system clock.
     fn(12, "host_time", 1, [](HleCallFrame& f) {
-        static const u64 base = [] {
-            // 2006-09-12 12:34:56 UTC.
-            constexpr u64 kPlaceholderEpoch = 1158064496ull;
-            if (const char* pin = std::getenv("CLICKHLE_EPOCH")) {
-                if (std::strcmp(pin, "now") == 0) {
-                    return static_cast<u64>(std::time(nullptr));
-                }
-                const long long v = std::strtoll(pin, nullptr, 10);
-                if (v > 0) {
-                    return static_cast<u64>(v);
+        const GuestAddr out = f.args.next_ptr();
+        u64 now = static_cast<u64>(std::time(nullptr));
+        if (const char* pin = std::getenv("CLICKHLE_EPOCH")) {
+            if (std::strcmp(pin, "now") != 0) {
+                const long long epoch = std::strtoll(pin, nullptr, 10);
+                if (epoch > 0) {
+                    now = static_cast<u64>(epoch) +
+                          f.emulator.system_clock_microsecond_count() / 1000000u;
                 }
             }
-            return kPlaceholderEpoch;
-        }();
-        const GuestAddr out = f.args.next_ptr();
-        const u64 now = base + f.emulator.microsecond_count() / 1000000u;
-        f.store<u32>(out, static_cast<u32>(now));
+        }
+        const std::time_t stamp = static_cast<std::time_t>(now);
+        std::tm local{};
+#if defined(_WIN32)
+        localtime_s(&local, &stamp);
+#else
+        localtime_r(&stamp, &local);
+#endif
+        const u32 fields[] = {
+            static_cast<u32>(local.tm_sec), static_cast<u32>(local.tm_min),
+            static_cast<u32>((local.tm_hour % 12 == 0) ? 12 : local.tm_hour % 12),
+            static_cast<u32>(local.tm_mday), static_cast<u32>(local.tm_mon + 1),
+            static_cast<u32>(local.tm_year + 1900)};
+        for (u32 i = 0; i < 6; ++i) {
+            if (!f.store<u32>(out + i * 4u, fields[i])) {
+                f.cpu.request_stop();
+                return;
+            }
+        }
         CLICKHLE_DEBUG(kCategory) << "host_time -> " << now;
-        f.ret(0);
+        // The firmware time conversion helper returns 1 on success.
+        f.ret(1);
     });
 
-    // Battery. Reported full: an emulator is mains-powered, and a game that
-    // dims itself or refuses to start on a flat battery would be wrong here.
-    // Scale is 0..20, not 0..100 -- confirmed by both tracks independently.
+    // RetailOS reads the host service and normalizes results above 20 by
+    // negating them. The comparison emulator maps host charge onto 0..20;
+    // use SDL's cross-platform power query when available and keep an
+    // environment override for deterministic testing and headless builds.
+    // With no battery information, report full charge. Scale is 0..20, not
+    // 0..100 -- confirmed by both tracks independently.
     // LLE's disassembly: firmware negates anything > 20 (`cmp r0,#0x14` /
     // `rsbgt r0,r0,#0`). Oracle called directly into the tail at 0x0025e364
     // and measured the exact boundary: 20 passes through unchanged, 21
-    // returns -21, 100 returns -100. So `f.ret(100)` -- this handler's
-    // previous value -- delivered -100 to every title, below any low-battery
-    // threshold. An emulator is mains-powered and should report full, which
-    // this scale's maximum (20) means, not literal 100.
-    fn(13, "host_battery", 0, [](HleCallFrame& f) { f.ret(20); });
+    // returns -21, 100 returns -100. Returning a host percentage directly
+    // would therefore report a negative value; #13 now converts percentage
+    // into the firmware's 0..20 range before returning it.
+    fn(13, "host_battery", 0, [](HleCallFrame& f) {
+        const u32 percent = host_battery_percent();
+        f.ret((percent * 20u + 50u) / 100u);
+    });
 
-    // resolve_name(...) -- four arguments, one of which is a name to look up.
-    //
-    // Answers "not found". What it resolves against is not established, and a
-    // fabricated result would be handed straight back to the caller as though
-    // it meant something. A game told the name is unknown can take its own
-    // path; a game given a made-up handle cannot.
-    //
-    // "Not found" is -1, not 0 -- confirmed independently by both tracks:
-    // LLE's return-convention sweep read it as a constant -1 in the
-    // disassembly, and oracle's execution measurement agreed exactly, on
-    // both firmware images. 0 is this interface's success shape elsewhere in
-    // the corpus, so the previous f.ret(0) told every caller the opposite of
-    // what the device says.
+    // Resolve a resource key into the descriptor used by the audio stream
+    // path. Firmware selects a localization domain (r0), writes the result to
+    // r1, checks the capacity at r2, and reads the key from r3. The host-side
+    // resource catalog is absent, so retain the key as the fallback text.
     fn(14, "resolve_name", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
+        const u32 domain = f.args.next_u32();
+        const GuestAddr out = f.args.next_ptr();
+        const GuestAddr size_address = f.args.next_ptr();
         const GuestAddr name = f.args.next_ptr();
         std::string text;
-        for (u32 i = 0; i < 64; ++i) {
+        for (u32 i = 0; i < 256; ++i) {
             const auto c = f.memory.read<u8>(name + i);
-            if (!c.has_value() || *c == 0) {
+            if (!c.has_value()) {
+                f.cpu.request_stop();
+                return;
+            }
+            if (*c == 0) {
                 break;
             }
             text.push_back(static_cast<char>(*c));
         }
-        CLICKHLE_DEBUG(kCategory)
-            << "resolve_name(\"" << text << "\") -> not found";
-        f.ret(static_cast<u32>(-1));
+        const auto capacity = f.memory.read<i32>(size_address);
+        if (!capacity.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*capacity < 0 || static_cast<u32>(*capacity) < text.size()) {
+            f.ret(static_cast<u32>(-1));
+            return;
+        }
+        if (out == 0) {
+            if (!f.store<u32>(size_address, static_cast<u32>(-1))) {
+                f.cpu.request_stop();
+                return;
+            }
+            f.ret(static_cast<u32>(-1));
+            return;
+        }
+        if (!f.store<u32>(out, 0) || !f.store<u32>(out + 4, 8)) {
+            f.cpu.request_stop();
+            return;
+        }
+        for (u32 i = 0; i < text.size(); ++i) {
+            if (!f.store<u8>(out + 8 + i, static_cast<u8>(text[i]))) {
+                f.cpu.request_stop();
+                return;
+            }
+        }
+        if (!f.store<u8>(out + 8 + static_cast<u32>(text.size()), 0) ||
+            !f.store<u32>(size_address, static_cast<u32>(text.size()))) {
+            f.cpu.request_stop();
+            return;
+        }
+        CLICKHLE_DEBUG(kCategory) << "resolve_name domain=" << domain << " key=\""
+                                  << text << "\" (fallback descriptor)";
+        const std::string extension =
+            std::filesystem::path(text).extension().string();
+        if (extension == ".m4a" || extension == ".mp3" ||
+            extension == ".aac" || extension == ".mp4") {
+            f.emulator.audio_state().pending_stream_asset =
+                f.emulator.vfs().resolve(text);
+        }
+        f.ret(static_cast<u32>(text.size()));
     });
 
     // The remaining miscTBD ordinals are unidentified. Deliberately not registered: an

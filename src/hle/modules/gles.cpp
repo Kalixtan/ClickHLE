@@ -23,7 +23,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -61,10 +63,81 @@ constexpr u32 kEglConfig = 0x4002;
 constexpr u32 kEglSurface = 0x4003;
 constexpr u32 kEglContext = 0x4004;
 constexpr u32 kEglTrue = 1;
+constexpr i32 kEglSuccess = 0x3000;
+constexpr i32 kEglNotInitialized = 0x3001;
+constexpr i32 kEglBadAlloc = 0x3003;
+constexpr i32 kEglBadAttribute = 0x3004;
+constexpr i32 kEglBadConfig = 0x3005;
+constexpr i32 kEglBadContext = 0x3006;
+constexpr i32 kEglBadDisplay = 0x3008;
+constexpr i32 kEglBadMatch = 0x3009;
+constexpr i32 kEglBadSurface = 0x300d;
+constexpr i32 kEglBadParameter = 0x300c;
 
 // eglQuerySurface attributes.
 constexpr i32 kEglWidth = 0x3057;
 constexpr i32 kEglHeight = 0x3056;
+
+std::optional<i32> egl_config_attribute(i32 attribute) {
+    switch (attribute) {
+        case 0x3020: return 16;  // EGL_BUFFER_SIZE
+        case 0x3021: return 0;   // EGL_ALPHA_SIZE
+        case 0x3022: return 5;   // EGL_BLUE_SIZE
+        case 0x3023: return 6;   // EGL_GREEN_SIZE
+        case 0x3024: return 5;   // EGL_RED_SIZE
+        case 0x3025: return 16;  // EGL_DEPTH_SIZE
+        case 0x3026: return 0;   // EGL_STENCIL_SIZE
+        case 0x3027: return 0x3038;  // EGL_CONFIG_CAVEAT = EGL_NONE
+        case 0x3028: return 1;   // EGL_CONFIG_ID (distinct from opaque handle)
+        case 0x3029: return 0;   // EGL_LEVEL
+        case 0x302a: return kScreenHeight;  // EGL_MAX_PBUFFER_HEIGHT
+        case 0x302b: return kScreenWidth * kScreenHeight;  // MAX_PBUFFER_PIXELS
+        case 0x302c: return kScreenWidth;   // EGL_MAX_PBUFFER_WIDTH
+        case 0x302d: return 0;   // EGL_NATIVE_RENDERABLE
+        case 0x302e: return 0;   // EGL_NATIVE_VISUAL_ID
+        case 0x302f: return 0;   // EGL_NATIVE_VISUAL_TYPE
+        case 0x3031: return 0;   // EGL_SAMPLES
+        case 0x3032: return 0;   // EGL_SAMPLE_BUFFERS
+        case 0x3033: return 0x0007;  // WINDOW | PIXMAP | PBUFFER
+        case 0x3034: return 0x3038;  // EGL_TRANSPARENT_TYPE = EGL_NONE
+        case 0x3035: return 0;   // EGL_TRANSPARENT_RED_VALUE
+        case 0x3036: return 0;   // EGL_TRANSPARENT_GREEN_VALUE
+        case 0x3037: return 0;   // EGL_TRANSPARENT_BLUE_VALUE
+        case 0x3039: return 0;   // EGL_BIND_TO_TEXTURE_RGB
+        case 0x303a: return 0;   // EGL_BIND_TO_TEXTURE_RGBA
+        case 0x303b: return 0;   // EGL_MIN_SWAP_INTERVAL
+        case 0x303c: return 1;   // EGL_MAX_SWAP_INTERVAL
+        case 0x303d: return 0;   // EGL_LUMINANCE_SIZE
+        case 0x303e: return 0;   // EGL_ALPHA_MASK_SIZE
+        case 0x303f: return 0x308e;  // EGL_COLOR_BUFFER_TYPE = EGL_RGB_BUFFER
+        case 0x3040: return 0x0001;  // EGL_RENDERABLE_TYPE = EGL_OPENGL_ES_BIT
+        case 0x3042: return 0x0001;  // EGL_CONFORMANT = EGL_OPENGL_ES_BIT
+        default: return std::nullopt;
+    }
+}
+
+bool egl_config_attribute_is_minimum(i32 attribute) {
+    switch (attribute) {
+        case 0x3020:  // EGL_BUFFER_SIZE
+        case 0x3021:  // EGL_ALPHA_SIZE
+        case 0x3022:  // EGL_BLUE_SIZE
+        case 0x3023:  // EGL_GREEN_SIZE
+        case 0x3024:  // EGL_RED_SIZE
+        case 0x3025:  // EGL_DEPTH_SIZE
+        case 0x3026:  // EGL_STENCIL_SIZE
+        case 0x3031:  // EGL_SAMPLES
+        case 0x3032:  // EGL_SAMPLE_BUFFERS
+        case 0x303d:  // EGL_LUMINANCE_SIZE
+        case 0x303e:  // EGL_ALPHA_MASK_SIZE
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool egl_config_attribute_is_mask(i32 attribute) {
+    return attribute == 0x3033 || attribute == 0x3040 || attribute == 0x3042;
+}
 
 /// EXPLICIT DEVIATION FROM HARDWARE FIDELITY, scoped to one title -- same
 /// spirit as emulator.cpp's kVortexDivisorInstructionPatched, see that
@@ -129,18 +202,51 @@ struct GlState {
     /// Unit selected for glTexCoordPointer / glEnableClientState.
     u32 client_active_unit = 0;
     bool surface_ready = false;
+    bool egl_initialized = false;
+    bool egl_context_created = false;
+    bool egl_surface_created = false;
+    bool egl_context_current = false;
+    u32 egl_draw_surface = 0;
+    u32 egl_read_surface = 0;
+    GLenum pending_gl_error = GL_NO_ERROR;
+    /// EGL status of the most recent EGL call in this emulated instance.
+    i32 egl_error = kEglSuccess;
+    std::map<i32, GuestAddr> egl_strings;
+    std::map<GLenum, GuestAddr> gl_strings;
     u64 frames = 0;
     u64 draws = 0;
     /// The texture bound by the most recent glBindTexture, and how many draws
     /// each one accounted for.
     u32 bound_texture = 0;
+    u32 bound_texture_target = 0x0DE1;
     std::map<u32, u64> draws_by_texture;
     std::set<u32> dumped;
+    std::map<u32, std::pair<i32, i32>> texture_dimensions;
+    std::map<u32, i32> texture_max_level;
+    std::vector<float> scratch_vertex;
+    std::vector<float> scratch_colour;
+    std::vector<float> scratch_texcoord[kMaxTextureUnits];
 };
 
-GlState& gl_state() {
-    static GlState state;
-    return state;
+thread_local GlState* active_gl_state = nullptr;
+
+GlState& gl_state() { return *active_gl_state; }
+
+void set_egl_error(i32 error) {
+    gl_state().egl_error = error;
+}
+
+void set_gl_error(GLenum error) {
+    if (gl_state().pending_gl_error == GL_NO_ERROR) {
+        gl_state().pending_gl_error = error;
+    }
+}
+
+bool require_egl_initialized(HleCallFrame& frame) {
+    if (gl_state().egl_initialized) return true;
+    set_egl_error(kEglNotInitialized);
+    frame.ret(0);
+    return false;
 }
 
 /// Byte stride actually used to walk an array. Zero means tightly packed, and
@@ -167,15 +273,12 @@ GlState& gl_state() {
 /// next draw because glVertexPointer only records the pointer -- GL reads it
 /// during glDrawElements, by which time a local buffer would be long gone.
 struct Scratch {
-    std::vector<float> vertex;
-    std::vector<float> colour;
-    std::vector<float> texcoord[kMaxTextureUnits];
+    std::vector<float>& vertex = gl_state().scratch_vertex;
+    std::vector<float>& colour = gl_state().scratch_colour;
+    std::vector<float>* texcoord = gl_state().scratch_texcoord;
 };
 
-Scratch& scratch() {
-    static Scratch buffers;
-    return buffers;
-}
+Scratch scratch() { return {}; }
 
 /// Resolves one guest array into something host GL can read, converting
 /// GL_FIXED to float on the way. Returns false if the range is not mapped.
@@ -247,8 +350,7 @@ void composite_gdi_overlay_impl() {
 /// layer still believing 4 or 7 was current. Anything that must match the
 /// texture a draw samples has to key off this one.
 std::map<u32, std::pair<i32, i32>>& texture_dimensions() {
-    static std::map<u32, std::pair<i32, i32>> dims;
-    return dims;
+    return gl_state().texture_dimensions;
 }
 
 /// Texel -> normalised, for the texture this draw will actually sample.
@@ -265,7 +367,10 @@ std::map<u32, std::pair<i32, i32>>& texture_dimensions() {
 /// correct texel coords, correct texture contents -- came out as a squashed
 /// 44-row band, because its coordinates were divided by another texture's size.
 void install_texel_scale() {
-    // Texturing ON, at DRAW time, whenever a real texture is bound.
+    // The selected texture target is enabled at DRAW time whenever a real
+    // texture is bound. Only GL_TEXTURE_2D needs texel-to-normalised scaling;
+    // rectangle textures use texel coordinates directly and cube maps use
+    // direction vectors.
     //
     // The ordinal layer enabled GL_TEXTURE_2D once, from a `static bool`, on
     // the first glBindTexture of the process. Measured on Ms. PAC-MAN by
@@ -282,14 +387,15 @@ void install_texel_scale() {
     // texture name 0 is GL's reserved default and Ms. PAC-MAN does bind it for
     // 2066 draws.
     if (gl_state().bound_texture != 0) {
-        glEnable(GL_TEXTURE_2D);
+        glEnable(gl_state().bound_texture_target);
     } else {
-        glDisable(GL_TEXTURE_2D);
+        glDisable(gl_state().bound_texture_target);
     }
     const auto it = texture_dimensions().find(gl_state().bound_texture);
     glMatrixMode(GL_TEXTURE);
     glLoadIdentity();
-    if (it != texture_dimensions().end() && it->second.first > 0 &&
+    if (gl_state().bound_texture_target == GL_TEXTURE_2D &&
+        it != texture_dimensions().end() && it->second.first > 0 &&
         it->second.second > 0) {
         glScalef(1.0f / static_cast<float>(it->second.first),
                  1.0f / static_cast<float>(it->second.second), 1.0f);
@@ -458,8 +564,7 @@ void check_gl_error(const char* what) {
 /// filter and upload a single level, so the max level is pinned to whatever was
 /// actually supplied.
 std::map<u32, i32>& texture_max_level() {
-    static std::map<u32, i32> levels;
-    return levels;
+    return gl_state().texture_max_level;
 }
 
 /// Records a level upload and keeps GL_TEXTURE_MAX_LEVEL consistent with it.
@@ -527,6 +632,16 @@ bool ensure_display_open(Emulator& emulator) {
 void gles_composite_gdi(void) { composite_gdi_overlay_impl(); }
 
 void gles_present_frame(HleCallFrame& f) {
+    auto& storage = f.emulator.gles_state_storage();
+    if (!storage.has_value()) storage.emplace<GlState>();
+    GlState& state = std::any_cast<GlState&>(storage);
+    GlState* previous_state = active_gl_state;
+    active_gl_state = &state;
+    struct RestoreState {
+        GlState*& slot;
+        GlState* previous;
+        ~RestoreState() { slot = previous; }
+    } restore{active_gl_state, previous_state};
     // One definition of "a frame happened", shared by all three kinds of
     // program. It used to live inside eglSwapBuffers, which meant a game that
     // never calls EGL -- a GDI-only program, or a DirectDraw one -- presented
@@ -615,7 +730,29 @@ namespace {
 void register_libgles(HleRegistry& registry) {
     const auto fn = [&registry](const char* name, u8 arity, HleHandler handler) {
         // libGLES_CM exports by name, unlike COREDLL.
-        registry.add_named(kModule, name, arity, std::move(handler));
+        const std::string_view export_name(name);
+        const bool is_egl = export_name.starts_with("egl");
+        const bool is_get_error = export_name == "eglGetError";
+        registry.add_named(kModule, name, arity,
+            [handler = std::move(handler), is_egl,
+             is_get_error](HleCallFrame& frame) {
+                auto& storage = frame.emulator.gles_state_storage();
+                if (!storage.has_value()) storage.emplace<GlState>();
+                GlState* previous = active_gl_state;
+                active_gl_state = &std::any_cast<GlState&>(storage);
+                // EGL reports the status of the most recent EGL call. A new
+                // EGL entry clears the prior status; eglGetError itself reads
+                // and clears that status in its handler.
+                if (is_egl && !is_get_error) {
+                    active_gl_state->egl_error = kEglSuccess;
+                }
+                struct RestoreState {
+                    GlState*& slot;
+                    GlState* previous;
+                    ~RestoreState() { slot = previous; }
+                } restore{active_gl_state, previous};
+                handler(frame);
+            });
     };
 
     // --- EGL -----------------------------------------------------------------
@@ -626,74 +763,231 @@ void register_libgles(HleRegistry& registry) {
     });
 
     fn("eglInitialize", 3, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
         const GuestAddr major = f.args.next_ptr();
         const GuestAddr minor = f.args.next_ptr();
-        if (major != kNullGuest) f.store<i32>(major, 1);
-        if (minor != kNullGuest) f.store<i32>(minor, 0);
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (major != kNullGuest && !f.store<i32>(major, 1)) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (minor != kNullGuest && !f.store<i32>(minor, 0)) {
+            f.cpu.request_stop();
+            return;
+        }
+        gl_state().egl_initialized = true;
         f.ret(kEglTrue);
     });
 
     fn("eglTerminate", 1, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
+        if (f.args.next_u32() != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
         f.emulator.display().close();
+        gl_state().egl_initialized = false;
+        gl_state().egl_context_created = false;
+        gl_state().egl_surface_created = false;
+        gl_state().egl_context_current = false;
+        gl_state().egl_draw_surface = 0;
+        gl_state().egl_read_surface = 0;
+        gl_state().surface_ready = false;
         f.ret(kEglTrue);
     });
 
     fn("eglChooseConfig", 5, [](HleCallFrame& f) {
-        (void)f.args.next_u32();  // display
-        (void)f.args.next_ptr();  // attribute list
+        const u32 display = f.args.next_u32();
+        const GuestAddr attributes = f.args.next_ptr();
         const GuestAddr configs = f.args.next_ptr();
         const i32 capacity = f.args.next_i32();
         const GuestAddr count = f.args.next_ptr();
-        // One config, and it always matches. The panel is fixed at 16-bit
-        // RGB565, so there is genuinely nothing to choose between.
-        if (configs != kNullGuest && capacity > 0) {
-            f.store<u32>(configs, kEglConfig);
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
         }
-        if (count != kNullGuest) {
-            f.store<i32>(count, capacity > 0 ? 1 : 0);
+        if (!require_egl_initialized(f)) return;
+        if (count == kNullGuest || capacity < 0) {
+            set_egl_error(kEglBadParameter);
+            f.ret(0);
+            return;
+        }
+
+        bool matches = true;
+        if (attributes != kNullGuest) {
+            bool terminated = false;
+            std::vector<std::pair<i32, i32>> requested_attributes;
+            for (u32 i = 0; i < 64; ++i) {
+                const u64 key_address64 = static_cast<u64>(attributes) + i * 8u;
+                if (key_address64 > std::numeric_limits<GuestAddr>::max() - 4u) {
+                    f.cpu.request_stop();
+                    return;
+                }
+                const GuestAddr key_address = static_cast<GuestAddr>(key_address64);
+                const auto key = f.memory.read<i32>(key_address);
+                if (!key.has_value()) {
+                    f.cpu.request_stop();
+                    return;
+                }
+                if (*key == 0x3038) {  // EGL_NONE
+                    terminated = true;
+                    break;
+                }
+                const auto requested = f.memory.read<i32>(key_address + 4);
+                if (!requested.has_value()) {
+                    f.cpu.request_stop();
+                    return;
+                }
+                requested_attributes.emplace_back(*key, *requested);
+            }
+            if (!terminated) {
+                set_egl_error(kEglBadAttribute);
+                f.ret(0);
+                return;
+            }
+
+            const auto config_id = std::find_if(
+                requested_attributes.begin(), requested_attributes.end(),
+                [](const auto& item) { return item.first == 0x3028; });
+            if (config_id != requested_attributes.end() &&
+                config_id->second < 0 && config_id->second != -1) {
+                set_egl_error(kEglBadAttribute);
+                f.ret(0);
+                return;
+            }
+            if (config_id != requested_attributes.end() &&
+                config_id->second != -1) {
+                // EGL_CONFIG_ID overrides every other attribute in the list.
+                matches = config_id->second == 1;
+            } else {
+                for (const auto& [key, requested] : requested_attributes) {
+                    if ((key == 0x3041 && requested < 0) ||
+                        (key != 0x3029 && key != 0x3041 && requested < 0 &&
+                         requested != -1)) {
+                        set_egl_error(kEglBadAttribute);
+                        f.ret(0);
+                        return;
+                    }
+                    if (key == 0x3041) {  // EGL_MATCH_NATIVE_PIXMAP
+                        if (requested != -1) matches = false;
+                        continue;
+                    }
+                    const auto actual = egl_config_attribute(key);
+                    if (!actual.has_value()) {
+                        set_egl_error(kEglBadAttribute);
+                        f.ret(0);
+                        return;
+                    }
+                    if (requested == -1 && key != 0x3029) {
+                        continue;  // EGL_DONT_CARE (not valid for EGL_LEVEL)
+                    }
+                    if (egl_config_attribute_is_mask(key)) {
+                        matches = matches && ((*actual & requested) == requested);
+                    } else if (egl_config_attribute_is_minimum(key)) {
+                        matches = matches && *actual >= requested;
+                    } else {
+                        matches = matches && *actual == requested;
+                    }
+                }
+            }
+        }
+        const i32 available = matches ? 1 : 0;
+        const i32 returned = configs == kNullGuest
+                                 ? available
+                                 : std::min(available, capacity);
+        if (returned != 0 && configs != kNullGuest &&
+            !f.store<u32>(configs, kEglConfig)) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (!f.store<i32>(count, returned)) {
+            f.cpu.request_stop();
+            return;
         }
         f.ret(kEglTrue);
     });
 
     fn("eglGetConfigs", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
         const GuestAddr configs = f.args.next_ptr();
         const i32 capacity = f.args.next_i32();
         const GuestAddr count = f.args.next_ptr();
-        if (configs != kNullGuest && capacity > 0) {
-            f.store<u32>(configs, kEglConfig);
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
         }
-        if (count != kNullGuest) {
-            f.store<i32>(count, capacity > 0 ? 1 : 0);
+        if (!require_egl_initialized(f)) return;
+        if (count == kNullGuest || capacity < 0) {
+            set_egl_error(kEglBadParameter);
+            f.ret(0);
+            return;
+        }
+        const i32 returned = configs == kNullGuest ? 1 : std::min(capacity, 1);
+        if (returned != 0 && !f.store<u32>(configs, kEglConfig)) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (!f.store<i32>(count, returned)) {
+            f.cpu.request_stop();
+            return;
         }
         f.ret(kEglTrue);
     });
 
     fn("eglCreateWindowSurface", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();  // display
-        (void)f.args.next_u32();  // config
+        const u32 display = f.args.next_u32();
+        const u32 config = f.args.next_u32();
         (void)f.args.next_u32();  // native window (the HWND we handed out)
         (void)f.args.next_ptr();  // attribute list
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (config != kEglConfig) {
+            set_egl_error(kEglBadConfig);
+            f.ret(0);
+            return;
+        }
 
         // This is where the host window normally first appears: the guest has
         // now committed to rendering, rather than merely having a window.
         // ensure_display_open is idempotent, so this is a no-op if something
         // else (glGenTextures, a draw) already needed a real context first.
         if (!ensure_display_open(f.emulator)) {
+            set_egl_error(kEglBadAlloc);
             f.ret(0);  // EGL_NO_SURFACE
             return;
         }
         gl_state().surface_ready = true;
+        gl_state().egl_surface_created = true;
         f.ret(kEglSurface);
     });
 
     fn("eglCreateContext", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
+        const u32 config = f.args.next_u32();
         (void)f.args.next_u32();
         (void)f.args.next_ptr();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (config != kEglConfig) {
+            set_egl_error(kEglBadConfig);
+            f.ret(0);
+            return;
+        }
+        gl_state().egl_context_created = true;
         f.ret(kEglContext);
     });
 
@@ -712,13 +1006,21 @@ void register_libgles(HleRegistry& registry) {
     // dead on eglGetError, which is a reasonable thing for a program to call
     // after every setup step.
     fn("eglGetError", 0, [](HleCallFrame& f) {
-        f.ret(0x3000);  // EGL_SUCCESS -- nothing here reports EGL failure
+        const i32 error = gl_state().egl_error;
+        gl_state().egl_error = kEglSuccess;
+        f.ret(static_cast<u32>(error));
     });
 
     fn("eglQueryString", 2, [](HleCallFrame& f) {
-        (void)f.args.next_u32();  // display
+        const u32 display = f.args.next_u32();
         const i32 name = f.args.next_i32();
-        static std::map<i32, GuestAddr> cached;
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(kNullGuest);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        auto& cached = gl_state().egl_strings;
         const auto it = cached.find(name);
         if (it != cached.end()) { f.ret(it->second); return; }
         std::string value;
@@ -726,43 +1028,68 @@ void register_libgles(HleRegistry& registry) {
             case 0x3053: value = "1.0"; break;               // EGL_VERSION
             case 0x3054: value = "NVIDIA Corporation"; break; // EGL_VENDOR
             case 0x3055: value = ""; break;                   // EGL_EXTENSIONS
-            default: f.ret(kNullGuest); return;
+            default:
+                set_egl_error(kEglBadParameter);
+                f.ret(kNullGuest);
+                return;
         }
         const GuestAddr block =
             f.emulator.heap().allocate(static_cast<u32>(value.size()) + 1);
-        if (block == kNullGuest) { f.ret(kNullGuest); return; }
+        if (block == kNullGuest) {
+            set_egl_error(kEglBadAlloc);
+            f.ret(kNullGuest);
+            return;
+        }
         write_guest_cstring(f.memory, block, value);
         cached[name] = block;
         f.ret(block);
     });
 
     fn("eglGetConfigAttrib", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();  // display
-        (void)f.args.next_u32();  // config
+        const u32 display = f.args.next_u32();
+        const u32 config = f.args.next_u32();
         const i32 attribute = f.args.next_i32();
         const GuestAddr out = f.args.next_ptr();
-        // One config, describing the panel: 16-bit RGB565, 16-bit depth.
-        i32 value = 0;
-        switch (attribute) {
-            case 0x3024: value = 5; break;   // EGL_RED_SIZE
-            case 0x3023: value = 6; break;   // EGL_GREEN_SIZE
-            case 0x3022: value = 5; break;   // EGL_BLUE_SIZE
-            case 0x3021: value = 0; break;   // EGL_ALPHA_SIZE
-            case 0x3025: value = 16; break;  // EGL_DEPTH_SIZE
-            case 0x3026: value = 0; break;   // EGL_STENCIL_SIZE
-            case 0x3020: value = 16; break;  // EGL_BUFFER_SIZE
-            case 0x3028: value = kEglConfig; break;  // EGL_CONFIG_ID
-            default: break;
+        if (display != kEglDisplay || config != kEglConfig ||
+            out == kNullGuest) {
+            set_egl_error(display != kEglDisplay ? kEglBadDisplay :
+                          (config != kEglConfig ? kEglBadConfig :
+                           kEglBadParameter));
+            f.ret(0);
+            return;
         }
-        if (out != kNullGuest) { f.store<i32>(out, value); }
+        if (!require_egl_initialized(f)) return;
+        const auto value = egl_config_attribute(attribute);
+        if (!value.has_value()) {
+            set_egl_error(kEglBadAttribute);
+            f.ret(0);
+            return;
+        }
+        if (!f.store<i32>(out, *value)) {
+            f.cpu.request_stop();
+            return;
+        }
         f.ret(kEglTrue);
     });
 
-    fn("eglGetCurrentDisplay", 0, [](HleCallFrame& f) { f.ret(kEglDisplay); });
-    fn("eglGetCurrentContext", 0, [](HleCallFrame& f) { f.ret(kEglContext); });
+    fn("eglGetCurrentDisplay", 0, [](HleCallFrame& f) {
+        f.ret(gl_state().egl_context_current ? kEglDisplay : 0u);
+    });
+    fn("eglGetCurrentContext", 0, [](HleCallFrame& f) {
+        f.ret(gl_state().egl_context_current ? kEglContext : 0u);
+    });
     fn("eglGetCurrentSurface", 1, [](HleCallFrame& f) {
-        (void)f.args.next_i32();
-        f.ret(kEglSurface);
+        const i32 which = f.args.next_i32();
+        if (which == 0x3059) {  // EGL_DRAW
+            f.ret(gl_state().egl_context_current
+                      ? gl_state().egl_draw_surface : 0u);
+        } else if (which == 0x305a) {  // EGL_READ
+            f.ret(gl_state().egl_context_current
+                      ? gl_state().egl_read_surface : 0u);
+        } else {
+            set_egl_error(kEglBadParameter);
+            f.ret(0);
+        }
     });
     fn("eglWaitGL", 0, [](HleCallFrame& f) { glFinish(); f.ret(kEglTrue); });
     fn("eglWaitNative", 1, [](HleCallFrame& f) {
@@ -773,25 +1100,80 @@ void register_libgles(HleRegistry& registry) {
     // surface as the window: there is one framebuffer here, and a game that
     // renders offscreen then blits is still rendering to the thing we present.
     fn("eglCreatePbufferSurface", 3, [](HleCallFrame& f) {
-        (void)f.args.next_u32();  // display
-        (void)f.args.next_u32();  // config
+        const u32 display = f.args.next_u32();
+        const u32 config = f.args.next_u32();
         (void)f.args.next_ptr();  // attribute list
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (config != kEglConfig) {
+            set_egl_error(kEglBadConfig);
+            f.ret(0);
+            return;
+        }
+        gl_state().egl_surface_created = true;
         f.ret(kEglSurface);
     });
     fn("eglCreatePixmapSurface", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
+        const u32 config = f.args.next_u32();
         (void)f.args.next_u32();  // native pixmap
         (void)f.args.next_ptr();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (config != kEglConfig) {
+            set_egl_error(kEglBadConfig);
+            f.ret(0);
+            return;
+        }
+        gl_state().egl_surface_created = true;
         f.ret(kEglSurface);
     });
 
     fn("eglQueryContext", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        (void)f.args.next_i32();
+        const u32 display = f.args.next_u32();
+        const u32 context = f.args.next_u32();
+        const i32 attribute = f.args.next_i32();
         const GuestAddr out = f.args.next_ptr();
-        if (out != kNullGuest) { f.store<i32>(out, 0); }
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (context != kEglContext || !gl_state().egl_context_created) {
+            set_egl_error(kEglBadContext);
+            f.ret(0);
+            return;
+        }
+        if (out == kNullGuest) {
+            set_egl_error(kEglBadParameter);
+            f.ret(0);
+            return;
+        }
+        i32 value = 0;
+        if (attribute == 0x3028) {  // EGL_CONFIG_ID
+            value = 1;
+        } else if (attribute == 0x3097) {  // EGL_CONTEXT_CLIENT_TYPE
+            value = 0x30a0;  // EGL_OPENGL_ES_API
+        } else if (attribute == 0x3098) {  // EGL_CONTEXT_CLIENT_VERSION
+            value = 1;
+        } else {
+            set_egl_error(kEglBadAttribute);
+            f.ret(0);
+            return;
+        }
+        if (!f.store<i32>(out, value)) {
+            f.cpu.request_stop();
+            return;
+        }
         f.ret(kEglTrue);
     });
 
@@ -799,38 +1181,108 @@ void register_libgles(HleRegistry& registry) {
         // Usually GL_NO_ERROR, because the layer's own checking drains the
         // host error queue after each call. Games poll this to decide whether
         // a context is healthy, and "fine" is the honest answer when it is.
+        if (gl_state().pending_gl_error != GL_NO_ERROR) {
+            const GLenum error = gl_state().pending_gl_error;
+            gl_state().pending_gl_error = GL_NO_ERROR;
+            f.ret(static_cast<u32>(error));
+            return;
+        }
         f.ret(static_cast<u32>(glGetError()));
     });
 
     fn("eglMakeCurrent", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
-        // Single context, already current since creation.
+        const u32 display = f.args.next_u32();
+        const u32 draw = f.args.next_u32();
+        const u32 read = f.args.next_u32();
+        const u32 context = f.args.next_u32();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (context != 0 &&
+            (context != kEglContext || !gl_state().egl_context_created)) {
+            set_egl_error(kEglBadContext);
+            f.ret(0);
+            return;
+        }
+        if (draw != 0 &&
+            (draw != kEglSurface || !gl_state().egl_surface_created)) {
+            set_egl_error(kEglBadSurface);
+            f.ret(0);
+            return;
+        }
+        if (read != 0 &&
+            (read != kEglSurface || !gl_state().egl_surface_created)) {
+            set_egl_error(kEglBadSurface);
+            f.ret(0);
+            return;
+        }
+        if ((context == 0 && (draw != 0 || read != 0)) ||
+            (context != 0 && (draw == 0 || read == 0))) {
+            set_egl_error(kEglBadMatch);
+            f.ret(0);
+            return;
+        }
+        gl_state().egl_context_current = context != 0;
+        gl_state().egl_draw_surface = draw;
+        gl_state().egl_read_surface = read;
         f.ret(kEglTrue);
     });
 
     fn("eglQuerySurface", 4, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
+        const u32 surface = f.args.next_u32();
         const i32 attribute = f.args.next_i32();
         const GuestAddr value = f.args.next_ptr();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (surface != kEglSurface || !gl_state().egl_surface_created) {
+            set_egl_error(kEglBadSurface);
+            f.ret(0);
+            return;
+        }
+        if (value == kNullGuest) {
+            set_egl_error(kEglBadParameter);
+            f.ret(0);
+            return;
+        }
         i32 result = 0;
         if (attribute == kEglWidth) {
             result = kScreenWidth;
         } else if (attribute == kEglHeight) {
             result = kScreenHeight;
+        } else {
+            set_egl_error(kEglBadAttribute);
+            f.ret(0);
+            return;
         }
-        if (value != kNullGuest) {
-            f.store<i32>(value, result);
+        if (!f.store<i32>(value, result)) {
+            f.cpu.request_stop();
+            return;
         }
         f.ret(kEglTrue);
     });
 
     fn("eglSwapBuffers", 2, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
+        const u32 surface = f.args.next_u32();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (surface != kEglSurface || !gl_state().egl_surface_created) {
+            set_egl_error(kEglBadSurface);
+            f.ret(0);
+            return;
+        }
         gles_present_frame(f);
         f.ret(kEglTrue);
     });
@@ -842,15 +1294,44 @@ void register_libgles(HleRegistry& registry) {
     });
 
     fn("eglDestroySurface", 2, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
+        const u32 surface = f.args.next_u32();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (surface != kEglSurface || !gl_state().egl_surface_created) {
+            set_egl_error(kEglBadSurface);
+            f.ret(0);
+            return;
+        }
+        gl_state().egl_surface_created = false;
+        if (gl_state().egl_draw_surface == surface) gl_state().egl_draw_surface = 0;
+        if (gl_state().egl_read_surface == surface) gl_state().egl_read_surface = 0;
         gl_state().surface_ready = false;
         f.ret(kEglTrue);
     });
 
     fn("eglDestroyContext", 2, [](HleCallFrame& f) {
-        (void)f.args.next_u32();
-        (void)f.args.next_u32();
+        const u32 display = f.args.next_u32();
+        const u32 context = f.args.next_u32();
+        if (display != kEglDisplay) {
+            set_egl_error(kEglBadDisplay);
+            f.ret(0);
+            return;
+        }
+        if (!require_egl_initialized(f)) return;
+        if (context != kEglContext || !gl_state().egl_context_created) {
+            set_egl_error(kEglBadContext);
+            f.ret(0);
+            return;
+        }
+        gl_state().egl_context_created = false;
+        gl_state().egl_context_current = false;
+        gl_state().egl_draw_surface = 0;
+        gl_state().egl_read_surface = 0;
         f.ret(kEglTrue);
     });
 
@@ -1699,7 +2180,22 @@ void register_libgles(HleRegistry& registry) {
         const i32 count = f.args.next_i32();
         const u32 type = f.args.next_u32();
         const GuestAddr indices = f.args.next_ptr();
-        if (count <= 0 || indices == kNullGuest) {
+        if (count < 0) {
+            set_gl_error(GL_INVALID_VALUE);
+            f.ret_void();
+            return;
+        }
+        if (count == 0 || indices == kNullGuest) {
+            f.ret_void();
+            return;
+        }
+
+        // The iPod firmware's index-copy path handles only GL_UNSIGNED_BYTE
+        // and GL_UNSIGNED_SHORT. Treating every other enum as 16-bit both
+        // under-checks guest memory and lets desktop GL read the buffer using
+        // a different element width (notably for GL_UNSIGNED_INT).
+        if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT) {
+            set_gl_error(GL_INVALID_ENUM);
             f.ret_void();
             return;
         }
@@ -1935,6 +2431,7 @@ void register_libgles(HleRegistry& registry) {
         const auto target = static_cast<GLenum>(f.args.next_u32());
         const u32 texture = f.args.next_u32();
         gl_state().bound_texture = texture;
+        gl_state().bound_texture_target = target;
         // Same lazy-context gap glGenTextures already closed, one call site
         // over: a title that binds a hardcoded texture name (never calls
         // glGenTextures at all) as its very first GL operation uploads real
@@ -2398,7 +2895,7 @@ void register_libgles(HleRegistry& registry) {
         //
         // The strings are allocated once in guest memory and cached, because
         // the caller keeps the pointer and GL promises it stays valid.
-        static std::map<GLenum, GuestAddr> cached;
+        auto& cached = gl_state().gl_strings;
         const auto it = cached.find(name);
         if (it != cached.end()) {
             f.ret(it->second);
@@ -2443,10 +2940,59 @@ void register_libgles(HleRegistry& registry) {
     fn("glGetIntegerv", 2, [](HleCallFrame& f) {
         const auto name = static_cast<GLenum>(f.args.next_u32());
         const GuestAddr out = f.args.next_ptr();
-        GLint value = 0;
-        glGetIntegerv(name, &value);
-        if (out != kNullGuest) {
-            f.store<i32>(out, value);
+        if (out == kNullGuest) {
+            // glGetIntegerv requires a writable result buffer. A guest null
+            // pointer would fault in the native GLES implementation.
+            f.cpu.request_stop();
+            return;
+        }
+
+        // Several GLES queries write vectors. Passing a one-word local to the
+        // host GL API lets GL_VIEWPORT and similar queries overwrite the HLE
+        // stack, and returning only the first component also breaks callers.
+        // The largest fixed-size GLES state vectors are matrices (16 words).
+        std::size_t count = 1;
+        switch (name) {
+            case 0x0BA2:  // GL_VIEWPORT
+            case 0x0C10:  // GL_SCISSOR_BOX
+            case 0x0B00:  // GL_CURRENT_COLOR
+            case 0x0B03:  // GL_CURRENT_TEXTURE_COORDS
+            case 0x0C22:  // GL_COLOR_CLEAR_VALUE
+            case 0x0C23:  // GL_COLOR_WRITEMASK
+                count = 4;
+                break;
+            case 0x0B02:  // GL_CURRENT_NORMAL
+                count = 3;
+                break;
+            case 0x0D3A:  // GL_MAX_VIEWPORT_DIMS
+            case 0x0B70:  // GL_DEPTH_RANGE
+            case 0x846D:  // GL_ALIASED_POINT_SIZE_RANGE
+            case 0x846E:  // GL_ALIASED_LINE_WIDTH_RANGE
+                count = 2;
+                break;
+            case 0x0BA6:  // GL_MODELVIEW_MATRIX
+            case 0x0BA7:  // GL_PROJECTION_MATRIX
+            case 0x0BA8:  // GL_TEXTURE_MATRIX
+                count = 16;
+                break;
+            case 0x86A3: {  // GL_COMPRESSED_TEXTURE_FORMATS
+                GLint formats = 0;
+                glGetIntegerv(0x86A2, &formats);  // GL_NUM_COMPRESSED_TEXTURE_FORMATS
+                if (formats > 0) count = static_cast<std::size_t>(formats);
+                break;
+            }
+            default:
+                break;
+        }
+        std::vector<GLint> values(count, 0);
+        glGetIntegerv(name, values.data());
+        for (std::size_t i = 0; i < count; ++i) {
+            const u64 address = static_cast<u64>(out) + i * sizeof(i32);
+            if (address > std::numeric_limits<GuestAddr>::max() ||
+                !f.store<i32>(static_cast<GuestAddr>(address), values[i])) {
+                f.cpu.request_stop();
+                return;
+            }
         }
         f.ret_void();
     });
@@ -2619,13 +3165,20 @@ void register_libgles(HleRegistry& registry) {
     CLICKHLE_DEBUG(kCategory) << "registered OpenGL ES 1.0 translation";
 }
 
-void gles_statistics(u64& frames, u64& draws) {
-    frames = gl_state().frames;
-    draws = gl_state().draws;
+void gles_statistics(Emulator& emulator, u64& frames, u64& draws) {
+    if (!emulator.gles_state_storage().has_value()) {
+        frames = draws = 0;
+        return;
+    }
+    const auto& state = std::any_cast<const GlState&>(emulator.gles_state_storage());
+    frames = state.frames;
+    draws = state.draws;
 }
 
-const std::map<u32, u64>& gles_draws_by_texture() {
-    return gl_state().draws_by_texture;
+const std::map<u32, u64>& gles_draws_by_texture(Emulator& emulator) {
+    static const std::map<u32, u64> empty;
+    if (!emulator.gles_state_storage().has_value()) return empty;
+    return std::any_cast<GlState&>(emulator.gles_state_storage()).draws_by_texture;
 }
 
 }  // namespace clickhle

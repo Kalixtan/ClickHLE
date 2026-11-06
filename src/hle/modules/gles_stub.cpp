@@ -16,9 +16,14 @@ void register_libgles(HleRegistry&) {
            "unavailable";
 }
 
-void gles_statistics(u64& frames, u64& draws) {
+void gles_statistics(Emulator&, u64& frames, u64& draws) {
     frames = 0;
     draws = 0;
+}
+
+const std::map<u32, u64>& gles_draws_by_texture(Emulator&) {
+    static const std::map<u32, u64> empty;
+    return empty;
 }
 
 // Both of these are called from coredll_user and ddraw, which are built
