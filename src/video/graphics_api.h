@@ -16,6 +16,7 @@ class GraphicsApi {
   public:
     using Submit = std::function<void(std::span<const u8>)>;
     explicit GraphicsApi(Submit submit);
+    void reset();
     u32 call(u32 ordinal, HleCallFrame &frame);
     void queue(std::array<u32, 4> header, std::span<const u8> payload = {});
     void flush();
@@ -25,9 +26,9 @@ class GraphicsApi {
     Submit submit_;
     std::vector<u8> pending_;
     std::array<u8, 0x2000> staging_{};
-    u32 active_texture_ = 0, next_texture_ = 0, error_ = 0;
+    u32 active_texture_ = 0, next_texture_ = 1, error_ = 0;
     std::array<u32, 3> textures_{};
-    std::map<u32, bool> enabled_;
+    std::map<u32, bool> enabled_{{0xbd0, true}}; // Dithering starts enabled in RetailOS.
     u16 textures_dirty_ = 0;
     u32 draw(u32 ordinal, HleCallFrame &frame, const std::array<u32, 16> &args);
     u16 attributes_enabled_ = 0, attributes_dirty_ = 0;

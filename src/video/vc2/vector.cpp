@@ -110,6 +110,8 @@ bool enabled(const Core &c, unsigned pred, unsigned lane) {
         return true;
     if (pred == 1)
         return false;
+    if (pred >= 6 && c.unknown_carry[lane])
+        throw std::runtime_error("Unverified carry from halfword SETF load");
     bool v = pred < 4 ? c.vz[lane] : pred < 6 ? c.vn[lane] : c.vc[lane];
     return v == ((pred & 1) == 0);
 }
@@ -162,6 +164,77 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         }
         return;
     }
+    // Provisional raster-mask loads. The original sixteen-row consumers
+    // advance the mask pointer by 256 bytes, so these offsets are in units
+    // of eight bytes. Other 80-bit load families have different fields.
+    const bool mask_load = length == 5 && w[0] == 0x2000 &&
+                           (w[1] & 0xf0ff) == 0x4000 &&
+                           ((w[2] & 0x3ff) == 0x1f || (w[2] & 0x3ff) == 0x27) &&
+                           (w[2] >> 9) <= 30 && w[3] == 0 && w[4] == 0x40e7;
+    if (mask_load) {
+        const u32 address = r[(w[2] >> 3) & 7] + (w[2] >> 9) * 8;
+        if (address & 15)
+            throw std::runtime_error("Unverified unaligned raster mask load");
+        Lanes values{};
+        for (unsigned lane = 0; lane < 16; ++lane)
+            values[lane] = read(address + lane, 1);
+        put(*this, coordinate(w[1] >> 8, false, 1), 0, values);
+        for (unsigned lane = 0; lane < 16; ++lane) {
+            vz[lane] = values[lane] == 0;
+            // Z is constrained by the IFZ consumers. Clearing N/C follows
+            // the existing unsigned-byte move model, not a silicon result.
+            vn[lane] = vc[lane] = false;
+            unknown_carry[lane] = false;
+        }
+        return;
+    }
+    // Original uniform conversion loads signed high halves before clamping
+    // the low halves to 0..65535 with IFNZ/IFN. Only this aligned form is
+    // established. Carry is deliberately unknown, not guessed from N.
+    if (length == 5 && w[0] == 0x2002 && w[1] == 0xcd00 &&
+        w[2] == 0x001f && w[3] == 0 && w[4] == 0x40e7) {
+        const u32 address = r[3];
+        if (address & 31)
+            throw std::runtime_error("Unverified unaligned halfword SETF load");
+        Lanes values{};
+        for (unsigned lane = 0; lane < 16; ++lane)
+            values[lane] = read(address + 2 * lane, 2);
+        put(*this, coordinate(0xcd, false, 2), 0, values);
+        for (unsigned lane = 0; lane < 16; ++lane) {
+            vz[lane] = values[lane] == 0;
+            vn[lane] = (values[lane] & 0x8000) != 0;
+            unknown_carry[lane] = true;
+        }
+        return;
+    }
+    // The masked and compact raster tails share their address fields.
+    // Source row moves into word 3 in the full form. Only the observed
+    // sixteen-row, descending-pitch forms are admitted here; do not decode
+    // their sign-extension bits as ALU repeat or scalar-result modifiers.
+    if (length == 5 && (w[0] == 0x2008 || w[0] == 0x2009 ||
+                        w[0] == 0x200c || w[0] == 0x200d)) {
+        const unsigned block = w[1] & 31;
+        const unsigned row = (w[3] >> 5) & 15;
+        const u32 bits = ((w[1] & 0xe0u) << 10) | ((w[0] & 4u) << 12) |
+                         ((w[0] & 1u) << 13) | ((w[1] >> 8) << 5);
+        const i32 offset = sign_extend(bits, 18);
+        const bool source_form = (block == 1 && w[2] == 0x8007) ||
+                            (block == 3 && w[2] == 7);
+        if (source_form && offset == -1280 * static_cast<i32>(row) &&
+            w[3] == (row ? 0x0e0e + row * 32 : 0x020e) &&
+            w[4] == (row ? 0x11ffu : 0x1000u)) {
+            const u32 address = r[0] + static_cast<u32>(offset);
+            if (address & 15)
+                throw std::runtime_error("Unverified unaligned masked raster store");
+            const auto source = operand((block == 3 ? 16 : 0) + row,
+                                        block == 1 ? 48 : 32, false, 1);
+            const auto values = get(*this, source, 0, false);
+            for (unsigned lane = 0; lane < 16; ++lane)
+                if (vz[lane])
+                    write(address + lane, static_cast<u32>(values[lane]), 1);
+            return;
+        }
+    }
     // Experimental split stores: verified against original memcpy and guarded
     // buffers. Encodings, never game identities or firmware PCs, select them.
     const bool partial_negative =
@@ -190,45 +263,91 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         u32 offset =
             ((w[1] & 0xe0u) << 10) | ((w[0] & 4u) << 12) | ((w[0] & 1u) << 13) | ((w[1] >> 8) << 5);
         u32 address = r[0] + static_cast<u32>(sign_extend(offset, 18));
-        // t5 bit 1 selects the row block, as in the measured H16 stores.
-        // Uploaded raster tails encode rows 16..31 both as t5=3,row=0..15
-        // and as t5=1,row=16..31. In particular, the latter's first 2208
-        // must not fall through to the unrelated load-style field decoder.
-        const unsigned row = ((w[1] & 2) ? 16 : 0) + (w[2] >> 11);
-        auto values = get(*this, operand(row, 32, false, 1), 0, false);
+        // H8 source c[4] selects the upper byte-column group, as for
+        // byte ALU operands; only c[3:0] selects a row. The colour-clamp
+        // shader stores the high bytes of H16 rows 0..15 (t5=1,c[4]=1).
+        // Texture shaders instead store H8 rows 16..31 (t5=3,c[4]=0).
+        const unsigned row = ((w[1] & 2) ? 16 : 0) + ((w[2] >> 11) & 15);
+        const unsigned column = 32 + ((w[2] >> 15) * 16);
+        auto values = get(*this, operand(row, column, false, 1), 0, false);
         for (unsigned i = 0; i < 16; ++i)
             write(address + i, static_cast<u32>(values[i]), 1);
         return;
     }
-    if (length == 5 && (w[0] == 0x2150 || w[0] == 0x2152 || w[0] == 0x2156) && w[3] == 0) {
-        unsigned reg = 0, width = 0, y = 16, x = 0;
-        bool vertical = false, low = false;
-        if (w[0] == 0x2150 && w[1] == 0x4000 && w[2] == 0x2f && w[4] == 0x87) {
+    // Provisional accumulator-indexed loads. Original palette shaders use a
+    // byte lookup, then a doubled index and two halfword reads for RGBA8888.
+    // This supports the observed +2-byte read, not a general offset field
+    // or the meaning of all modifiers. Keep other forms explicitly guarded.
+    if (length == 5 && (w[0] & 0xfff9) == 0x2150) {
+        unsigned reg = 0, width = 0, y = 16, x = 0, offset = 0;
+        bool vertical = false, full_index = false;
+        if (w[0] == 0x2150 && w[1] == 0x4000 && w[2] == 0x2f && w[4] == 0x87 && w[3] == 0) {
             reg = 5;
             width = 1;
-        } else if (w[0] == 0x2152 && w[1] == 0x4100 && w[2] == 0x17 && w[4] == 0x87) {
+        } else if (w[0] == 0x2152 && w[1] == 0x4100 && w[2] == 0x17 && w[4] == 0x87 && w[3] == 0) {
             reg = 2;
             width = 2;
             y = 17;
-        } else if (w[0] == 0x2150 && w[1] == 0x5000 && w[2] == 0x37 && w[4] == 0x87) {
+        } else if (w[0] == 0x2150 && w[1] == 0x5000 && w[2] == 0x37 && w[4] == 0x87 && w[3] == 0) {
             reg = 6;
             width = 1;
             x = 16;
-        } else if (w[0] == 0x2156 &&
-                   (w[1] == 0x6000 || w[1] == 0x6400 || w[1] == 0x6800 || w[1] == 0x6c00) &&
-                   w[2] == 0x1f && w[4] == 0x80e7) {
-            reg = 3;
-            width = 2;
-            x = 32 + ((w[1] >> 8) & 15);
-            vertical = low = true;
+        } else {
+            const unsigned dest = w[1] >> 8;
+            // Direct byte textures use the same full index as palette
+            // indices, but read r3 and place the sample in the shader's
+            // colour/alpha column. These destinations occur in the original
+            // programs 5..9 and 20; other modifiers remain unverified.
+            const bool direct_byte = ((dest & 0xf3) == 0x23 ||
+                                      (dest & 0xf3) == 0x63 ||
+                                      (dest & 0xf3) == 0xa0 ||
+                                      (dest & 0xf3) == 0xb2) &&
+                                     w[0] == 0x2154 && (w[1] & 255) == 0 &&
+                                     w[2] == 0x1f && w[3] == 0 && w[4] == 0x80e7;
+            if (direct_byte) {
+                reg = 3;
+                width = 1;
+                y = (dest >> 6) * 16;
+                x = ((dest >> 4) & 3) * 16 + (dest & 15);
+                vertical = full_index = true;
+            }
+            const bool texture_bank = (dest & 0xf0) == 0x60 || (dest & 0xf0) == 0xa0;
+            if (!direct_byte && texture_bank && (w[1] & 255) == 0 && w[4] == 0x80e7) {
+                if (w[0] == 0x2154 && (dest & 3) == 3 && w[2] == 0x27 && w[3] == 0) {
+                    reg = 4;
+                    width = 1;
+                } else if (w[0] == 0x2156 && !(dest & 1) && w[2] == 0x1f &&
+                           (w[3] == 0 || (w[3] == 0x2000 && (dest & 3) == 2))) {
+                    reg = 3;
+                    width = 2;
+                    offset = w[3] == 0x2000 ? 2 : 0;
+                }
+                y = (dest >> 6) * 16;
+                x = 32 + (dest & 15);
+                vertical = full_index = true;
+            }
         }
         if (width) {
             Lanes values{};
-            for (unsigned i = 0; i < 16; ++i)
-                values[i] = read(r[reg] + static_cast<u32>(low ? acclo[i] : acc[i]) * width, width);
+            for (unsigned i = 0; i < 16; ++i) {
+                // Texture shaders explicitly accumulate the high product of
+                // y * stride. Dropping ACC loses every index above 65535.
+                // The observed x15 form uses the complete 32-bit index;
+                // the older non-x15 lookup forms retain their ACC index.
+                const u32 index = full_index
+                                      ? static_cast<u32>(acc[i]) * 65536u + acclo[i]
+                                      : static_cast<u32>(acc[i]);
+                values[i] = read(r[reg] + index * width + offset, width);
+            }
             put(*this, operand(y, x, vertical, width), 0, values);
             return;
         }
+        std::ostringstream message;
+        message << "Unsupported vector indexed load [" << std::hex << std::setfill('0');
+        for (unsigned i = 0; i < length; ++i)
+            message << (i ? " " : "") << std::setw(4) << w[i];
+        message << "]";
+        throw std::runtime_error(message.str());
     }
     if (op9 < 32) {
         const unsigned kind = op9 >> 3;
@@ -265,13 +384,18 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         i32 offset = 0;
         if (length == 3) {
             offset = sign_extend(((w[1] & 255) << 7) | (w[2] >> 9), 15) * 8;
-            if (kind == 1 && select == 1) {
+            // The edge-mask routine stores H8 rows 16..31 at its supplied
+            // buffer. Here t5=2 selects row block 16, not a 2048-byte offset.
+            // This exact repeated byte form shares the measured H16 source
+            // fields; other unverified byte-store layouts stay guarded.
+            const bool edge_mask_store = w[0] == 0x2208 && w[1] == 2 && w[2] == 0x0113;
+            if ((kind == 1 && select == 1) || edge_mask_store) {
                 unsigned t = w[1] & 31;
                 // Provisional: t5 bit 3 is a modifier, not an x=16 origin.
                 // Original copy routines preserve guarded buffers with this
                 // layout. Any lane-mask or bus-write effects are unresolved.
                 d = operand(16 * ((t >> 1) & 1) + 32 * ((t >> 2) & 1) + (w[2] >> 11),
-                            32 * (t & 1), false, 2);
+                            32 * (t & 1), false, edge_mask_store ? 1 : 2);
                 offset = static_cast<i32>(32 * (w[1] >> 8));
             }
         } else {
@@ -391,6 +515,20 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
                 pred = (w[2] >> 6) & 7;
                 count = 1;
             }
+            // Original shader clamp: IFNZ first sets the low half to
+            // 65535 for nonzero high halves, then IFN clears negative inputs.
+            // As in context flag packing, this compact field is a predicate,
+            // not REP. Other immediate modifier forms remain unverified.
+            if (w[0] == 0x2222 && (w[1] & 255) == 0xe0 && w[2] == 0x0500) {
+                pred = 4;
+                count = 1;
+            }
+            // RGBA5551 expansion pairs IFNZ #255 with IFZ #0. Decoding
+            // this as REP4 clears opaque alpha and neighbouring columns.
+            if (w[0] == 0x2224 && (w[1] & 255) == 0xe0 && w[2] == 0x0480) {
+                pred = 2;
+                count = 1;
+            }
             bkind = 1;
             immediate = sign_extend(w[2] & 63, 6);
         }
@@ -413,7 +551,12 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
             throw std::runtime_error("Unsupported 48-bit B type");
         unsigned y = 16 * ((t >> 1) & 1) + 32 * ((t >> 2) & 1),
                  x = 32 * (t & 1) + 16 * ((t >> 3) & 1), c = w[2] >> 11;
-        a = operand(y + (d.vertical ? 0 : c), x + (d.vertical ? c : 0), d.vertical, d.width, ar);
+        // In horizontal byte operands, c[4] selects the other 16-byte
+        // column group, not another 16 rows. RenderServer's dithering
+        // routine updates all four byte groups of each loaded pixel row.
+        const unsigned ay = y + (d.vertical ? 0 : d.width == 1 ? c & 15 : c);
+        const unsigned ax = x + (d.vertical ? c : d.width == 1 ? c & 16 : 0);
+        a = operand(ay, ax, d.vertical, d.width, ar);
         a.role = 'a';
         if (!bkind) {
             b = coordinate((w[2] >> 2) & 255, w[2] & 1, d.width, br);
@@ -435,12 +578,56 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
     // complement followed by +1. These contracts establish only the forms
     // below, not arbitrary selectors 5/7 or their flag/accumulator modifiers.
     const bool byte_mask = length == 5 && w[0] == 0x202c && bkind == 1 &&
-                           (immediate == 0xf0 || immediate == 0xf8) && w[4] == 7 &&
+                           (immediate == 0xf0 || immediate == 0xf8 || immediate == 0xfe) && w[4] == 7 &&
                            count == 1 && a.width == 1 && d.width == 1 &&
                            a.reg < 0 && d.reg < 0;
-    const bool complement = length == 3 && w[0] == 0x223c && bkind == 1 &&
+    // RGBA5551 tests bit zero before expanding it to an alpha byte.
+    // Z is constrained by the following IFNZ/IFZ moves. N/C use the
+    // existing logical-result model; no device capture establishes them.
+    const bool alpha_bit = length == 3 && w[0] == 0x222c &&
+                           ((w[1] & 255) == 0xf5 || (w[1] & 255) == 0xf3) &&
+                           (w[2] & 0x7ff) == 0x601 &&
+                           a.reg < 0 && d.reg < 0;
+    // The bilinear shader uses the same complement with 16-bit fractions:
+    // signed imm6=63 is -1, giving 65535-fraction before unsigned products.
+    const bool half_complement = w[0] == 0x223e && (w[1] & 255) == 0xf1 &&
+                                 a.width == 2 && d.width == 2 && a.vertical && d.vertical;
+    const bool complement = length == 3 && (w[0] == 0x223c || half_complement) && bkind == 1 &&
                             immediate == -1 && count == 1 && !setf &&
                             a.reg < 0 && d.reg < 0;
+    // Firmware mask composition: nonzero rejects a pixel, and either input
+    // must be able to reject it. The separate split-address shift also uses
+    // selector 6 to join bit fields. Only plain byte-vector forms are covered
+    // here; accumulator, flags and indexed variants remain unverified.
+    const bool byte_or = bkind == 0 && a.width == 1 && b.width == 1 && d.width == 1 &&
+                         a.reg < 0 && b.reg < 0 && d.reg < 0 &&
+                         ((length == 3 && w[0] == 0x2234 && count == 1) ||
+                          (length == 5 && w[0] == 0x2030 &&
+                           (w[4] == 7 || w[4] == 0x87)));
+    // Firmware-derived B + sign(A). MPEG-4's vc_H263IQuant8x8 uses
+    // B=A for odd quantizers and B=0 for even ones; both reproduce the
+    // H.263 inverse-quantization formula, including zero coefficients.
+    // RenderServer uses B=1 to make a zero/nonzero edge rejection mask.
+    // No silicon result establishes other widths, modifiers or overflow.
+    const bool quant_sign = length == 5 && w[0] == 0x2142 && w[4] == 0x47 &&
+                            a.width == 2 && d.width == 2 && !a.vertical && !d.vertical &&
+                            a.reg < 0 && d.reg < 0 &&
+                            ((bkind == 1 && immediate == 0) ||
+                             (bkind == 0 && b.width == 2 && !b.vertical && b.reg < 0));
+    const bool edge_sign = length == 5 && w[0] == 0x2144 &&
+                           (w[1] & 255) == 0xf0 && (w[2] & 0x7ff) == 0x401 &&
+                           w[3] == 0x010e && w[4] == 7 && bkind == 1 && immediate == 1 &&
+                           a.width == 2 && d.width == 1 && a.vertical && d.vertical &&
+                           a.reg < 0 && d.reg < 0;
+    // RGBA4444 expansion: (packed nibbles >> 4) is already in ACCLO.
+    // OR with immediate zero forwards the masked high nibbles into the
+    // existing x15 accumulator path, producing two replicated bytes.
+    // Only this observed, flag-free immediate form is established here.
+    const bool nibble_or = length == 5 && w[0] == 0x2036 &&
+                           (w[1] & 255) == 0xf5 && w[3] == 0x010e &&
+                           w[4] == 0x8007 && bkind == 1 && immediate == 0 &&
+                           a.width == 2 && d.width == 2 && a.vertical && d.vertical &&
+                           a.reg < 0 && d.reg < 0;
     const bool split48 = length == 3 && (w[0] == 0x23f2 || w[0] == 0x23ea) &&
                          (w[1] == 0xe0 || w[1] == 0x20e0) && (w[2] == 0x804 || w[2] == 0x884);
     const bool split80 = length == 5 && (w[0] == 0x21f2 || w[0] == 0x21ea) && w[2] == 0x100 &&
@@ -465,7 +652,17 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         throw std::runtime_error("Unsupported vector carry operands");
     if (highborrow && (!carry_operands || d.vertical))
         throw std::runtime_error("Unsupported vector borrow operands");
-    if (x15 && !nibble && !blend && (d.width != 2 || op == 9 || op == 11 || op == 13 || op == 17))
+    // Inferred byte-destination extension of the measured multiply-high
+    // and x15 rules. Original bilinear shaders sum four truncated products.
+    // This exact combination has no retained silicon result; keep other
+    // byte operations, operands and modifiers guarded.
+    const bool filtered_byte = length == 5 && w[0] == 0x219c &&
+                               (w[1] & 255) == 0xf5 && w[3] == 0x780e &&
+                               (w[4] == 0x8407 || w[4] == 0x8007) && bkind == 0 &&
+                               d.width == 1 && a.width == 1 && b.width == 2 &&
+                               d.vertical && a.vertical && b.vertical &&
+                               d.reg < 0 && a.reg < 0 && b.reg < 0;
+    if (x15 && !nibble && !blend && !filtered_byte && (d.width != 2 || op == 9 || op == 11 || op == 13 || op == 17))
         throw std::runtime_error("Unsupported vector accumulator form");
 
     for (unsigned k = 0; k < count; ++k) {
@@ -495,12 +692,16 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         std::array<bool, 16> selected{};
         for (unsigned i = 0; i < 16; ++i)
             selected[i] = enabled(*this, pred, i);
+        if (highcarry || highborrow)
+            for (unsigned i = 0; i < 16; ++i)
+                if (selected[i] && unknown_carry[i])
+                    throw std::runtime_error("Unverified carry from halfword SETF load");
         for (unsigned i = 0; i < 16; ++i) {
             Value x = av[i], y = bv[i], value = 0;
             unsigned sh = static_cast<unsigned>(y) & 31;
             if (complement)
-                value = x ^ 255;
-            else if (byte_mask)
+                value = x ^ ((1u << (8 * d.width)) - 1);
+            else if (byte_mask || alpha_bit)
                 value = x & y;
             else if (nibble)
                 value = op == 24 ? x * (1LL << sh) : op == 27 ? x >> sh : x & y;
@@ -510,6 +711,11 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
                 switch (op) {
                 case 4:
                     value = y;
+                    break;
+                case 6:
+                    if (!byte_or && !nibble_or)
+                        throw std::runtime_error("Unsupported vector OR form");
+                    value = x | y;
                     break;
                 case 8:
                 case 9:
@@ -579,6 +785,13 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
                 case 37:
                     value = std::max<Value>(0, std::min(x, y));
                     break;
+                case 40:
+                    if (!quant_sign && !edge_sign)
+                        throw std::runtime_error("Unsupported vector sign-adjust form");
+                    value = y + (x > 0) - (x < 0);
+                    if (quant_sign && (value < -32768 || value > 32767))
+                        throw std::runtime_error("Unverified vector sign-adjust overflow");
+                    break;
                 case 44:
                     value = (y >> i) & 1;
                     break;
@@ -597,7 +810,7 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
                     acclo[i] = static_cast<u32>(total) & 65535;
                     value = blend ? std::min<Value>(255, total >> 8) : total;
                 } else if (x15) {
-                    if (d.width != 2)
+                    if (d.width != 2 && !filtered_byte)
                         throw std::runtime_error("Unsupported byte accumulator modifier");
                     Value total = saturate(
                         acc[i] * 65536 + acclo[i] + (accumulate ? value : value & 65535), 4);
@@ -605,6 +818,13 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
                     acclo[i] = static_cast<u32>(total) & 65535;
                     value = total;
                 } else if (accumulate) {
+                    // Firmware RGB565 packing accumulates the 16-bit shift
+                    // result: red << 11 has its sign bit set. Accumulating
+                    // the unbounded positive shift instead clamps colours
+                    // above 0x7fff. Other ALU/modifier forms are not inferred
+                    // from this packing contract.
+                    if (op == 24)
+                        value = sign_extend(static_cast<u32>(value), 16);
                     Value total = saturate((acc[i] + value) * 65536 + acclo[i], 4);
                     acc[i] = total >> 16;
                     acclo[i] = static_cast<u32>(total) & 65535;
@@ -650,6 +870,7 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
                     vz[i] = (values[i] & mask) == 0;
                     vn[i] = values[i] < 0;
                     vc[i] = values[i] < 0 || values[i] > mask;
+                    unknown_carry[i] = false;
                     // The matching context restore shifts the packed flag word
                     // right by one: its low bit restores C. Other shift forms
                     // still need independent carry/zero-shift evidence.

@@ -17,8 +17,9 @@ The command-line program is `build/bin/clickhle`. When Qt 6 Widgets is available
 
 Graphics use a native C++ VideoCore II interpreter running original firmware. Native HLE builds
 its command packets; games do not execute RetailOS ARM code or require `osos.bin`. Both frontends
-display the raw framebuffer, with no shader replacement or Python runtime. Set
-`CLICKHLE_VC2_FIRMWARE` to a fallback game RenderServer image; games may supply their own image.
+display the raw framebuffer, with no shader replacement or Python runtime. Place the game
+RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRMWARE`
+can override that path; games may also supply their own image.
 Built-in pipeline programs also need locally extracted VC2 records (not distributed).
 Unsupported APIs and instructions stop execution, and games are not yet expected to render
 correctly. Diagnostic PNGs and packets go to `work/vc2` (or `CLICKHLE_VC2_OUTPUT`).

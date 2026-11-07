@@ -39,6 +39,9 @@ float color_float(u32 bits) {
 } // namespace
 
 GraphicsApi::GraphicsApi(Submit submit) : submit_(std::move(submit)) {}
+void GraphicsApi::reset() {
+    *this = GraphicsApi(submit_);
+}
 void GraphicsApi::queue(std::array<u32, 4> header, std::span<const u8> payload) {
     const std::size_t size = (16 + payload.size() + 3) & ~std::size_t(3);
     if (size > kPacketCapacity) throw std::runtime_error("Graphics packet exceeds staging capacity");

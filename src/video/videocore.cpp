@@ -12,6 +12,14 @@
 #include <iterator>
 #include <sstream>
 #include <stdexcept>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 namespace clickhle {
 namespace {
@@ -21,11 +29,34 @@ std::vector<u8> read_file(const std::filesystem::path &path) {
         throw std::runtime_error("Cannot open " + path.string());
     return {std::istreambuf_iterator<char>(file), {}};
 }
-std::filesystem::path required_path(const char *name) {
-    const char *value = std::getenv(name);
-    if (!value || !*value)
-        throw std::runtime_error(std::string("Set ") + name + " for the native VC2 backend");
-    return value;
+std::filesystem::path default_firmware_path() {
+    if (const char *value = std::getenv("CLICKHLE_VC2_FIRMWARE"); value && *value)
+        return value;
+    std::filesystem::path executable;
+#if defined(_WIN32)
+    std::vector<wchar_t> buffer(512);
+    for (;;) {
+        const DWORD size = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+        if (!size) break;
+        if (size < buffer.size()) {
+            executable = std::wstring(buffer.data(), size);
+            break;
+        }
+        if (buffer.size() >= 32768) break;
+        buffer.resize(buffer.size() * 2);
+    }
+#elif defined(__APPLE__)
+    uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buffer(size);
+    if (size && _NSGetExecutablePath(buffer.data(), &size) == 0)
+        executable = std::filesystem::canonical(buffer.data());
+#elif defined(__linux__)
+    executable = std::filesystem::read_symlink("/proc/self/exe");
+#endif
+    if (executable.empty())
+        throw std::runtime_error("Cannot locate the executable; set CLICKHLE_VC2_FIRMWARE");
+    return executable.parent_path() / "rserver.bin";
 }
 } // namespace
 struct VideoCore::Impl {
@@ -55,12 +86,15 @@ struct VideoCore::Impl {
         if (started)
             return;
         if (firmware.empty())
-            firmware = read_file(required_path("CLICKHLE_VC2_FIRMWARE"));
+            firmware = read_file(default_firmware_path());
         if (firmware.size() < 0x206 || firmware.size() > 0x140000 || firmware.size() % 4)
             throw std::runtime_error("Invalid VC2 firmware upload");
         // Upload bytes to VC SRAM and execute the firmware entry. Host-port
         // cache/clock setup is abstracted by HLE, not replayed as ARM code.
         chip.load(firmware);
+        // The game-image loader clears readiness after uploading the image.
+        // Only executing the new firmware may publish a ready state.
+        chip.write(0x1f8, 0);
         if (!chip.run()) throw std::runtime_error(chip.error);
         if (chip.read(0x1f8) != 1)
             throw std::runtime_error("VC2 firmware readiness handshake failed");
@@ -124,8 +158,10 @@ struct VideoCore::Impl {
                   static_cast<std::streamsize>(packets.size()));
         if (!log)
             throw std::runtime_error("Cannot write VC2 packet capture");
-        // Inherited testbed assumption: wake the consumer after publication.
-        // The physical host interrupt route is not established yet.
+        // RetailOS 0x10275028 publishes the producer block, then writes
+        // 0xa5a50002 to VC address 0x10000400. Resuming after sleep models
+        // its observed purpose; the register's hardware semantics remain
+        // provisional. RenderServer does not enable the VMCS host IRQ here.
         chip.r[31] += 2;
         bool ok = chip.run();
         for (unsigned i = 0; i < 512 && ok &&
@@ -191,10 +227,15 @@ struct VideoCore::Impl {
             packet({5, 0, 0, 0});
             if (!frame.store<u32>(first, 1) || !frame.store<u32>(second, 2))
                 throw std::runtime_error("Invalid render-server output pointers");
+            // RetailOS API 152 clears the graphics state and restores its
+            // defaults after opening the render service (0x100cdb88).
+            api.reset();
             return 1;
         }
         case 153:
-            api.flush();
+            // RetailOS closes the service only after glFinish acknowledges
+            // its completion marker, not merely after submitting the batch.
+            finish();
             started = false;
             return 1;
         case 41:
