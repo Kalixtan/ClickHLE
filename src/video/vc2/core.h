@@ -18,6 +18,18 @@ struct DmaTransfer {
 struct DmaDescriptor {
     std::array<u32, 6> words;
 };
+class Core;
+struct VectorOperand {
+    u32 base = 0;
+    bool vertical = false;
+    unsigned width = 1;
+    int reg = -1;
+    bool step = false, discard = false;
+    char role = 0;
+    bool packed_columns = false;
+    u32 offset(const Core &c, unsigned k) const;
+};
+
 class Core {
   public:
     Core();
@@ -51,6 +63,17 @@ class Core {
     u32 timer = 0;
 
   private:
+    struct VectorDecode {
+        std::array<u32, 5> words{};
+        unsigned length = 0;
+        VectorOperand d, a, b;
+        unsigned count = 1, pred = 0, sru = 0, sreg = 7, scalar = 7;
+        bool setf = false, clear = false, accumulate = false, x15 = false;
+        int bkind = 0;
+        std::int64_t immediate = 0;
+    };
+    static constexpr unsigned vector_cache_size = 1024;
+    std::vector<VectorDecode> vector_cache_ = std::vector<VectorDecode>(vector_cache_size);
     std::vector<u8> ram_;
     std::map<u32, u32> registers_, reads_;
     std::array<u32, 4> compare_{};

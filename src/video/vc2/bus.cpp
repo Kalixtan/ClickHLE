@@ -10,10 +10,14 @@ u32 Core::read(u32 address, unsigned width) {
     if (address & (width - 1))
         throw std::runtime_error("Unaligned VC2 bus read");
     if (address < ram_.size() || (address >= 0xfe000000 && address < 0xfe400000)) {
-        u32 a = ram_address(address, width), v = 0;
-        for (unsigned i = 0; i < width; ++i)
-            v |= static_cast<u32>(ram_[a + i]) << (8 * i);
-        return v;
+        const u32 a = ram_address(address, width);
+        u32 value = ram_[a];
+        if (width >= 2)
+            value |= static_cast<u32>(ram_[a + 1]) << 8;
+        if (width == 4)
+            value |= (static_cast<u32>(ram_[a + 2]) << 16) |
+                     (static_cast<u32>(ram_[a + 3]) << 24);
+        return value;
     }
     u32 v = registers_[address], seen = reads_[address]++;
     // Explicit ready-bit assumptions inherited from the standalone testbed.
@@ -69,9 +73,14 @@ void Core::write(u32 address, u32 value, unsigned width) {
     if (address & (width - 1))
         throw std::runtime_error("Unaligned VC2 bus write");
     if (address < ram_.size() || (address >= 0xfe000000 && address < 0xfe400000)) {
-        u32 a = ram_address(address, width);
-        for (unsigned i = 0; i < width; ++i)
-            ram_[a + i] = static_cast<u8>(value >> (8 * i));
+        const u32 a = ram_address(address, width);
+        ram_[a] = static_cast<u8>(value);
+        if (width >= 2)
+            ram_[a + 1] = static_cast<u8>(value >> 8);
+        if (width == 4) {
+            ram_[a + 2] = static_cast<u8>(value >> 16);
+            ram_[a + 3] = static_cast<u8>(value >> 24);
+        }
         return;
     }
     if (width < 4)

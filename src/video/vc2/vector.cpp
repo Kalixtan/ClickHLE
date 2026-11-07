@@ -11,37 +11,32 @@ using Value = std::int64_t;
 using Lanes = std::array<Value, 16>;
 u32 add2d(u32 a, u32 b) { return ((a + (b & ~63u)) & 0xfc0) | ((a + b) & 63); }
 unsigned repeats(unsigned bits, const Core &c) { return bits == 7 ? c.r[0] : 1u << bits; }
-struct Operand {
-    u32 base = 0;
-    bool vertical = false;
-    unsigned width = 1;
-    int reg = -1;
-    bool step = false, discard = false;
-    char role = 0;
-    bool packed_columns = false;
-    u32 offset(const Core &c, unsigned k) const {
-        u32 o = step ? add2d(base, k * (vertical ? 1 : 64)) : base;
-        if (reg >= 0) {
-            u32 v = c.r[static_cast<unsigned>(reg)];
-            if ((role == 'b' && !vertical) || (role == 'd' && !vertical && width == 2))
-                v = (v & ~63u) | (v & 48);
-            else if (role == 'a' && !vertical && width == 2)
-                v = (v & ~63u) | (((v & 63) + 16) & 32);
-            else if (role == 'd' && vertical)
-                v = (v & ~0xfc0u) | ((v & 0xc00));
-            o = add2d(o, v);
-        }
-        // Provisional packed-halfword indexing: logical columns 16..31
-        // select the second H16 bank, skipping the first bank's high bytes.
-        // Firmware flip/copy contracts support this bit permutation; silicon
-        // behaviour and the full modifier encoding remain unverified.
-        if (packed_columns)
-            o = (o & ~48u) | ((o & 16u) << 1) | ((o & 32u) >> 1);
-        // Provisional column-base model, paired with scalar 5430..5730.
-        // Wrap columns independently of rows; never carry into the next row.
-        return add2d(o, c.r[30] & 0x30);
+
+} // namespace
+u32 VectorOperand::offset(const Core &c, unsigned k) const {
+    u32 o = step ? add2d(base, k * (vertical ? 1 : 64)) : base;
+    if (reg >= 0) {
+        u32 v = c.r[static_cast<unsigned>(reg)];
+        if ((role == 'b' && !vertical) || (role == 'd' && !vertical && width == 2))
+            v = (v & ~63u) | (v & 48);
+        else if (role == 'a' && !vertical && width == 2)
+            v = (v & ~63u) | (((v & 63) + 16) & 32);
+        else if (role == 'd' && vertical)
+            v = (v & ~0xfc0u) | ((v & 0xc00));
+        o = add2d(o, v);
     }
-};
+    // Provisional packed-halfword indexing: logical columns 16..31
+    // select the second H16 bank, skipping the first bank's high bytes.
+    // Firmware flip/copy contracts support this bit permutation; silicon
+    // behaviour and the full modifier encoding remain unverified.
+    if (packed_columns)
+        o = (o & ~48u) | ((o & 16u) << 1) | ((o & 32u) >> 1);
+    // Provisional column-base model, paired with scalar 5430..5730.
+    // Wrap columns independently of rows; never carry into the next row.
+    return add2d(o, c.r[30] & 0x30);
+}
+namespace {
+using Operand = VectorOperand;
 int reg3(unsigned v) { return v == 7 ? -1 : static_cast<int>(v); }
 Operand operand(unsigned y, unsigned x, bool vertical, unsigned width, int reg = -1,
                 bool step = false) {
@@ -93,15 +88,22 @@ Operand source_a(unsigned a, int reg, unsigned t) {
 Lanes get(const Core &c, const Operand &o, unsigned repeat, bool sign = true) {
     u32 base = o.offset(c, repeat), y = base >> 6, x = base & 63;
     Lanes values{};
-    for (unsigned i = 0; i < 16; ++i) {
-        u32 value = 0;
-        for (unsigned b = 0; b < o.width; ++b) {
-            u32 a = o.vertical ? (((y + i) & 63) << 6) | ((x + 16 * b) & 63)
-                               : (y << 6) | ((x + i + 16 * b) & 63);
-            value |= static_cast<u32>(c.vrf[a]) << (8 * b);
+    // Operands have byte or split-halfword lanes. Select the layout once,
+    // keeping row/column wrapping identical at the VRF bank boundaries.
+    if (o.width == 1) {
+        for (unsigned i = 0; i < 16; ++i) {
+            const u32 address = o.vertical ? (((y + i) & 63) << 6) | x
+                                           : (y << 6) | ((x + i) & 63);
+            values[i] = c.vrf[address];
         }
-        values[i] =
-            sign && o.width > 1 ? sign_extend(value, 8 * o.width) : static_cast<Value>(value);
+    } else {
+        for (unsigned i = 0; i < 16; ++i) {
+            const u32 row = o.vertical ? ((y + i) & 63) << 6 : y << 6;
+            const u32 column = o.vertical ? x : (x + i) & 63;
+            const u32 value = c.vrf[row | column] |
+                              (static_cast<u32>(c.vrf[row | ((column + 16) & 63)]) << 8);
+            values[i] = sign ? static_cast<Value>(value ^ 0x8000) - 0x8000 : value;
+        }
     }
     return values;
 }
@@ -461,107 +463,120 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         }
         return;
     }
-    Operand d, a, b;
-    unsigned count = 1, pred = 0, sru = 0, sreg = 7;
-    bool setf = false, clear = false, accumulate = false, x15 = false;
-    int bkind = 0;
-    Value immediate = 0;
-    unsigned scalar = 7;
-    if (length == 5) {
-        setf = w[4] & 0x4000;
-        pred = (w[4] >> 11) & 7;
-        clear = w[4] & 0x400;
-        accumulate = w[4] & 0x200;
-        x15 = w[4] & 0x8000;
-        if (w[4] & 0x100)
-            throw std::runtime_error("Unsupported vector x8 modifier");
-        count = repeats((w[4] >> 5) & 7, *this);
-        sru = (w[4] >> 3) & 3;
-        sreg = w[4] & 7;
-        d = destination(w[1], select, w[3] & 1);
-        // Provisional packed destination form used by firmware block copies.
-        d.packed_columns = op9 == 0x27;
-        a = source_a(((w[3] >> 4) & 63) * 32 + (w[2] >> 11), reg3((w[3] >> 1) & 7), w[1] & 31);
-        if (w[2] & 0x400) {
-            bkind = 1;
-            immediate = sign_extend(((w[3] >> 10) << 10) | (w[2] & 1023), 16);
-        } else if (w[3] & 0x8000) {
-            bkind = 2;
-            scalar = (w[3] >> 12) & 7;
-            immediate = sign_extend(((w[3] >> 10) & 3) * 1024 + (w[2] & 1023), 12);
-        } else {
-            const bool packed_b = (w[2] & 3) == 3 && (w[3] & 0x800) && op == 4;
-            if ((w[2] & 2) && !packed_b)
-                throw std::runtime_error("Unsupported vector B type");
-            b = coordinate((w[2] >> 2) & 255, w[2] & 1, w[3] & 0x800 ? 2 : 1,
-                           reg3((w[3] >> 12) & 7), w[3] & 0x400);
-            b.role = 'b';
-            // Provisional B type: checked by original VMCS horizontal flips
-            // and RenderServer copies, including crossing an H16 bank edge.
-            b.packed_columns = packed_b;
-        }
-    } else {
-        if (w[2] & 0x400) {
-            setf = w[2] & 0x200;
-            count = repeats((w[2] >> 6) & 7, *this);
-            // Provisional flag packing in the paired firmware context routines:
-            // start at 2, add 1 if C, subtract 2 if Z, subtract 4 if N.
-            // Treating these fields as REP loses the flags and changes unrelated
-            // VRF rows. Limit the correction to the observed encodings until
-            // the general 48-bit immediate modifier layout is established.
-            if (w[1] == 0x00e0 &&
-                ((w[0] == 0x2242 && w[2] == 0x0581) ||
-                 (w[0] == 0x2252 && (w[2] == 0x0482 || w[2] == 0x0504)))) {
-                pred = (w[2] >> 6) & 7;
-                count = 1;
-            }
-            // Original shader clamp: IFNZ first sets the low half to
-            // 65535 for nonzero high halves, then IFN clears negative inputs.
-            // As in context flag packing, this compact field is a predicate,
-            // not REP. Other immediate modifier forms remain unverified.
-            if (w[0] == 0x2222 && (w[1] & 255) == 0xe0 && w[2] == 0x0500) {
-                pred = 4;
-                count = 1;
-            }
-            // RGBA5551 expansion pairs IFNZ #255 with IFZ #0. Decoding
-            // this as REP4 clears opaque alpha and neighbouring columns.
-            if (w[0] == 0x2224 && (w[1] & 255) == 0xe0 && w[2] == 0x0480) {
-                pred = 2;
-                count = 1;
-            }
-            bkind = 1;
-            immediate = sign_extend(w[2] & 63, 6);
-        }
-        d = destination(w[1], select, count > 1);
-        unsigned t = w[1] & 31;
-        int ar = -1, br = -1;
-        if (!(op9 & 1)) {
-            if (t & 8) {
-                t &= ~8u;
-                ar = d.reg;
-            }
-            if (!bkind && (w[2] & 2))
-                br = d.reg;
-            if (d.reg >= 0 && (ar >= 0 || br >= 0)) {
-                d.reg = -1;
-                if (d.width == 2 && (w[1] & 0x1000))
-                    d.discard = true;
-            }
-        } else if (!bkind && (w[2] & 2))
-            throw std::runtime_error("Unsupported 48-bit B type");
-        unsigned y = 16 * ((t >> 1) & 1) + 32 * ((t >> 2) & 1),
-                 x = 32 * (t & 1) + 16 * ((t >> 3) & 1), c = w[2] >> 11;
-        // In horizontal byte operands, c[4] selects the other 16-byte
-        // column group, not another 16 rows. RenderServer's dithering
-        // routine updates all four byte groups of each loaded pixel row.
-        const unsigned ay = y + (d.vertical ? 0 : d.width == 1 ? c & 15 : c);
-        const unsigned ax = x + (d.vertical ? c : d.width == 1 ? c & 16 : 0);
-        a = operand(ay, ax, d.vertical, d.width, ar);
-        a.role = 'a';
-        if (!bkind) {
-            b = coordinate((w[2] >> 2) & 255, w[2] & 1, d.width, br);
-            if (br >= 0)
+    // Cache only static decoding. Instruction bytes are fetched normally and
+    // checked on every use, including code uploaded through DMA or RAM aliases.
+    // Compact REP r0 also changes destination stepping; leave it uncached.
+    const bool dynamic_repeat = length == 5 ? ((w[4] >> 5) & 7) == 7 :
+                                (w[2] & 0x400) && ((w[2] >> 6) & 7) == 7;
+    auto &cached = vector_cache_[(r[31] >> 1) & (vector_cache_size - 1)];
+    VectorDecode decoded;
+    const bool hit = !dynamic_repeat && cached.length == length && cached.words == w;
+    if (hit)
+        decoded = cached;
+    auto &[words, decoded_length, d, a, b, count, pred, sru, sreg, scalar,
+           setf, clear, accumulate, x15, bkind, immediate] = decoded;
+    if (!hit) {
+        if (length == 5) {
+            setf = w[4] & 0x4000;
+            pred = (w[4] >> 11) & 7;
+            clear = w[4] & 0x400;
+            accumulate = w[4] & 0x200;
+            x15 = w[4] & 0x8000;
+            if (w[4] & 0x100)
+                throw std::runtime_error("Unsupported vector x8 modifier");
+            count = repeats((w[4] >> 5) & 7, *this);
+            sru = (w[4] >> 3) & 3;
+            sreg = w[4] & 7;
+            d = destination(w[1], select, w[3] & 1);
+            // Provisional packed destination form used by firmware block copies.
+            d.packed_columns = op9 == 0x27;
+            a = source_a(((w[3] >> 4) & 63) * 32 + (w[2] >> 11), reg3((w[3] >> 1) & 7), w[1] & 31);
+            if (w[2] & 0x400) {
+                bkind = 1;
+                immediate = sign_extend(((w[3] >> 10) << 10) | (w[2] & 1023), 16);
+            } else if (w[3] & 0x8000) {
+                bkind = 2;
+                scalar = (w[3] >> 12) & 7;
+                immediate = sign_extend(((w[3] >> 10) & 3) * 1024 + (w[2] & 1023), 12);
+            } else {
+                const bool packed_b = (w[2] & 3) == 3 && (w[3] & 0x800) && op == 4;
+                if ((w[2] & 2) && !packed_b)
+                    throw std::runtime_error("Unsupported vector B type");
+                b = coordinate((w[2] >> 2) & 255, w[2] & 1, w[3] & 0x800 ? 2 : 1,
+                               reg3((w[3] >> 12) & 7), w[3] & 0x400);
                 b.role = 'b';
+                // Provisional B type: checked by original VMCS horizontal flips
+                // and RenderServer copies, including crossing an H16 bank edge.
+                b.packed_columns = packed_b;
+            }
+        } else {
+            if (w[2] & 0x400) {
+                setf = w[2] & 0x200;
+                count = repeats((w[2] >> 6) & 7, *this);
+                // Provisional flag packing in the paired firmware context routines:
+                // start at 2, add 1 if C, subtract 2 if Z, subtract 4 if N.
+                // Treating these fields as REP loses the flags and changes unrelated
+                // VRF rows. Limit the correction to the observed encodings until
+                // the general 48-bit immediate modifier layout is established.
+                if (w[1] == 0x00e0 &&
+                    ((w[0] == 0x2242 && w[2] == 0x0581) ||
+                     (w[0] == 0x2252 && (w[2] == 0x0482 || w[2] == 0x0504)))) {
+                    pred = (w[2] >> 6) & 7;
+                    count = 1;
+                }
+                // Original shader clamp: IFNZ first sets the low half to
+                // 65535 for nonzero high halves, then IFN clears negative inputs.
+                // As in context flag packing, this compact field is a predicate,
+                // not REP. Other immediate modifier forms remain unverified.
+                if (w[0] == 0x2222 && (w[1] & 255) == 0xe0 && w[2] == 0x0500) {
+                    pred = 4;
+                    count = 1;
+                }
+                // RGBA5551 expansion pairs IFNZ #255 with IFZ #0. Decoding
+                // this as REP4 clears opaque alpha and neighbouring columns.
+                if (w[0] == 0x2224 && (w[1] & 255) == 0xe0 && w[2] == 0x0480) {
+                    pred = 2;
+                    count = 1;
+                }
+                bkind = 1;
+                immediate = sign_extend(w[2] & 63, 6);
+            }
+            d = destination(w[1], select, count > 1);
+            unsigned t = w[1] & 31;
+            int ar = -1, br = -1;
+            if (!(op9 & 1)) {
+                if (t & 8) {
+                    t &= ~8u;
+                    ar = d.reg;
+                }
+                if (!bkind && (w[2] & 2))
+                    br = d.reg;
+                if (d.reg >= 0 && (ar >= 0 || br >= 0)) {
+                    d.reg = -1;
+                    if (d.width == 2 && (w[1] & 0x1000))
+                        d.discard = true;
+                }
+            } else if (!bkind && (w[2] & 2))
+                throw std::runtime_error("Unsupported 48-bit B type");
+            unsigned y = 16 * ((t >> 1) & 1) + 32 * ((t >> 2) & 1),
+                     x = 32 * (t & 1) + 16 * ((t >> 3) & 1), c = w[2] >> 11;
+            // In horizontal byte operands, c[4] selects the other 16-byte
+            // column group, not another 16 rows. RenderServer's dithering
+            // routine updates all four byte groups of each loaded pixel row.
+            const unsigned ay = y + (d.vertical ? 0 : d.width == 1 ? c & 15 : c);
+            const unsigned ax = x + (d.vertical ? c : d.width == 1 ? c & 16 : 0);
+            a = operand(ay, ax, d.vertical, d.width, ar);
+            a.role = 'a';
+            if (!bkind) {
+                b = coordinate((w[2] >> 2) & 255, w[2] & 1, d.width, br);
+                if (br >= 0)
+                    b.role = 'b';
+            }
+        }
+        if (!dynamic_repeat) {
+            decoded.words = w;
+            decoded.length = length;
+            cached = decoded;
         }
     }
     if (count > 65536)
@@ -852,15 +867,13 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         }
         // Capture lane selection before setf: newly written flags must not
         // change which destination lanes this instruction writes.
+        const u32 base = d.offset(*this, k), yy = base >> 6, xx = base & 63;
         for (unsigned i = 0; i < 16; ++i)
             if (selected[i] && !d.discard) {
-                Lanes lane = values;
-                Operand single = d;
-                u32 base = single.offset(*this, k), yy = base >> 6, xx = base & 63;
                 for (unsigned byte = 0; byte < d.width; ++byte) {
                     u32 address = d.vertical ? (((yy + i) & 63) << 6) | ((xx + 16 * byte) & 63)
                                              : (yy << 6) | ((xx + i + 16 * byte) & 63);
-                    vrf[address] = static_cast<u8>(lane[i] >> (8 * byte));
+                    vrf[address] = static_cast<u8>(values[i] >> (8 * byte));
                 }
             }
         if (setf)
