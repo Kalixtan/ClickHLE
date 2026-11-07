@@ -44,6 +44,7 @@ enum uc_prot : uint32_t {
 };
 
 enum uc_mem_type : int {
+    kMemRead = 16,           // UC_MEM_READ
     kMemReadUnmapped = 19,   // UC_MEM_READ_UNMAPPED
     kMemWriteUnmapped = 20,  // UC_MEM_WRITE_UNMAPPED
     kMemWriteProt = 22,      // UC_MEM_WRITE_PROT
@@ -52,6 +53,7 @@ enum uc_mem_type : int {
 enum uc_hook_type : uint64_t {
     kHookIntr = 1ull << 0,
     kHookCode = 1ull << 2,
+    kHookMemRead = 1ull << 10,
     // UC_HOOK_MEM_UNMAPPED, from unicorn.h's own macro expansion:
     // UC_HOOK_MEM_READ_UNMAPPED(1<<4) + UC_HOOK_MEM_WRITE_UNMAPPED(1<<5) +
     // UC_HOOK_MEM_FETCH_UNMAPPED(1<<6) -- verified against the real macro
@@ -97,6 +99,8 @@ enum uc_arm_reg : int {
 using uc_cb_hookcode_t = void (*)(uc_engine* uc, uint64_t address, uint32_t size,
                                   void* user_data);
 using uc_cb_hookintr_t = void (*)(uc_engine* uc, uint32_t intno, void* user_data);
+using uc_cb_hookmem_t = void (*)(uc_engine* uc, uc_mem_type type, uint64_t address,
+                                 int size, int64_t value, void* user_data);
 using uc_cb_eventmem_t = bool (*)(uc_engine* uc, uc_mem_type type, uint64_t address,
                                   int size, int64_t value, void* user_data);
 

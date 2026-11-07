@@ -32,6 +32,7 @@
 
 #include "clickhle/hle/modules.h"
 
+#include <array>
 #include <cstdlib>
 #include <string_view>
 #include <utility>
@@ -56,7 +57,7 @@ constexpr u32 kWheelTouched = 1u << 30;
 /// 256 steps and the value wraps.
 constexpr u32 kWheelPositionMask = 0xFFu;
 
-/// Steps the wheel advances per frame while a spin key is held.
+/// Raw wheel detents per input poll for the legacy scripted spin controls.
 ///
 /// A real thumb sweeps the ring at some rate; 6 of 256 steps per frame is about
 /// a full turn every two seconds, which is a comfortable menu speed. Too fast
@@ -118,7 +119,8 @@ const u32 kWheelEventEveryNPolls = [] {
 /// The firmware's own 256-entry table is a local research artifact and stays
 /// out of this tree; this is the algorithm, which is not.
 [[nodiscard]] u32 wheel_position_for_raw(u8 raw) {
-    return (static_cast<u32>((0x77 - static_cast<i32>(raw)) << 3) / 3u) & 0xFFu;
+    const i32 scaled = (0x77 - static_cast<i32>(raw)) * 8;
+    return static_cast<u32>(scaled / 3) & 0xffu;
 }
 
 /// Current wheel state.
@@ -143,15 +145,6 @@ struct WheelState {
         return position() | (touched ? kWheelTouched : 0u);
     }
 
-    /// One physical detent. The ring has 96 of them and the raw byte wraps
-    /// with that period.
-    void spin(i32 detents) {
-        i32 next = (static_cast<i32>(raw) + detents) % 96;
-        if (next < 0) {
-            next += 96;
-        }
-        raw = static_cast<u8>(next);
-    }
 };
 
 /// Mirror the wheel worker that feeds InputEvents#0's self-consuming counter.
@@ -165,9 +158,10 @@ void update_wheel_counter(Emulator::InputState& state, u32 current_word) {
 
     i32 delta = static_cast<i32>(current_word & kWheelPositionMask) -
                 static_cast<i32>(previous_word & kWheelPositionMask);
-    if (delta > 48) {
+    // RetailOS 0x100dc0b4 uses 0x48 as the half-range cutoff.
+    if (delta > 72) {
         delta -= 96;
-    } else if (delta < -48) {
+    } else if (delta < -72) {
         delta += 96;
     }
 
@@ -216,84 +210,38 @@ std::string_view button_record_mode() {
 /// OS codes 0x6e, 0x6f, 0x5a, 0x59, 0x10), and anything else is 0, which
 /// `InputEvents#1` ignores. So these five values are the whole space; only the
 /// assignment to physical controls is open.
-/// The five physical controls, and only those. ActionEast/ActionWest are the
-/// keyboard's stand-in for rotating the ring -- they are not buttons on the
-/// device and must not post a button record, or a spin would read as a press.
-u8 button_event_id(Button button) {
-    // Values in {1,3,4,5}. NOT 0..4, which is what this used to emit.
-    //
-    // Measured by the oracle against `InputEvents#1`, the dispatcher, with the
-    // instruction count beside each because a return value alone cannot tell a
-    // handled call from a rejected one:
-    //
-    //     +0x00 = 0    Returned r0=0     16 instr   REJECTED
-    //     +0x00 = 1    Lost              2466       handled
-    //     +0x00 = 2    Returned r0=2     16         REJECTED
-    //     +0x00 = 3    Returned r0=0     2765       handled
-    //     +0x00 = 4    Returned r0=0     2768       handled
-    //     +0x00 = 5    Returned r0=0     2771       handled
-    //     +0x00 = 6+   Returned r0=id    16         REJECTED
-    //
-    // A rejected id is returned to the caller unchanged, so a non-zero return
-    // from #1 means "I did not handle this", not a status.
-    //
-    // This also matches LLE's producer-side table, where the pump emits 1..5
-    // from OS codes 0x6e/0x6f/0x5a/0x59/0x10 and #1 has no case for 2. Two
-    // independent routes to the same four values.
-    //
-    // WHICH control maps to WHICH id is still open: the id->code step reads a
-    // RAM table at 0x1081dac1 with a flag-gated remap on top, so it is not
-    // determinable statically. CLICKHLE_SELECT_ID overrides Select's id for
-    // sweeping, which is now a four-value search rather than open-ended.
+/// ActionEast/ActionWest in legacy scripts rotate the ring; they are not
+/// physical buttons and must not post button records.
+// Rockbox's PP502x register read names bits 8..12: Select, Right, Left,
+// Play/Pause, Menu. RetailOS shifts them down to bits 0..4 and maps them to
+// internal IDs at 0x100c9204. Bit 5 has no confirmed physical label.
+constexpr std::array<u8, 6> kHardwareBitToId{3, 1, 2, 4, 0, 5};
+// The RetailOS ID-to-OS-code table is populated in RAM. These game-facing
+// types preserve the observed Select/Menu behavior and Fliwheel's directional
+// receipts, but remain provisional until that table is measured on hardware.
+constexpr std::array<u8, 6> kIdToEventType{1, 4, 3, 2, 5, 0xff};
+
+u8 hardware_bit_for_button(Button button) {
     switch (button) {
-        // FIVE DISTINCT IDS. This table previously gave JoypadNorth id 1 and
-        // let Select default to 1 as well -- a collision, so "tap up" and
-        // Select were indistinguishable to the guest and the five controls only
-        // ever spanned four ids. Every tap sweep run before this is invalid for
-        // JoypadNorth.
-        //
-        // SUPERSEDES the "Select = 1" claim below (and its 2026-09-19 sweep):
-        // that sweep ran through the dead duplicate-record loop
-        // (`queue_input_event(2 + (i % 4), ...)`, see the "BUG THAT COST DAYS"
-        // comment further down in this file), which injected a phantom
-        // `[id=2 type=1]` record alongside every real Select press. With that
-        // loop removed, a clean single-tap-per-id re-sweep from the actual main
-        // menu gives the opposite mapping:
-        //
-        //     id 1   exit dialog directly            Menu/Back
-        //     id 2   menu -> level select -> instructions, one clean tap each   Select
-        //     id 3,4,5   no visible effect from the menu   unverified
-        //
-        // Select = 2 is now the verified value. JoypadNorth = 1 follows the
-        // same re-sweep (id 1's exit-dialog behaviour matches its "Menu" role).
-        // JoypadEast/South/West (3,4,5) were never re-verified under clean
-        // delivery and remain placeholders assigned around the two verified
-        // values.
-        case Button::JoypadNorth: return 1;   // Menu, top tap
-        case Button::JoypadEast: return 3;    // Forward, right tap
-        case Button::JoypadSouth: return 4;   // Play, bottom tap
-        case Button::JoypadWest: return 5;    // Back, left tap
-        case Button::ActionNorth: {           // Select, the centre button
-            if (const char* v = std::getenv("CLICKHLE_SELECT_ID")) {
-                return static_cast<u8>(std::atoi(v));
-            }
-            return 2;
-        }
+        case Button::ActionNorth: return 0; // Select
+        case Button::JoypadEast: return 1;  // Next / Right
+        case Button::JoypadWest: return 2;  // Previous / Left
+        case Button::JoypadSouth: return 3; // Play / Pause
+        case Button::JoypadNorth: return 4; // Menu
         default: return 0xff;
     }
 }
 
-/// Re-posts a press record for every control currently held.
-///
-/// oracle measured (2026-09-19, after retracting the toggle claim) that genuine
-/// repeated delivery of the same press is **idempotent**, not a toggle: chaining
-/// two real id=2 type=1 records in one call leaves FLAGS=1, the second does not
-/// flip it back. So re-posting while held is safe, which their earlier toggle
-/// reading had ruled out.
-///
-/// Only under CLICKHLE_RECORD_MODE=held. Real hardware posts on transitions, so
-/// this is a deliberate deviation kept for screens that appear to want a level
-/// rather than an edge.
+u8 event_type_for_button(Button button) {
+    const u8 bit = hardware_bit_for_button(button);
+    if (bit == 0xff) return 0xff;
+    if (button == Button::ActionNorth) {
+        if (const char* override = std::getenv("CLICKHLE_SELECT_ID"))
+            return static_cast<u8>(std::atoi(override));
+    }
+    return kIdToEventType[kHardwareBitToId[bit]];
+}
+
 void repost_held(Emulator& emulator, Emulator::InputState& state,
                  std::string_view mode,
                  u8 (*id_of)(Button)) {
@@ -312,125 +260,50 @@ void repost_held(Emulator& emulator, Emulator::InputState& state,
     }
 }
 
-void drain_input(Emulator& emulator) {
-    auto& input_state = emulator.input_state();
-    Display& display = emulator.display();
-    InputEvent event;
-    while (display.next_input(event)) {
-        if (event.button == Button::Count) {
-            continue;
-        }
-        input_state.held_buttons[static_cast<std::size_t>(event.button)] =
-            event.pressed;
-        CLICKHLE_DEBUG(kCategory)
-            << "button " << static_cast<int>(event.button)
-            << (event.pressed ? " down" : " up");
+// The ISR's six button bits map to these IDs at 0x100c9204. The later
+// ID-to-OS-code table is populated at runtime and remains unverified here.
+void post_button_record(Emulator& emulator, u8 event_type, bool pressed) {
+    if (event_type == 0xff) return;
+    const std::string_view mode = button_record_mode();
+    if (!pressed && mode != "both" && mode != "held") return;
+    u8 phase = (mode == "both" || mode == "held") ? (pressed ? 2u : 1u) : 1u;
+    if (const char* override = std::getenv("CLICKHLE_EVENT_GATE"))
+        phase = static_cast<u8>(std::atoi(override));
+    u32 payload = emulator.tick_count();
+    if (const char* override = std::getenv("CLICKHLE_EVENT_PAYLOAD"))
+        payload = static_cast<u32>(std::strtoul(override, nullptr, 0));
+    // The frame driver's 12-byte list node carries type, phase and timestamp.
+    // The physical bit to internal ID is proven; the later OS-code translation
+    // into this game-facing type is still provisional.
+    emulator.queue_input_event(
+        static_cast<u8>(g_event_type_base != 0
+                            ? (g_event_type_base + event_type) & 0xff
+                            : event_type),
+        payload, phase);
+}
 
-        // Post a real 12-byte record as well as setting the poll bit.
-        //
-        // This was the gap: nothing in the button path ever called
-        // queue_input_event, so a press produced ONLY a poll bit and never a
-        // record on app+0x30. Hardware produces both -- the ISR posts into the
-        // OS event system and the pump turns that into a record -- so a title
-        // that reads the event list rather than polling saw nothing at all. It
-        // is why --press and every --force-buttons mask moved no title: there
-        // was no event to find, not a wrong one.
-        //
-        // Press only. The pump emits a record per transition it recognises, and
-        // a release carries no type of its own in the five-code table; the
-        // held state is what the poll reports.
-        //
-        // The payload is a millisecond timestamp, not a keycode (LLE: the pump
-        // passes `to_millis(ts, 1000)`), and the gate must be 1 -- gate 2 is
-        // source kind 4 and `InputEvents#1` requires `event[1] == 1`.
-        // record[+0x00] = BUTTON ID (0-5), record[+0x01] = 1 release / 2 press.
-        //
-        // CORRECTED 2026-09-19 from oracle relaying LLE: these fields are not
-        // "type" and "gate". I had been writing the TYPE where the id belongs,
-        // and gate 1 always -- which in the real encoding means RELEASE. So
-        // every button press ClickHLE has ever delivered arrived as a release,
-        // and an id out of range is dropped by the bounds check at 5 anyway.
-        //
-        // Both transitions are posted now, because release is a real event here
-        // rather than something to suppress.
-        const u8 id = button_event_id(event.button);
-        if (id == 0xff) {
-            continue;  // not a device control; the ring is polled, not posted
-        }
-        // ONE record per press, on the edge. NOT one per transition.
-        //
-        // oracle called Zuma's own `handle_events` (0x18011d3c) directly with a
-        // synthesized record and found the bit is a **TOGGLE on delivery**, not
-        // a press/release encoding:
-        //
-        //     FLAGS=0, id=2, type=1  -> bit 0x01 SET
-        //     FLAGS=0, id=2, type=2  -> bit 0x01 SET
-        //     FLAGS=1, id=2, type=1  -> bit 0x01 CLEARED
-        //     FLAGS=1, id=2, type=2  -> bit 0x01 CLEARED
-        //
-        // Payload made no difference (0, 1, 0xffffffff identical). Each record
-        // flips the bit from whatever it already was.
-        //
-        // So posting a record on press AND on release flipped the bit twice per
-        // button press and left it exactly where it started -- records arriving,
-        // being read every frame, and having zero net effect. That is precisely
-        // the symptom Zuma's stage screen showed.
-        //
-        // I introduced this when applying LLE's "1 = release / 2 = press"
-        // correction: I made both transitions post, reasoning that release was
-        // "a real event rather than something to suppress". Under toggle
-        // semantics that reasoning is exactly backwards.
-        // TWO COMPETING MODELS, selectable, because oracle and LLE disagree and
-        // I can test where neither of them can.
-        //
-        //   oracle, by calling handle_events with a synthesized record:
-        //     the bit TOGGLES on delivery. FLAGS=0 + id=2 sets it for type 1
-        //     AND type 2; FLAGS=1 + id=2 clears it for both. So one record per
-        //     press edge, and posting on release too would cancel it.
-        //
-        //   LLE, by re-deriving the per-record logic independently (106/106):
-        //     it is UNCONDITIONAL -- press sets bit 0x01, release clears it,
-        //     neither depending on the starting value. They believe oracle's
-        //     test exercised a separate value-dependent XOR over a pending
-        //     bitmask at input_object+0xc, not the record path.
-        //
-        // CLICKHLE_RECORD_MODE=edge  -> one record on press only        (probe)
-        // CLICKHLE_RECORD_MODE=both  -> press phase 2, release phase 1  (RetailOS)
-        //
-        // Default is `both`: the frame driver publishes the transitions it
-        // receives from the OS event queue. `edge` is available for probing
-        // guests that appear to consume only the press transition.
-        static const std::string_view record_mode = [] {
-            return button_record_mode();
-        }();
-        const bool post_release = record_mode == "both" || record_mode == "held";
-        if (!event.pressed && !post_release) {
-            continue;
-        }
-        // +0x01 must be 1. Measured: the dispatcher loads +0x01, compares, and
-        // returns in FIVE instructions for any value other than 1 -- including
-        // 2. A record with +0x01 = 2 is discarded, unread beyond that byte.
-        //
-        // This does not flatly contradict LLE's "1 = release, 2 = press": that
-        // came from Mahjong's CONSUMER walking app+0x30, and this is the
-        // outbound dispatcher. Both can hold -- a consumer may accept 1 and 2
-        // where the dispatcher accepts only 1. But 2 is measured as dropped,
-        // and 0..4 ids were measured as half-rejected, so the combination I was
-        // emitting could not work either way.
-        u8 phase = post_release ? (event.pressed ? 2u : 1u) : 1u;
-        if (const char* g = std::getenv("CLICKHLE_EVENT_GATE")) {
-            phase = static_cast<u8>(std::atoi(g));
-        }
-        u32 payload = emulator.tick_count();
-        if (const char* pl = std::getenv("CLICKHLE_EVENT_PAYLOAD")) {
-            payload = static_cast<u32>(std::strtoul(pl, nullptr, 0));
-        }
-        emulator.queue_input_event(
-            static_cast<u8>(g_event_type_base != 0
-                                ? (g_event_type_base + id) & 0xff
-                                : id),
-            payload, phase);
-    }
+void apply_hardware_bit_internal(Emulator& emulator, u8 bit, bool pressed) {
+    if (bit >= kHardwareBitToId.size()) return;
+    auto& state = emulator.input_state();
+    const u32 mask = 1u << bit;
+    if (((state.hardware_button_mask & mask) != 0) == pressed) return;
+    if (pressed) state.hardware_button_mask |= mask;
+    else state.hardware_button_mask &= ~mask;
+    post_button_record(emulator, kIdToEventType[kHardwareBitToId[bit]], pressed);
+}
+
+void apply_button_transition(Emulator& emulator, InputEvent event) {
+    if (event.button == Button::Count) return;
+    emulator.input_state().held_buttons[static_cast<std::size_t>(event.button)] =
+        event.pressed;
+    const u8 bit = hardware_bit_for_button(event.button);
+    if (bit != 0xff) emulator.set_hardware_button(bit, event.pressed);
+}
+
+void drain_input(Emulator& emulator) {
+    InputEvent event;
+    while (emulator.display().next_input(event))
+        apply_button_transition(emulator, event);
 }
 
 [[nodiscard]] bool held(const Emulator::InputState& state, Button button) {
@@ -438,6 +311,14 @@ void drain_input(Emulator& emulator) {
 }
 
 }  // namespace
+
+void apply_hardware_button(Emulator& emulator, Button button, bool pressed) {
+    apply_button_transition(emulator, {button, pressed});
+}
+
+void apply_hardware_bit(Emulator& emulator, u8 bit, bool pressed) {
+    apply_hardware_bit_internal(emulator, bit, pressed);
+}
 
 namespace {
 /// A button mask forced into every poll, pulsed on and off.
@@ -468,6 +349,54 @@ void set_forced_wheel(u32 mask) { g_forced_wheel = mask; }
 
 void set_event_type_base(u32 base) { g_event_type_base = base; }
 
+void poll_hardware_input(Emulator& emulator) {
+    drain_input(emulator);
+    auto& state = emulator.input_state();
+    const bool clockwise = held(state, Button::ActionEast);
+    const bool anticlockwise = held(state, Button::ActionWest);
+    if (clockwise != anticlockwise) {
+        static const i32 multiplier = [] {
+            const char* value = std::getenv("CLICKHLE_WHEEL_STEP");
+            const i32 n = value != nullptr ? std::atoi(value) : 1;
+            return n > 0 ? n : 1;
+        }();
+        emulator.move_hardware_wheel(
+            (clockwise ? kSpinStep : -kSpinStep) * multiplier);
+        state.synthetic_wheel_active = true;
+    } else if (state.synthetic_wheel_active) {
+        emulator.release_hardware_wheel();
+        state.synthetic_wheel_active = false;
+    }
+
+    const u32 port = emulator.sample_hardware_port();
+    // Rockbox validates this mask; RetailOS checks the same signature
+    // through a mask loaded at runtime. Other packets leave this state.
+    if ((port & 0x800000ffu) == 0x8000001au) {
+        const u8 buttons = static_cast<u8>((port >> 8) & 0x3f);
+        for (u8 bit = 0; bit < 6; ++bit)
+            apply_hardware_bit_internal(emulator, bit,
+                                        (buttons & (1u << bit)) != 0);
+        state.hardware_wheel_raw = (port & kWheelTouched)
+            ? std::optional<u8>{static_cast<u8>((port >> 16) & 0x7f)}
+            : std::nullopt;
+    }
+    static const std::string_view mode = button_record_mode();
+    repost_held(emulator, state, mode, &event_type_for_button);
+
+    WheelState wheel{state.wheel_raw, state.wheel_touched};
+    const bool was_touched = wheel.touched;
+    wheel.touched = state.hardware_wheel_raw.has_value();
+    if (wheel.touched) wheel.raw = *state.hardware_wheel_raw;
+    if (was_touched && !wheel.touched) {
+        wheel.raw = 0;
+        state.wheel_threshold = 3;
+        state.wheel_accumulator = 0;
+    }
+    state.wheel_raw = wheel.raw;
+    state.wheel_touched = wheel.touched;
+    update_wheel_counter(state, wheel.raw_word());
+}
+
 void register_input(HleRegistry& registry) {
     const auto fn = [&registry](u32 ordinal, std::string name, u8 arity,
                                 HleHandler handler) {
@@ -484,107 +413,15 @@ void register_input(HleRegistry& registry) {
         // `r0 = sp`, and reads `[sp + 4]`; Ms. Pac-Man passes `(sp + 4, sp)`
         // and reads `[sp]`. Different registers, same conclusion -- each reads
         // whatever it put in r1.
-        // Advance the wheel before answering. A game reads position and
-        // differences it, so motion has to happen between polls -- a wheel that
-        // only moves when a key is pressed and released would deliver a single
-        // step no matter how long it was held.
-        drain_input(f.emulator);
+        // RetailOS's input worker has already sampled the port and updated
+        // the button list and wheel counter for this callback. This API reads
+        // that cached state; it does not read the physical register again.
         auto& input_state = f.emulator.input_state();
-        {
-            static const std::string_view mode = button_record_mode();
-            repost_held(f.emulator, input_state, mode, &button_event_id);
-        }
-        WheelState wheel{input_state.wheel_raw, input_state.wheel_touched};
-        const bool clockwise = held(input_state, Button::ActionEast);
-        const bool anticlockwise = held(input_state, Button::ActionWest);
-        const bool was_touched = wheel.touched;
-        wheel.touched = clockwise || anticlockwise;
-        if (clockwise != anticlockwise) {
-            // kSpinStep is one physical detent, which is correct per poll ONLY
-            // if polls happen at hardware rate. Headless we poll as fast as the
-            // host allows; interactively the interpreter runs well below 60fps,
-            // so the same hold produces far fewer detents and the menu barely
-            // moves. That is a rate error, not a mapping error -- scrolling
-            // works, it is just too slow to use.
-            //
-            // CLICKHLE_WHEEL_STEP multiplies the detents per poll. Default 1 so
-            // headless runs and the screenshot baselines are unchanged.
-            static const i32 multiplier = [] {
-                const char* v = std::getenv("CLICKHLE_WHEEL_STEP");
-                const i32 n = v != nullptr ? std::atoi(v) : 1;
-                return n > 0 ? n : 1;
-            }();
-            wheel.spin((clockwise ? kSpinStep : -kSpinStep) * multiplier);
-        }
-        // A finger leaving the wheel ZEROES the raw word, it does not merely
-        // clear bit 30.
-        //
-        // LLE, 2026-09-18: the hardware path `0x10277510` sets bit 30 from the
-        // register and writes `block[0x24] = 0` outright on release. We were
-        // clearing the touch flag and keeping the last position, so after a
-        // release the guest kept reading a stale non-zero position with the
-        // contact bit clear -- a state the hardware never produces.
-        //
-        // This module's own header already said why that matters: "releasing
-        // must clear it, or the next press reads as one enormous jump". The
-        // rule was written down and only half implemented.
-        if (was_touched && !wheel.touched) {
-            wheel.raw = 0;
-            input_state.wheel_threshold = 3;
-            input_state.wheel_accumulator = 0;
-            CLICKHLE_DEBUG(kCategory) << "wheel released, raw word zeroed";
-        }
-
-        if (wheel.touched) {
-            CLICKHLE_DEBUG(kCategory)
-                << "wheel " << wheel.position() << (wheel.touched ? " touched" : "");
-        }
-        input_state.wheel_raw = wheel.raw;
-        input_state.wheel_touched = wheel.touched;
-        const u32 raw_wheel_word = wheel.raw_word();
-        u32 wheel_word = wheel.packed();
-        u32 counter_source = raw_wheel_word;
+        u32 wheel_word = WheelState{input_state.wheel_raw,
+                                    input_state.wheel_touched}.packed();
         if (g_forced_wheel != 0 && g_forced_period != 0 &&
-            (input_state.poll_count / g_forced_period) % 2 == 0) {
+            (input_state.poll_count / g_forced_period) % 2 == 0)
             wheel_word |= g_forced_wheel;
-            counter_source |= g_forced_wheel;
-        }
-        update_wheel_counter(input_state, counter_source);
-        // THE BUG THAT COST DAYS ON ZUMA'S STAGE/INSTRUCTIONS SCREENS.
-        //
-        // This whole block used to be here: a stale, pre-id/type-model loop
-        // over the five taps, posting `queue_input_event(2 + (i % 4), ...)` on
-        // every held-state CHANGE, plus a second stale post of
-        // `queue_input_event(1, g_wheel.position())` while the wheel was
-        // touched. Both predate `button_event_id`/`drain_input`/`repost_held`
-        // above, which is the actual, correct delivery path -- this ran IN
-        // PARALLEL with it and was never removed.
-        //
-        // Its computed output (`events`) never reached the guest: `out_a` is
-        // written from the firmware counter below, not from a button mask.
-        // So the loop was doing
-        // nothing useful and, on every Select press, injecting an UNINTENDED
-        // second record -- `taps[4] = ActionNorth`, `2 + (4 % 4) = 2` -- right
-        // alongside the real one.
-        //
-        // Found by walking handle_events's own record list on the exact call
-        // that produced an unexplained FLAGS bit (LLE + oracle, 2026-09-19):
-        // every single Select press carried TWO records, `[id=1 ...]` (mine)
-        // and `[id=2 type=1]` (this dead loop's). `touched` therefore always
-        // included bit 0x01 alongside bit 0x10, and `handle_events`'s stage-3
-        // edge compensation treated that spurious touch as "didn't move this
-        // call" and forced a flip -- corrupting `c->buttons` to `0x11` on
-        // every Select press, menu included. If the Instructions screen reads
-        // `c->buttons` as an EXACT match against the confirm value, a
-        // permanently-polluted low bit would fail that check on every single
-        // press, which is exactly the symptom: Select worked well enough for
-        // the menu's presumably looser check and never once satisfied
-        // whatever the Instructions screen tests.
-        //
-        // `g_forced_buttons`/`--force-buttons` remains inert: this API has no
-        // button-mask output. It should be removed from the CLI or redirected
-        // to the real event path in a separate change.
-
         // The first word is a SIGNED EVENT COUNT, not a button mask.
         //
         // Measured by the oracle against real firmware (2026-09-18), by setting

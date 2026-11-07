@@ -315,11 +315,10 @@ struct VideoCore::Impl {
         report << "Instructions " << std::dec << chip.instructions << ", DMA words "
                << chip.dma_words << "\n";
         report << "API sequence " << sequence << ", VC timer " << chip.timer << "\n";
-        report << "Vector lanes: lane acc acclo Z N C unknown-carry\n";
+        report << "Vector lanes: lane acc acclo Z N C\n";
         for (unsigned i = 0; i < chip.acc.size(); ++i)
             report << std::dec << i << " " << chip.acc[i] << " 0x" << std::hex << chip.acclo[i]
-                   << std::dec << " " << chip.vz[i] << " " << chip.vn[i] << " " << chip.vc[i]
-                   << " " << chip.unknown_carry[i] << "\n";
+                   << std::dec << " " << chip.vz[i] << " " << chip.vn[i] << " " << chip.vc[i] << "\n";
         std::ofstream vrf(output / "native-vrf.bin", std::ios::binary);
         vrf.write(reinterpret_cast<const char *>(chip.vrf.data()),
                   static_cast<std::streamsize>(chip.vrf.size()));
@@ -364,8 +363,10 @@ bool VideoCore::call(u32 ordinal, HleCallFrame &frame) {
         if (!frame.emulator.screenshot_path().empty())
             static_cast<void>(display.screenshot(frame.emulator.screenshot_path()));
     }
-    if (ordinal == 157 && success && !frame.emulator.display().pump())
-        frame.cpu.request_stop();
+    if (ordinal == 157 && success) {
+        if (!frame.emulator.display().pump())
+            frame.cpu.request_stop();
+    }
     return success;
 }
 bool VideoCore::submit(std::span<const u8> packets) {

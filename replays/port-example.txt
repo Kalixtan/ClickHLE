@@ -1,0 +1,5 @@
+# PP502x input register at 0x7000c140. Counts are port reads, not frames.
+# Idle, hold Select for three reads, then release.
+120 0x8000001a
+3 0x8000011a
+60 0x8000001a

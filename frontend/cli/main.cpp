@@ -65,6 +65,8 @@ struct Options {
     unsigned long auto_press_interval = 60;
     std::string input_script;
     std::filesystem::path input_file;
+    std::filesystem::path replay_file;
+    std::string replay_text;
     unsigned long frames = 0;
     unsigned long long instructions = 0;
     bool list_missing = true;
@@ -182,8 +184,12 @@ Options:
                           --input 2600+right,2900-right,2905+south,2910-south
                         walks right for 300 frames, then jumps. Order does not
                         matter; frames are sorted. Same button names as --press
-  --input-file <file>   Read replay syntax from a text file; lines may contain
-                        comma-separated transitions and # comments
+  --input-file <file>   Read the legacy button-transition script from a text
+                        file; lines may contain transitions and # comments
+  --replay-file <file>  Headless only. Replace reads of the 0x7000c140 input
+                        port. Each line is <poll-count> <32-bit port word>.
+                        Button bits are 8..13; wheel raw is in bits 16..22;
+                        bit 30 means touched. Example: 4 0x8000011a.
   --screenshot <file>   Write every presented frame to <file> as a BMP, so the
                         file ends up holding the last frame drawn
   --probe <Lib#n>       Log every call to an ordinal, with its arguments, and
@@ -411,6 +417,10 @@ bool parse_options(int argc, char** argv, Options& options) {
             const std::string value = value_for("--input-file");
             if (value.empty()) return false;
             options.input_file = value;
+        } else if (arg == "--replay-file") {
+            const std::string value = value_for("--replay-file");
+            if (value.empty()) return false;
+            options.replay_file = value;
         } else if (arg == "--press-every") {
             const std::string value = value_for("--press-every");
             if (value.empty()) return false;
@@ -462,6 +472,21 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.input_script.append(line, first, last - first + 1);
         }
         // An empty replay is useful for a deterministic idle smoke run.
+    }
+    if (!options.replay_file.empty()) {
+        if (!options.input_script.empty() || !options.input_file.empty()) {
+            std::cerr << "use one replay format at a time\n";
+            return false;
+        }
+        std::ifstream replay(options.replay_file);
+        if (!replay) {
+            std::cerr << "cannot open replay file '" << options.replay_file.string()
+                      << "'\n";
+            return false;
+        }
+        std::ostringstream contents;
+        contents << replay.rdbuf();
+        options.replay_text = contents.str();
     }
     return true;
 }
@@ -737,10 +762,23 @@ int main(int argc, char** argv) {
 
     clickhle::log::set_level(options.log_level);
 
+    std::vector<clickhle::ReplayEntry> replay_entries;
+    if (!options.replay_file.empty()) {
+        std::string why;
+        if (!clickhle::parse_replay(options.replay_text, replay_entries, why)) {
+            std::cerr << "replay: " << why << "\n";
+            return 2;
+        }
+    }
+
     clickhle::Emulator::Config config;
     config.executable = options.executable;
     if (options.capture_videocore && !options.headless) {
         std::cerr << "--capture-videocore requires --headless\n";
+        return 2;
+    }
+    if (!options.replay_file.empty() && !options.headless) {
+        std::cerr << "--replay-file requires --headless\n";
         return 2;
     }
     config.capture_videocore = options.capture_videocore;
@@ -748,7 +786,8 @@ int main(int argc, char** argv) {
     if (options.clock_hz != 0) {
         config.emulated_hz = options.clock_hz;
     }
-    config.deterministic_system_clock = options.deterministic_system_clock;
+    config.deterministic_system_clock = options.deterministic_system_clock ||
+                                        !options.replay_file.empty();
 
     clickhle::Emulator emulator;
     emulator.set_screenshot_path(options.screenshot);
@@ -764,21 +803,14 @@ int main(int argc, char** argv) {
         emulator.memory().set_read_watch_handler(
             [target](clickhle::GuestAddr address, clickhle::u32 size,
                      clickhle::u64 value) {
-                // pc - 8, not pc.
-                //
-                // ARM's pc reads as the executing instruction's address plus 8
-                // during execution, and the core reports that architectural
-                // value. Printing it raw put every address in every trace 8
-                // bytes past the instruction that caused the access -- which is
-                // silently wrong, because pc-8 usually lands on *some* valid
-                // instruction and the trace still reads plausibly. The LLE
-                // track caught it by matching five reported pcs against the
-                // disassembly and finding all five at pc-8.
+                // Unicorn exposes the executing address directly. ARM's
+                // architectural PC lookahead applies to guest instructions,
+                // not to ICpuCore::pc().
                 const clickhle::u32 raw =
                     target->cpu() != nullptr ? target->cpu()->pc() : 0;
                 std::cout << "  [read] " << size << "B at 0x" << std::hex
                           << address << " = 0x" << value << " from pc 0x"
-                          << (raw >= 8 ? raw - 8 : raw) << std::dec << "\n";
+                          << raw << std::dec << "\n";
             });
     }
     if (!options.watches.empty()) {
@@ -787,14 +819,11 @@ int main(int argc, char** argv) {
         emulator.memory().set_watch_handler(
             [target, stop_on_write](clickhle::GuestAddr addr, clickhle::u32 size,
                                     clickhle::u64 value) {
-                // pc - 8: reg(15) is ARM's architectural pc, which reads as
-                // the executing instruction's address plus 8. See the read
-                // watch above.
                 const clickhle::u32 raw =
                     target->cpu() == nullptr ? 0 : target->cpu()->reg(15);
                 std::cerr << "[watch] write " << size << " bytes at 0x"
                           << std::hex << addr << " = 0x" << value
-                          << " from pc 0x" << (raw >= 8 ? raw - 8 : raw)
+                          << " from pc 0x" << raw
                           << std::dec << "\n";
                 if (stop_on_write && target->cpu() != nullptr) {
                     std::ostringstream regs;
@@ -851,6 +880,8 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << error << "\n";
         return 1;
     }
+    if (!options.replay_file.empty())
+        emulator.set_replay(std::move(replay_entries));
 
     // After load(), because the CPU is created there -- registering earlier
     for (const unsigned long address : options.tracepoints) {

@@ -1253,6 +1253,8 @@ RunResult Emulator::run_game(u64 max_instructions) {
     // that present nothing. Its presentation limit cannot bound the callback
     // index: after a non-presenting callback those counters diverge.
     for (; single_frame_mode_ || frame_limit_ == 0 || frames < frame_limit_; ++frames) {
+        // RetailOS samples the device before publishing its button-event list.
+        poll_hardware_input(*this);
         const u64 missing_before = hle_missing_calls_;
         // Investigation hook: inject one correctly-shaped event on a cadence,
         // independent of the button plumbing, so a type/gate sweep tests the
@@ -1732,6 +1734,58 @@ u64 Emulator::microsecond_count() const {
                        hle_calls_ * config_.hle_call_cycles + idle_cycles_;
     const u64 hz = config_.emulated_hz == 0 ? 1 : config_.emulated_hz;
     return cycles * 1'000'000ull / hz;
+}
+
+void Emulator::set_hardware_buttons(u8 mask) {
+    input_state_.hardware_port_word =
+        (input_state_.hardware_port_word & ~(0x3fu << 8)) |
+        (static_cast<u32>(mask & 0x3f) << 8);
+}
+
+void Emulator::set_hardware_button(u8 bit, bool pressed) {
+    if (bit >= 6) return;
+    const u32 mask = 1u << (bit + 8);
+    if (pressed) input_state_.hardware_port_word |= mask;
+    else input_state_.hardware_port_word &= ~mask;
+}
+
+void Emulator::set_hardware_wheel(u8 raw_position) {
+    if (raw_position >= 96) return;
+    hardware_wheel_position_ = raw_position;
+    input_state_.hardware_port_word =
+        (input_state_.hardware_port_word & ~(0x3ffu << 16)) |
+        (static_cast<u32>(raw_position) << 16) | (1u << 30);
+}
+
+void Emulator::release_hardware_wheel() {
+    input_state_.hardware_port_word &= ~((0x3ffu << 16) | (1u << 30));
+}
+
+void Emulator::move_hardware_wheel(i32 detents) {
+    const i64 next = (static_cast<i64>(hardware_wheel_position_) +
+                      static_cast<i64>(detents) % 96 + 96) % 96;
+    set_hardware_wheel(static_cast<u8>(next));
+}
+
+void Emulator::set_replay(std::vector<ReplayEntry> entries) {
+    replay_entries_ = std::move(entries);
+    replay_next_entry_ = 0;
+    replay_polls_left_ = 0;
+    input_state_.hardware_button_mask = 0;
+    hardware_wheel_position_ = 0;
+    input_state_.hardware_port_word = 0x8000001a;
+}
+
+u32 Emulator::sample_hardware_port() {
+    if (!replay_entries_.empty()) {
+        if (replay_polls_left_ == 0 && replay_next_entry_ < replay_entries_.size()) {
+            const ReplayEntry& entry = replay_entries_[replay_next_entry_++];
+            input_state_.hardware_port_word = entry.port_word;
+            replay_polls_left_ = entry.polls;
+        }
+        if (replay_polls_left_ != 0) --replay_polls_left_;
+    }
+    return input_state_.hardware_port_word;
 }
 
 u64 Emulator::system_clock_microsecond_count() {

@@ -135,8 +135,6 @@ bool enabled(const Core &c, unsigned pred, unsigned lane) {
         return true;
     if (pred == 1)
         return false;
-    if (pred >= 6 && c.unknown_carry[lane])
-        throw std::runtime_error("Unverified carry from halfword SETF load");
     bool v = pred < 4 ? c.vz[lane] : pred < 6 ? c.vn[lane] : c.vc[lane];
     return v == ((pred & 1) == 0);
 }
@@ -231,13 +229,13 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
             // Z is constrained by the IFZ consumers. Clearing N/C follows
             // the existing unsigned-byte move model, not a silicon result.
             vn[lane] = vc[lane] = false;
-            unknown_carry[lane] = false;
         }
         return;
     }
     // Original uniform conversion loads signed high halves before clamping
     // the low halves to 0..65535 with IFNZ/IFN. Only this aligned form is
-    // established. Carry is deliberately unknown, not guessed from N.
+    // established. Clearing C is provisional: SETF updates C, but the
+    // load's ALU carry result has not been measured on hardware.
     if (length == 5 && w[0] == 0x2002 && w[1] == 0xcd00 &&
         w[2] == 0x001f && w[3] == 0 && w[4] == 0x40e7) {
         const u32 address = r[3];
@@ -250,7 +248,7 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
         for (unsigned lane = 0; lane < 16; ++lane) {
             vz[lane] = values[lane] == 0;
             vn[lane] = (values[lane] & 0x8000) != 0;
-            unknown_carry[lane] = true;
+            vc[lane] = false;
         }
         return;
     }
@@ -581,6 +579,14 @@ Core::VectorDecode Core::decode_vector(const std::array<u32, 5> &w, unsigned len
                 pred = 2;
                 count = 1;
             }
+            // An uploaded shader follows a carry-setting right shift with
+            // this IFNC #0 move and an 80-bit IFC #0x8000 move. r0 holds an
+            // address at this site, not a repeat count. The compact
+            // predicate layout beyond this exact encoding is unverified.
+            if (w[0] == 0x2226 && w[1] == 0xa0e0 && w[2] == 0x05c0) {
+                pred = 7;
+                count = 1;
+            }
             bkind = 1;
             immediate = sign_extend(w[2] & 63, 6);
         }
@@ -618,7 +624,7 @@ Core::VectorDecode Core::decode_vector(const std::array<u32, 5> &w, unsigned len
     }
     if (count > 65536)
         throw std::runtime_error("VC2 vector repeat limit");
-    auto &[nibble, blend, byte_mask, alpha_bit, half_complement, complement, byte_or,
+    auto &[nibble, blend, byte_mask, texture_nibble_mask, alpha_bit, half_complement, complement, byte_or, halfword_or,
            quant_sign, edge_sign, nibble_or, split48, split80, lowcarry, lowborrow,
            vertical_carry, highcarry, highborrow, carry_operands, filtered_byte, kernel] = decoded.modes;
     nibble = length == 5 && (w[0] == 0x20c4 || w[0] == 0x20dc || w[0] == 0x202c) &&
@@ -636,6 +642,16 @@ Core::VectorDecode Core::decode_vector(const std::array<u32, 5> &w, unsigned len
                            (immediate == 0xf0 || immediate == 0xf8 || immediate == 0xfe) && w[4] == 7 &&
                            count == 1 && a.width == 1 && d.width == 1 &&
                            a.reg < 0 && d.reg < 0;
+    // Provisional nibble extraction in original texture shaders 36/37.
+    // IFC takes the low four bits of the indexed byte; the adjacent IFNC
+    // branch shifts the other nibble into the same accumulator destination.
+    // Selector 5 is a mask in the established byte forms, but this combined
+    // IFC/CLRA/x15 form has no retained device result.
+    texture_nibble_mask = length == 5 && w[0] == 0x202a &&
+                          (w[1] == 0x10f3 || w[1] == 0x10f5) &&
+                          (w[2] & 0x1fff) == 0x1c0f && w[3] == 0x000e &&
+                          w[4] == 0xb407 && bkind == 1 && immediate == 15 &&
+                          a.width == 1 && d.width == 2 && a.reg < 0 && d.reg < 0;
     // RGBA5551 tests bit zero before expanding it to an alpha byte.
     // Z is constrained by the following IFNZ/IFZ moves. N/C use the
     // existing logical-result model; no device capture establishes them.
@@ -659,6 +675,12 @@ Core::VectorDecode Core::decode_vector(const std::array<u32, 5> &w, unsigned len
                          ((length == 3 && w[0] == 0x2234 && count == 1) ||
                           (length == 5 && w[0] == 0x2030 &&
                            (w[4] == 7 || w[4] == 0x87)));
+    // Provisional halfword join in uploaded shaders 36/37: a carry-derived
+    // high bit is combined with the shifted lower halfword. Selector 6 also
+    // unions rejection masks elsewhere; no device result establishes this
+    // x15 form independently, so accept only the archived instruction.
+    halfword_or = length == 5 && w[0] == 0x2036 && w[1] == 0xa1f5 &&
+                   w[2] == 0x0a81 && w[3] == 0x790e && w[4] == 0x8007;
     // Firmware-derived B + sign(A). MPEG-4's vc_H263IQuant8x8 uses
     // B=A for odd quantizers and B=0 for even ones; both reproduce the
     // H.263 inverse-quantization formula, including zero coefficients.
@@ -752,7 +774,7 @@ void Core::execute_vector(const std::array<u32, 5> &w, unsigned length,
     const unsigned op = (w[0] & 511) >> 3;
     const auto &[words, decoded_length, d, a, b, count, pred, sru, sreg, scalar,
            setf, clear, accumulate, x15, bkind, immediate, modes] = decoded;
-    const auto &[nibble, blend, byte_mask, alpha_bit, half_complement, complement, byte_or,
+    const auto &[nibble, blend, byte_mask, texture_nibble_mask, alpha_bit, half_complement, complement, byte_or, halfword_or,
            quant_sign, edge_sign, nibble_or, split48, split80, lowcarry, lowborrow,
            vertical_carry, highcarry, highborrow, carry_operands, filtered_byte, kernel] = decoded.modes;
     for (unsigned k = 0; k < count; ++k) {
@@ -793,16 +815,12 @@ void Core::execute_vector(const std::array<u32, 5> &w, unsigned length,
         std::array<bool, 16> selected{};
         for (unsigned i = 0; i < 16; ++i)
             selected[i] = enabled(*this, pred, i);
-        if (highcarry || highborrow)
-            for (unsigned i = 0; i < 16; ++i)
-                if (selected[i] && unknown_carry[i])
-                    throw std::runtime_error("Unverified carry from halfword SETF load");
         for (unsigned i = 0; i < 16; ++i) {
             Value x = av[i], y = bv[i], value = 0;
             unsigned sh = static_cast<unsigned>(y) & 31;
             if (complement)
                 value = x ^ ((1u << (8 * d.width)) - 1);
-            else if (byte_mask || alpha_bit)
+            else if (byte_mask || texture_nibble_mask || alpha_bit)
                 value = x & y;
             else if (nibble)
                 value = op == 24 ? x * (1LL << sh) : op == 27 ? x >> sh : x & y;
@@ -814,7 +832,7 @@ void Core::execute_vector(const std::array<u32, 5> &w, unsigned length,
                     value = y;
                     break;
                 case 6:
-                    if (!byte_or && !nibble_or)
+                    if (!byte_or && !nibble_or && !halfword_or)
                         throw std::runtime_error("Unsupported vector OR form");
                     value = x | y;
                     break;
@@ -973,11 +991,21 @@ void Core::execute_vector(const std::array<u32, 5> &w, unsigned length,
                     vz[i] = (values[i] & mask) == 0;
                     vn[i] = values[i] < 0;
                     vc[i] = values[i] < 0 || values[i] > mask;
-                    unknown_carry[i] = false;
                     // The matching context restore shifts the packed flag word
                     // right by one: its low bit restores C. Other shift forms
                     // still need independent carry/zero-shift evidence.
                     if (length == 3 && w[0] == 0x22d2 && w[1] == 0x10e0 && w[2] == 0x0601)
+                        vc[i] = (static_cast<u32>(av[i]) & 1) != 0;
+                    // The uploaded texture shaders split a 16-bit coordinate
+                    // with LSR #1, then consume C via paired IFC/IFNC moves.
+                    // The context restore above independently uses the same
+                    // shifted-out low bit. Keep these shader forms exact until
+                    // wider vector shift flag rules have device evidence.
+                    if ((length == 5 && w[0] == 0x20de &&
+                         (w[1] & 0xf0ff) == 0xa0f5 && w[2] == 0x0401 &&
+                         w[3] == 0x010e && w[4] == 0x4607) ||
+                        (length == 3 && w[0] == 0x22de &&
+                         (w[1] & 0xf0ff) == 0xa0f5 && (w[2] & 0x0fff) == 0x0e01))
                         vc[i] = (static_cast<u32>(av[i]) & 1) != 0;
                     if (lowcarry && carry_operands)
                         vc[i] =

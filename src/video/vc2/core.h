@@ -54,9 +54,6 @@ class Core {
     std::array<std::int64_t, 16> acc{};
     std::array<u32, 16> acclo{};
     std::array<bool, 16> vz{}, vn{}, vc{};
-    // The halfword SETF load has established Z/N consumers, but no C rule.
-    // Keep that uncertainty until an instruction replaces the lane flags.
-    std::array<bool, 16> unknown_carry{};
     std::vector<DmaDescriptor> descriptors;
     bool sleeping = false;
     std::string error;
@@ -68,10 +65,12 @@ class Core {
         bool nibble = false;
         bool blend = false;
         bool byte_mask = false;
+        bool texture_nibble_mask = false;
         bool alpha_bit = false;
         bool half_complement = false;
         bool complement = false;
         bool byte_or = false;
+        bool halfword_or = false;
         bool quant_sign = false;
         bool edge_sign = false;
         bool nibble_or = false;

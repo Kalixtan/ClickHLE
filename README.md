@@ -24,3 +24,14 @@ Built-in pipeline programs also need locally extracted VC2 records (not distribu
 Unsupported APIs and instructions stop execution, and games are not yet expected to render
 correctly. Normal play writes no diagnostic captures. Headless tests can opt in with
 `--headless --capture-videocore`; captures go to `work/vc2` (or `CLICKHLE_VC2_OUTPUT`).
+
+For repeatable headless input tests, use `--replay-file replays/port-example.txt`.
+Each line holds a raw `0x7000c140` input-port word for a number of port reads:
+`120 0x8000001a` or `3 0x8000011a` (Select held). Button bits are 8–13,
+the wheel position is in bits 16–22, and bit 30 signals touch. This override
+is available in headless mode only; GUI input supplies the same port word.
+The emulator currently samples this word in its RetailOS input-worker model;
+one headless port read occurs before each game callback, and GUI changes are
+sampled immediately so a short button tap is not lost at low frame rates.
+The model does not include the clickwheel controller's serial pins or
+device-ready register.

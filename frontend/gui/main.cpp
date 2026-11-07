@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iomanip>
 #include <memory>
 #include <optional>
@@ -32,6 +33,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
 #include <QPlainTextEdit>
@@ -158,6 +160,93 @@ private:
     bool integer_scaling_ = true;
 };
 
+class ClickWheelWidget final : public QWidget {
+public:
+    std::function<void(u8, bool)> button;
+    std::function<void(u8)> wheel;
+    std::function<void()> release_wheel;
+
+    explicit ClickWheelWidget(QWidget* parent = nullptr) : QWidget(parent) {
+        setMinimumSize(190, 190);
+        setMaximumSize(280, 280);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        const QPointF center = rect().center();
+        const qreal radius = std::min(width(), height()) * 0.46;
+        p.setPen(QPen(QColor(80, 88, 100), 2));
+        p.setBrush(QColor(214, 217, 222));
+        p.drawEllipse(center, radius, radius);
+        p.setBrush(QColor(60, 66, 77));
+        p.drawEllipse(center, radius * 0.36, radius * 0.36);
+        p.setPen(Qt::white);
+        p.drawText(QRectF(center.x() - 30, center.y() - 12, 60, 24),
+                   Qt::AlignCenter, tr("Select"));
+        p.setPen(QColor(25, 30, 38));
+        for (const auto& item : std::array<std::pair<const char*, QPointF>, 4>{
+                 {{"Menu", {0, -0.71}}, {">|", {0.72, 0}},
+                  {">||", {0, 0.71}}, {"|<", {-0.72, 0}}}}) {
+            const QPointF pos = center + QPointF(item.second.x() * radius,
+                                                 item.second.y() * radius);
+            p.drawText(QRectF(pos.x() - 30, pos.y() - 12, 60, 24),
+                       Qt::AlignCenter, QString::fromLatin1(item.first));
+        }
+    }
+
+    void mousePressEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) return;
+        press_point_ = event->position();
+        const QPointF delta = event->position() - rect().center();
+        const qreal radius = std::min(width(), height()) * 0.46;
+        const qreal distance = std::hypot(delta.x(), delta.y());
+        if (distance < radius * 0.36) {
+            held_bit_ = 0;
+        } else if (distance < radius) {
+            if (std::abs(delta.x()) > std::abs(delta.y()))
+                held_bit_ = delta.x() > 0 ? 1 : 2;
+            else
+                held_bit_ = delta.y() > 0 ? 3 : 4;
+        } else {
+            return;
+        }
+        if (button) button(*held_bit_, true);
+        event->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent* event) override {
+        if (!(event->buttons() & Qt::LeftButton) || !wheel) return;
+        if (held_bit_ &&
+            std::hypot(event->position().x() - press_point_.x(),
+                       event->position().y() - press_point_.y()) > 8) {
+            if (button) button(*held_bit_, false);
+            held_bit_.reset();
+        }
+        const QPointF delta = event->position() - rect().center();
+        const qreal radius = std::min(width(), height()) * 0.46;
+        const qreal distance = std::hypot(delta.x(), delta.y());
+        if (distance < radius * 0.40 || distance > radius * 1.15) return;
+        qreal angle = std::atan2(delta.x(), -delta.y());
+        if (angle < 0) angle += 2 * 3.14159265358979323846;
+        wheel(static_cast<u8>(std::floor(angle * 96 /
+                   (2 * 3.14159265358979323846))) % 96);
+    }
+
+    void mouseReleaseEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) return;
+        if (held_bit_ && button) button(*held_bit_, false);
+        held_bit_.reset();
+        if (release_wheel) release_wheel();
+        event->accept();
+    }
+
+private:
+    std::optional<u8> held_bit_;
+    QPointF press_point_;
+};
+
 class MainWindow final : public QMainWindow {
 public:
     explicit MainWindow(QString startup_game = {}) {
@@ -168,6 +257,29 @@ public:
         createActions();
         createMenus();
         createTools();
+        auto* wheel_dock = new QDockWidget(tr("Click Wheel"), this);
+        wheel_dock->setObjectName(QStringLiteral("clickWheelDock"));
+        wheel_dock->setFeatures(QDockWidget::DockWidgetMovable |
+                                QDockWidget::DockWidgetFloatable);
+        auto* wheel = new ClickWheelWidget(wheel_dock);
+        wheel->button = [this](u8 bit, bool down) {
+            if (!emulator_) return;
+            emulator_->set_hardware_button(bit, down);
+            clickhle::poll_hardware_input(*emulator_);
+        };
+        wheel->wheel = [this](u8 raw) {
+            if (!emulator_) return;
+            emulator_->set_hardware_wheel(raw);
+            clickhle::poll_hardware_input(*emulator_);
+        };
+        wheel->release_wheel = [this] {
+            if (!emulator_) return;
+            emulator_->release_hardware_wheel();
+            clickhle::poll_hardware_input(*emulator_);
+        };
+        wheel_dock->setWidget(wheel);
+        addDockWidget(Qt::RightDockWidgetArea, wheel_dock);
+        tools_menu_->addAction(wheel_dock->toggleViewAction());
         refreshTools();
         statusBar()->showMessage(tr("Ready — open a game executable"));
 
@@ -195,11 +307,20 @@ public:
 
 protected:
     void keyPressEvent(QKeyEvent* event) override {
-        if (!event->isAutoRepeat() && emulator_) {
-            if (const auto button = mapButton(event->key())) {
-                emulator_->display().inject(*button, true);
+        if (emulator_) {
+            if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down) {
+                emulator_->move_hardware_wheel(event->key() == Qt::Key_Up ? -3 : 3);
+                clickhle::poll_hardware_input(*emulator_);
                 event->accept();
                 return;
+            }
+            if (!event->isAutoRepeat()) {
+                if (const auto bit = keyHardwareBit(event->key())) {
+                    emulator_->set_hardware_button(*bit, true);
+                    clickhle::poll_hardware_input(*emulator_);
+                    event->accept();
+                    return;
+                }
             }
         }
         QMainWindow::keyPressEvent(event);
@@ -207,8 +328,15 @@ protected:
 
     void keyReleaseEvent(QKeyEvent* event) override {
         if (!event->isAutoRepeat() && emulator_) {
-            if (const auto button = mapButton(event->key())) {
-                emulator_->display().inject(*button, false);
+            if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down) {
+                emulator_->release_hardware_wheel();
+                clickhle::poll_hardware_input(*emulator_);
+                event->accept();
+                return;
+            }
+            if (const auto bit = keyHardwareBit(event->key())) {
+                emulator_->set_hardware_button(*bit, false);
+                clickhle::poll_hardware_input(*emulator_);
                 event->accept();
                 return;
             }
@@ -224,16 +352,14 @@ protected:
     }
 
 private:
-    static std::optional<Button> mapButton(int key) {
+    static std::optional<u8> keyHardwareBit(int key) {
         switch (key) {
-            case Qt::Key_Up: case Qt::Key_S: return Button::ActionWest;
-            case Qt::Key_Down: case Qt::Key_X: return Button::ActionEast;
-            case Qt::Key_Left: return Button::JoypadWest;
-            case Qt::Key_Right: return Button::JoypadEast;
+            case Qt::Key_Left: return 2;
+            case Qt::Key_Right: return 1;
             case Qt::Key_Return: case Qt::Key_Enter: case Qt::Key_Space:
-            case Qt::Key_Z: case Qt::Key_A: return Button::ActionNorth;
-            case Qt::Key_M: return Button::JoypadNorth;
-            case Qt::Key_P: return Button::JoypadSouth;
+            case Qt::Key_Z: case Qt::Key_A: return 0;
+            case Qt::Key_M: return 4;
+            case Qt::Key_P: return 3;
             default: return std::nullopt;
         }
     }

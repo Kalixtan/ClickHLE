@@ -9,6 +9,7 @@
 namespace clickhle {
 
 class Emulator;
+enum class Button;
 
 class HleRegistry;
 struct HleCallFrame;
@@ -25,6 +26,9 @@ void register_misc(HleRegistry& registry);
 
 /// "InputEvents": the click wheel. Two ordinals for the whole input API.
 void register_input(HleRegistry& registry);
+void apply_hardware_button(Emulator& emulator, Button button, bool pressed);
+void apply_hardware_bit(Emulator& emulator, u8 bit, bool pressed);
+void poll_hardware_input(Emulator& emulator);
 
 /// Forces a button mask into every input poll, pulsed with the given period in
 /// polls. Investigation only: which bit is which control is not established,

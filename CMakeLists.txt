@@ -68,6 +68,7 @@ add_library(clickhle_core
     src/hle/modules.cpp
     src/hle/modules/misc.cpp
     src/hle/modules/input.cpp
+    src/hle/modules/input_replay.cpp
     src/hle/modules/settings.cpp
     src/hle/modules/fileio.cpp
     src/hle/modules/audio.cpp

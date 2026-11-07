@@ -18,6 +18,7 @@
 #include "clickhle/hle/registry.h"
 #include "clickhle/hle/scheduler.h"
 #include "clickhle/hle/vfs.h"
+#include "clickhle/input/replay.h"
 #include "clickhle/loader/eapp_image.h"
 #include "clickhle/video/display.h"
 #include "clickhle/video/videocore.h"
@@ -261,6 +262,10 @@ public:
         i32 wheel_accumulator = 0;
         u8 wheel_raw = 0;
         bool wheel_touched = false;
+        std::optional<u8> hardware_wheel_raw;
+        bool synthetic_wheel_active = false;
+        u32 hardware_button_mask = 0;
+        u32 hardware_port_word = 0x8000001a;
         std::array<bool, static_cast<std::size_t>(Button::Count)> held_buttons{};
         u64 poll_count = 0;
     };
@@ -402,6 +407,13 @@ public:
     }
     [[nodiscard]] AudioState& audio_state() noexcept { return audio_state_; }
     [[nodiscard]] InputState& input_state() noexcept { return input_state_; }
+    void set_hardware_buttons(u8 mask);
+    void set_hardware_button(u8 bit, bool pressed);
+    void set_hardware_wheel(u8 raw_position);
+    void release_hardware_wheel();
+    void move_hardware_wheel(i32 detents);
+    void set_replay(std::vector<ReplayEntry> entries);
+    [[nodiscard]] u32 sample_hardware_port();
     [[nodiscard]] MiscState& misc_state() noexcept { return misc_state_; }
     [[nodiscard]] FilesystemState& filesystem_state() noexcept {
         return filesystem_state_;
@@ -730,6 +742,10 @@ public:
 
 private:
     std::vector<InputEvent> pending_input_;
+    std::vector<ReplayEntry> replay_entries_;
+    std::size_t replay_next_entry_ = 0;
+    u64 replay_polls_left_ = 0;
+    u8 hardware_wheel_position_ = 0;
     bool completions_enabled_ = true;
     std::map<std::string, u64> call_counts_;
     ReturnAudit return_audit_;

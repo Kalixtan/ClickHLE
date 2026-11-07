@@ -60,6 +60,12 @@ public:
                       reinterpret_cast<void*>(&UnicornCpu::onCodeThunk), this, 1, 0);
         lib_.hook_add(uc_, &mem_hook_, us::kHookMemUnmapped,
                       reinterpret_cast<void*>(&UnicornCpu::onUnmappedThunk), this, 1, 0);
+        // Shared host memory bypasses AddressSpace::read() for guest loads.
+        // Install this only for explicit read-watch debugging sessions.
+        if (memory_.watching_reads()) {
+            lib_.hook_add(uc_, &read_hook_, us::kHookMemRead,
+                          reinterpret_cast<void*>(&UnicornCpu::onReadThunk), this, 1, 0);
+        }
     }
 
     ~UnicornCpu() override {
@@ -295,6 +301,25 @@ private:
                                 int size, i64 value, void* user_data) {
         return static_cast<UnicornCpu*>(user_data)->onUnmapped(type, static_cast<u32>(address), size, value);
     }
+    static void onReadThunk(us::uc_engine*, us::uc_mem_type, u64 address,
+                            int size, i64, void* user_data) {
+        static_cast<UnicornCpu*>(user_data)->onRead(static_cast<u32>(address), size);
+    }
+
+    void onRead(u32 address, int size) {
+        if (size <= 0 || !memory_.watched_read_overlaps(address, static_cast<u32>(size))) {
+            return;
+        }
+        // Unicorn invokes this before the load. The same mapped bytes back
+        // AddressSpace, so its typed read supplies the value and watch report.
+        switch (size) {
+        case 1: (void)memory_.read<u8>(address); break;
+        case 2: (void)memory_.read<u16>(address); break;
+        case 4: (void)memory_.read<u32>(address); break;
+        case 8: (void)memory_.read<u64>(address); break;
+        default: break;
+        }
+    }
 
     void onCode(u32 address, u32 /*size*/) {
         real_pc_ = address;
@@ -409,6 +434,7 @@ private:
     us::uc_hook intr_hook_{};
     us::uc_hook code_hook_{};
     us::uc_hook mem_hook_{};
+    us::uc_hook read_hook_{};
 
     u64 instructions_ = 0;
     u32 real_pc_ = 0;

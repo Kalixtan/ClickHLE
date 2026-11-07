@@ -146,6 +146,17 @@ public:
         std::function<void(GuestAddr, u32, u64)> handler) {
         on_read_watch_ = std::move(handler);
     }
+    [[nodiscard]] bool watching_reads() const noexcept {
+        return !read_watches_.empty() && static_cast<bool>(on_read_watch_);
+    }
+    [[nodiscard]] bool watched_read_overlaps(GuestAddr addr, u32 size) const noexcept {
+        for (const GuestAddr watched : read_watches_) {
+            if (watched >= addr && watched - addr < size) {
+                return true;
+            }
+        }
+        return false;
+    }
     void note_read(GuestAddr addr, u32 size, u64 value) const {
         if (read_watches_.empty() || !on_read_watch_) {
             return;
