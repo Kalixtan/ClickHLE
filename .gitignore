@@ -29,10 +29,12 @@
 # Game, firmware, and other reference assets
 **/Games/
 **/iPod_Control/
+**/iTunes_installer/
 **/assets/
 **/Data/
 **/Firmware/
 **/firmware/
+**/firmware_filesystem/
 **/Resources/
 *.bin
 *.exe
@@ -62,3 +64,10 @@
 Thumbs.db
 *.swp
 *~
+
+# Python interpreter cache
+__pycache__/
+*.pyc
+
+# Locally archived VC2 firmware programs, compiled as immutable byte arrays
+/src/video/vc2/program_data.inc

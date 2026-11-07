@@ -20,6 +20,7 @@
 #include "clickhle/hle/vfs.h"
 #include "clickhle/loader/eapp_image.h"
 #include "clickhle/video/display.h"
+#include "clickhle/video/videocore.h"
 
 namespace clickhle {
 
@@ -31,7 +32,7 @@ namespace clickhle {
 class Emulator {
 public:
     /// One observed call at the ARM-to-render-server boundary. VideoCore
-    /// execution is not implemented; this records the host-visible API traffic
+    /// tracing records the host-visible API traffic
     /// and any small input prefix that can help reverse its contract.
     struct VideoCoreEvent {
         u64 sequence = 0;
@@ -402,13 +403,7 @@ public:
     [[nodiscard]] FilesystemState& filesystem_state() noexcept {
         return filesystem_state_;
     }
-    [[nodiscard]] std::any& gles_state_storage() noexcept { return gles_state_; }
-    [[nodiscard]] std::any& gles_ordinal_state_storage() noexcept {
-        return gles_ordinal_state_;
-    }
-    [[nodiscard]] u32& next_gles_texture_name() noexcept {
-        return next_gles_texture_name_;
-    }
+
     [[nodiscard]] Scheduler& scheduler() noexcept { return scheduler_; }
     [[nodiscard]] Vfs& vfs() noexcept { return vfs_; }
 
@@ -489,6 +484,7 @@ public:
     [[nodiscard]] std::string save_state(const std::filesystem::path& path);
     [[nodiscard]] std::string load_state(const std::filesystem::path& path);
     [[nodiscard]] Display& display() noexcept { return *display_; }
+    [[nodiscard]] VideoCore* videocore() noexcept { return videocore_.get(); }
 
     /// Host audio output.
     ///
@@ -650,15 +646,13 @@ private:
     InputState input_state_;
     MiscState misc_state_;
     FilesystemState filesystem_state_;
-    std::any gles_state_;
-    std::any gles_ordinal_state_;
-    u32 next_gles_texture_name_ = 0;
     Scheduler scheduler_;
     Vfs vfs_;
     /// Address of the SVC thunk being serviced, so block_thread() can send the
     /// thread back to it. Zero outside an HLE call.
     GuestAddr current_thunk_ = 0;
     unsigned call_depth_ = 0;
+    std::unique_ptr<VideoCore> videocore_;
     std::unique_ptr<Display> display_ = Display::create();
     std::unique_ptr<AudioDevice> audio_;
     u32 audio_rate_ = 0;

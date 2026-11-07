@@ -12,6 +12,13 @@ cmake --build build --parallel
 ```
 
 The command-line program is `build/bin/clickhle`. When Qt 6 Widgets is available, CMake also builds
-`build/bin/clickhle-gui`. Unicorn Engine 2 is required at runtime; SDL3 and OpenGL add video and
-audio support. Dependencies, game images, firmware, and reference assets are not bundled. See
+`build/bin/clickhle-gui`. Unicorn Engine 2 is required at runtime; SDL3 adds window, input, and audio support. Dependencies, game images, firmware, and reference assets are not bundled. See
 [LICENSING.md](LICENSING.md) for dependency notes.
+
+Graphics use a native C++ VideoCore II interpreter running original firmware. Native HLE builds
+its command packets; games do not execute RetailOS ARM code or require `osos.bin`. Both frontends
+display the raw framebuffer, with no shader replacement or Python runtime. Set
+`CLICKHLE_VC2_FIRMWARE` to a fallback game RenderServer image; games may supply their own image.
+Built-in pipeline programs also need locally extracted VC2 records (not distributed).
+Unsupported APIs and instructions stop execution, and games are not yet expected to render
+correctly. Diagnostic PNGs and packets go to `work/vc2` (or `CLICKHLE_VC2_OUTPUT`).

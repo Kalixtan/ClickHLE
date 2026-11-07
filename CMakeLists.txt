@@ -66,7 +66,6 @@ add_library(clickhle_core
     src/hle/vfs.cpp
     src/hle/scheduler.cpp
     src/hle/modules.cpp
-    src/hle/modules/opengles.cpp
     src/hle/modules/misc.cpp
     src/hle/modules/input.cpp
     src/hle/modules/settings.cpp
@@ -75,6 +74,15 @@ add_library(clickhle_core
     src/hle/modules/metadata.cpp
     src/audio/audio_device.cpp
     src/audio/audio_decoder.cpp
+    src/video/videocore.cpp
+    src/video/graphics_api.cpp
+    src/video/graphics_math.cpp
+    src/video/graphics_draw.cpp
+    src/video/graphics_programs.cpp
+    src/video/vc2/core.cpp
+    src/video/vc2/bus.cpp
+    src/video/vc2/vector.cpp
+    src/video/vc2/png.cpp
     src/video/display.cpp
 )
 
@@ -89,13 +97,8 @@ target_link_libraries(clickhle_core PRIVATE ${CMAKE_DL_LIBS})
 target_compile_definitions(clickhle_core PUBLIC
     CLICKHLE_CPU_BACKEND_DEFAULT="${CLICKHLE_CPU_BACKEND}")
 
-# Optional video and audio support.
-# SDL3 (zlib) and desktop OpenGL. Both optional: without them the tree still
-# builds and tests, and Display::create() returns a headless implementation that
-# fails to open a window rather than crashing. Only src/video/display_sdl.cpp
-# ever includes SDL, and only src/hle/modules/gles.cpp ever calls GL.
-
-option(CLICKHLE_WITH_VIDEO "Build the SDL3/OpenGL video backend" ON)
+# SDL presents the native framebuffer and provides host audio and input.
+option(CLICKHLE_WITH_VIDEO "Build the SDL3 presentation backend" ON)
 
 # Bundled iPod games also use AAC/MP3 streams. PCM WAV playback has an internal
 # decoder; FFmpeg is optional and enables the compressed formats when installed.
@@ -114,13 +117,11 @@ endif()
 set(CLICKHLE_VIDEO_ENABLED OFF)
 if(CLICKHLE_WITH_VIDEO)
     find_package(SDL3 QUIET)
-    find_package(OpenGL QUIET)
-    if(SDL3_FOUND AND OpenGL_FOUND)
+    if(SDL3_FOUND)
         target_sources(clickhle_core PRIVATE
             src/video/display_sdl.cpp
-            src/audio/audio_sdl.cpp
-            src/hle/modules/gles.cpp)
-        target_link_libraries(clickhle_core PUBLIC SDL3::SDL3 OpenGL::GL)
+            src/audio/audio_sdl.cpp)
+        target_link_libraries(clickhle_core PUBLIC SDL3::SDL3)
         target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_SDL=1)
         # SDL's own headers use C-style casts. They are not ours to fix, and
         # they are the only reason these files would trip the warning.
@@ -128,17 +129,10 @@ if(CLICKHLE_WITH_VIDEO)
             set_source_files_properties(
                 src/video/display_sdl.cpp
                 src/audio/audio_sdl.cpp
-                src/hle/modules/gles.cpp
                 PROPERTIES COMPILE_OPTIONS "-Wno-old-style-cast")
         endif()
         set(CLICKHLE_VIDEO_ENABLED ON)
     endif()
-endif()
-
-if(NOT CLICKHLE_VIDEO_ENABLED)
-    # No GL context to draw into; the entry points still register so coverage
-    # reports and the ordinal-forwarding table stay meaningful.
-    target_sources(clickhle_core PRIVATE src/hle/modules/gles_stub.cpp)
 endif()
 
 # Frontends.

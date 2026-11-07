@@ -20,15 +20,8 @@ struct HleCallFrame;
 ///
 /// Adding a module: write the file, declare it here, call it in register_all().
 
-/// The largest library a click-wheel game imports: 179 ordinals, every game.
-void register_opengles(HleRegistry& registry);
-
 /// Apple's "miscTBD", typo and all: 15 ordinals, every game. Holds the heap.
 void register_misc(HleRegistry& registry);
-
-/// The OpenGL ES 1.x implementation, registered by name under module "gl".
-/// OpenGLES ordinal handlers forward calls to it.
-void register_libgles(HleRegistry& registry);
 
 /// "InputEvents": the click wheel. Two ordinals for the whole input API.
 void register_input(HleRegistry& registry);
@@ -63,9 +56,6 @@ void register_all_modules(HleRegistry& registry);
 /// Frames presented and draw calls issued so far. Zero until the renderer is
 /// wired up.
 void gles_statistics(Emulator& emulator, u64& frames, u64& draws);
-
-/// Present one emulated frame through the configured display backend.
-void gles_present_frame(HleCallFrame& frame);
 
 /// Draw calls attributed to each bound texture name.
 ///

@@ -177,6 +177,7 @@ void fail(std::string* error, std::string message) {
 
 bool Emulator::load(Config config, std::string* error) {
     config_ = std::move(config);
+    videocore_ = std::make_unique<VideoCore>();
     system_clock_start_ = std::chrono::steady_clock::now();
     last_system_clock_us_ = 0;
     metadata_state_ = {};
@@ -184,9 +185,6 @@ bool Emulator::load(Config config, std::string* error) {
     input_state_ = {};
     misc_state_ = {};
     filesystem_state_ = {};
-    gles_state_.reset();
-    gles_ordinal_state_.reset();
-    next_gles_texture_name_ = 0;
     game_driver_ready_ = false;
     single_frame_mode_ = false;
     game_main_vector_ = 0;
@@ -345,6 +343,16 @@ bool Emulator::load(Config config, std::string* error) {
     }
 
     register_all_modules(registry_);
+    if (videocore_) {
+        // Every firmware export can be dispatched without a host GL handler.
+        // Execution may still stop at an unsupported firmware dependency.
+        for (u32 ordinal = 0; ordinal < 179; ++ordinal) {
+            if (!registry_.find("OpenGLES", ordinal)) {
+                registry_.add("OpenGLES", ordinal, "native_graphics_" + std::to_string(ordinal), 0,
+                              [](HleCallFrame& frame) { frame.cpu.request_stop(); });
+            }
+        }
+    }
 
     if (!bind_imports(error)) {
         return false;
@@ -643,7 +651,8 @@ bool Emulator::on_svc(u32 immediate) {
 
     std::optional<VideoCoreEvent> videocore_event;
     if (videocore_trace_enabled_ &&
-        is_videocore_boundary_call(*entry->function)) {
+        (is_videocore_boundary_call(*entry->function) ||
+         (videocore_ && entry->function->module == "OpenGLES" && entry->function->has_ordinal))) {
         VideoCoreEvent event;
         event.sequence = ++videocore_sequence_;
         event.frame = game_frame_index_;
@@ -651,7 +660,7 @@ bool Emulator::on_svc(u32 immediate) {
         event.return_pc = cpu_->lr();
         event.ordinal = entry->function->ordinal;
         event.name = entry->function->name;
-        event.arg_count = std::min<u8>(entry->function->arity, 4);
+        event.arg_count = videocore_ ? 4 : std::min<u8>(entry->function->arity, 4);
         for (u8 i = 0; i < event.arg_count; ++i) {
             event.args[i] = cpu_->reg(i);
         }
@@ -727,7 +736,20 @@ bool Emulator::on_svc(u32 immediate) {
     const u32 thread_before = scheduler_.current_handle();
     const GuestAddr thunk_before = current_thunk_;
     current_thunk_ = entry->address;
-    entry->function->handler(frame);
+    if (videocore_ && entry->function->module == "OpenGLES" && entry->function->has_ordinal) {
+        if (!videocore_->call(entry->function->ordinal, frame)) {
+            CLICKHLE_ERROR("vc2") << videocore_->error();
+            last_guest_call_failure_ = videocore_->error();
+            cpu_->request_stop();
+        } else if (frame_limit_ && videocore_->frames() >= frame_limit_) {
+            cpu_->request_stop();
+        }
+    } else if (videocore_ && entry->function->module == "gl") {
+        last_guest_call_failure_ = "Named GL entry points are not supported by the VC2 backend";
+        cpu_->request_stop();
+    } else {
+        entry->function->handler(frame);
+    }
     current_thunk_ = thunk_before;
     if (videocore_event.has_value()) {
         videocore_event->result = cpu_->reg(reg::kR0);
@@ -868,6 +890,7 @@ bool take(const std::vector<std::byte>& in, std::size_t& at, T& value) {
 }  // namespace
 
 std::string Emulator::save_state(const std::filesystem::path& path) {
+    if (videocore_) return "Save states are not supported by the experimental VC2 backend";
     if (cpu_ == nullptr) {
         return "nothing loaded";
     }
@@ -938,6 +961,7 @@ std::string Emulator::save_state(const std::filesystem::path& path) {
 }
 
 std::string Emulator::load_state(const std::filesystem::path& path) {
+    if (videocore_) return "Save states are not supported by the experimental VC2 backend";
     if (cpu_ == nullptr) {
         return "nothing loaded";
     }
@@ -1380,6 +1404,7 @@ RunResult Emulator::run_game(u64 max_instructions) {
                 break;
             }
             total.status = RunStatus::Fault;
+            if (videocore_ && !videocore_->error().empty()) total.fault = videocore_->error();
             if (total.fault.empty() && !last_guest_call_failure_.empty()) {
                 total.fault = last_guest_call_failure_;
             }

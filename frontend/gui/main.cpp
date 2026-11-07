@@ -529,13 +529,6 @@ private:
         int height = 0;
         std::vector<u8> pixels = emulator_->display().read_rgba(width, height);
         if (!pixels.empty() && width > 0 && height > 0) {
-            // The emulated LCD is an opaque surface. The GL front buffer's
-            // alpha may be unset or affected by guest blending; letting the
-            // host window manager composite that alpha makes transparent game
-            // texels turn into black holes in the captured frame.
-            for (std::size_t alpha = 3; alpha < pixels.size(); alpha += 4) {
-                pixels[alpha] = 255;
-            }
             QImage image(pixels.data(), width, height, width * 4,
                          QImage::Format_RGBA8888);
             canvas_->setFrame(image.mirrored(false, true).copy());

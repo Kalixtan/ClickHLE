@@ -8,7 +8,6 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
-#include <SDL3/SDL_opengl.h>
 
 #include "clickhle/common/log.h"
 #include "clickhle/video/display.h"
@@ -39,112 +38,46 @@ public:
 
     [[nodiscard]] bool open(int width, int height,
                             const std::string& title) override {
-        if (window_ != nullptr) {
-            return true;
-        }
-        // SDL installs its own SIGINT/SIGTERM handlers, which only set an
-        // internal quit flag. Any loop that does not poll for that flag then
-        // ignores Ctrl-C and, worse, survives `timeout` and kill -TERM -- an
-        // emulator that wedges becomes an orphan burning a core until someone
-        // notices. We do our own event handling, so take the signals back.
-        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-
-        if (headless_) {
-            // SDL's offscreen driver renders through Mesa's surfaceless EGL, so
-            // this works with no display server at all -- not merely a window
-            // that happens to be hidden.
-            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "offscreen");
-            scale_ = 1;  // no point scaling up something nobody is looking at
-            scale_explicit_ = false;  // and an explicit --scale cannot override
-
-        }
-        if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
-            CLICKHLE_ERROR(kCategory) << "SDL_InitSubSystem: " << SDL_GetError();
-            return false;
-        }
-
-        // A 2.1 compatibility context, deliberately.
-        //
-        // OpenGL ES 1.0 is a fixed-function API: matrix stacks, glVertexPointer,
-        // alpha test. Desktop GL up to 2.1 has all of it, so the translation is
-        // close to one-for-one and the renderer stays small. A core-profile
-        // path with an ubershader is the eventual answer (roadmap task #20) and
-        // is what a modern macOS build would need, but it buys nothing yet.
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-        SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
-        SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 5);
-        SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 6);
-        SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 5);
-
-        // Presented at 2x so a 320x240 panel is legible on a modern monitor;
-        // the guest still renders at native resolution and the GLES layer
-        // scales its viewport to match.
-        SDL_WindowFlags flags = SDL_WINDOW_OPENGL;
-        // SDL installs its own SIGINT/SIGTERM handlers, which only set an
-        // internal quit flag. Any loop that does not poll for that flag then
-        // ignores Ctrl-C and, worse, survives `timeout` and kill -TERM -- an
-        // emulator that wedges becomes an orphan burning a core until someone
-        // notices. We do our own event handling, so take the signals back.
-        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
-
-        if (headless_) {
-            flags |= SDL_WINDOW_HIDDEN;
-        } else if (fullscreen_) {
-            flags |= SDL_WINDOW_FULLSCREEN;
-        }
-        window_ = SDL_CreateWindow(title.c_str(), width * scale_,
-                                   height * scale_, flags);
-        if (window_ == nullptr) {
-            CLICKHLE_ERROR(kCategory) << "SDL_CreateWindow: " << SDL_GetError();
-            return false;
-        }
-        context_ = SDL_GL_CreateContext(window_);
-        if (context_ == nullptr) {
-            CLICKHLE_ERROR(kCategory) << "SDL_GL_CreateContext: " << SDL_GetError();
-            SDL_DestroyWindow(window_);
-            window_ = nullptr;
-            return false;
-        }
-        SDL_GL_MakeCurrent(window_, context_);
-        SDL_GL_SetSwapInterval(0);  // the guest paces itself
-
+        if (opened_) return true;
         width_ = width;
         height_ = height;
-        CLICKHLE_INFO(kCategory)
-            << (headless_ ? "opened headless " : "opened ") << width << "x"
-            << height << " surface at " << scale_ << "x, GL "
-            << reinterpret_cast<const char*>(glGetString(GL_VERSION));
-        // The host's texture-dimension ceiling. musika asks for 23644x1 and
-        // 77824x1 storage allocations; whether those are refusable at all
-        // depends on this number, so log it rather than assume the usual
-        // 16384.
-        {
-            GLint max_tex = 0;
-            glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
-            CLICKHLE_INFO(kCategory) << "GL_MAX_TEXTURE_SIZE " << max_tex;
+        if (headless_) { opened_ = true; return true; }
+        SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+        if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) return false;
+        window_ = SDL_CreateWindow(title.c_str(), width * scale_, height * scale_,
+                                   fullscreen_ ? SDL_WINDOW_FULLSCREEN : 0);
+        if (window_) renderer_ = SDL_CreateRenderer(window_, nullptr);
+        if (renderer_) texture_ = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGB24,
+                                                   SDL_TEXTUREACCESS_STREAMING, width, height);
+        if (!texture_) {
+            CLICKHLE_ERROR(kCategory) << SDL_GetError();
+            close();
+            return false;
         }
+        SDL_SetTextureScaleMode(texture_, SDL_SCALEMODE_NEAREST);
+        SDL_SetRenderLogicalPresentation(renderer_, width, height, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+        opened_ = true;
         return true;
     }
 
     void close() override {
-        if (context_ != nullptr) {
-            SDL_GL_DestroyContext(context_);
-            context_ = nullptr;
-        }
-        if (window_ != nullptr) {
-            SDL_DestroyWindow(window_);
-            window_ = nullptr;
-        }
+        if (texture_) SDL_DestroyTexture(texture_);
+        if (renderer_) SDL_DestroyRenderer(renderer_);
+        if (window_) SDL_DestroyWindow(window_);
+        texture_ = nullptr;
+        renderer_ = nullptr;
+        window_ = nullptr;
+        opened_ = false;
     }
 
-    [[nodiscard]] bool is_open() const override { return window_ != nullptr; }
+    [[nodiscard]] bool is_open() const override { return opened_; }
 
     void present() override {
-        if (window_ != nullptr) {
-            SDL_GL_SwapWindow(window_);
-        }
+        if (!texture_ || rgb_.empty() || frame_width_ != width_ || frame_height_ != height_) return;
+        SDL_UpdateTexture(texture_, nullptr, rgb_.data(), width_ * 3);
+        SDL_RenderClear(renderer_);
+        SDL_RenderTexture(renderer_, texture_, nullptr, nullptr);
+        SDL_RenderPresent(renderer_);
     }
 
     [[nodiscard]] bool pump() override {
@@ -252,42 +185,6 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool screenshot(const std::filesystem::path& path) override {
-        if (window_ == nullptr) {
-            return false;
-        }
-        int w = width_;
-        int h = height_;
-        SDL_GetWindowSizeInPixels(window_, &w, &h);
-
-        const auto row = static_cast<std::size_t>(w) * 3u;
-        std::vector<u8> pixels(row * static_cast<std::size_t>(h));
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        // GL_BGR and bottom-up rows are exactly BMP's layout, so the readback
-        // needs no further conversion.
-        glReadPixels(0, 0, w, h, GL_BGR, GL_UNSIGNED_BYTE, pixels.data());
-        return write_bmp(path, w, h, pixels.data());
-    }
-
-    [[nodiscard]] std::vector<u8> read_rgba(int& width, int& height) override {
-        if (window_ == nullptr) {
-            width = 0;
-            height = 0;
-            return {};
-        }
-        width = width_;
-        height = height_;
-        std::vector<u8> pixels(static_cast<std::size_t>(width) *
-                               static_cast<std::size_t>(height) * 4u);
-        glPixelStorei(GL_PACK_ALIGNMENT, 1);
-        // The guest frame ends at SDL_GL_SwapWindow. Read the presented front
-        // buffer; the back buffer is undefined after a double-buffer swap.
-        glReadBuffer(GL_FRONT);
-        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE,
-                     pixels.data());
-        glReadBuffer(GL_BACK);
-        return pixels;
-    }
 
 private:
     /// Keyboard to click wheel.
@@ -364,7 +261,9 @@ private:
     u32 script_counter_ = 0;
     SDL_Gamepad* gamepad_ = nullptr;
     SDL_Window* window_ = nullptr;
-    SDL_GLContext context_ = nullptr;
+    SDL_Renderer* renderer_ = nullptr;
+    SDL_Texture* texture_ = nullptr;
+    bool opened_ = false;
     int width_ = 0;
     int height_ = 0;
     int scale_ = 2;

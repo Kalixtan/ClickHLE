@@ -158,6 +158,7 @@ Options:
                         breakpoint on data, which is what you need when the
                         interesting write is one of thousands and cannot be
                         picked out by a register value
+  --videocore           Accepted for compatibility; VC2 is always enabled
   --headless            Render without showing a window (works with no display
                         server at all); screenshots still work
   --instructions <n>    Stop after n guest instructions in a single callback.
@@ -357,6 +358,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.watch_breaks = true;
         } else if (arg == "--fullscreen") {
             options.fullscreen = true;
+        } else if (arg == "--videocore") {
+            // Accepted for compatibility; VC2 is always enabled.
         } else if (arg == "--headless") {
             options.headless = true;
         } else if (arg == "--calls") {

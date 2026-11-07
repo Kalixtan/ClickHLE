@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -9,21 +10,7 @@
 
 namespace clickhle {
 
-/// Inherited from the Gizmondo's control set and still to be replaced by the
-/// click wheel: spin direction and velocity, taps at the cardinal points, and
-/// the centre button. See milestone M6.
-/// a four-way joypad left of the screen, four action buttons right of it, two
-/// shoulder buttons, and five "piano" keys across the top.
-///
-/// Deliberately physical rather than virtual-key: the display backend knows
-/// about host keyboards and gamepads, and the HLE layer knows about VK codes.
-/// Neither should have to know about the other.
-/// The click wheel's controls.
-///
-/// Inherited names on the left of each line, kept because the display backend
-/// and the --input script parser already speak them. What matters is the right:
-/// a click wheel is a ring you rotate, four taps at the cardinal points, and a
-/// centre button.
+// Click-wheel taps and keyboard substitutes for rotation.
 enum class Button {
     JoypadNorth,    ///< Menu    -- the wheel's top tap
     JoypadEast,     ///< Forward -- right tap
@@ -56,7 +43,7 @@ struct ScriptedInput {
     bool pressed = false;
 };
 
-/// The host window and GL context.
+/// The host window and native framebuffer.
 ///
 /// An interface rather than a direct SDL dependency for two reasons: the tree
 /// must still build and test with no SDL present, and nothing in src/ or
@@ -66,10 +53,7 @@ class Display {
 public:
     virtual ~Display() = default;
 
-    /// Creates the backend compiled into this build. Never returns null: with
-    /// no SDL, a headless implementation is returned whose open() fails
-    /// cleanly, so a game that wants graphics gets a diagnostic rather than a
-    /// crash.
+    /// Creates an SDL or CPU-only framebuffer backend.
     [[nodiscard]] static std::unique_ptr<Display> create();
 
     [[nodiscard]] virtual std::string_view backend() const = 0;
@@ -95,7 +79,7 @@ public:
     /// window. Must be set before open().
     virtual void set_fullscreen(bool fullscreen) = 0;
 
-    /// Opens a window with a GL context current on the calling thread.
+    /// Opens the presentation surface.
     [[nodiscard]] virtual bool open(int width, int height,
                                     const std::string& title) = 0;
     virtual void close() = 0;
@@ -135,11 +119,18 @@ public:
     /// This is the project's ground truth for "does it draw". It also makes the
     /// renderer testable without a human looking at a screen, and gives the
     /// framebuffer diff harness (roadmap task #31) something to compare.
-    [[nodiscard]] virtual bool screenshot(const std::filesystem::path& path) = 0;
+    [[nodiscard]] virtual bool screenshot(const std::filesystem::path& path);
 
     /// Reads the current framebuffer as bottom-up RGBA8 pixels. Returns an
-    /// empty buffer when the backend has no live GL surface.
-    [[nodiscard]] virtual std::vector<u8> read_rgba(int& width, int& height) = 0;
+    /// empty buffer until the firmware produces pixels.
+    [[nodiscard]] virtual std::vector<u8> read_rgba(int& width, int& height);
+
+    // Raw device rows, shared by every frontend without host rendering.
+    void set_frame_rgb(std::span<const u8> pixels, int width, int height);
+protected:
+    std::vector<u8> rgb_;
+    int frame_width_ = 0;
+    int frame_height_ = 0;
 };
 
 /// Writes 24-bit BGR rows, bottom-up, as an uncompressed BMP. Separate from the
