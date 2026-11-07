@@ -54,6 +54,7 @@ struct Options {
     bool run = false;
     bool plan = false;
     bool headless = false;
+    bool capture_videocore = false;
     bool show_calls = false;
     std::vector<unsigned long> tracepoints;
     unsigned long profile_period = 0;
@@ -161,6 +162,8 @@ Options:
   --videocore           Accepted for compatibility; VC2 is always enabled
   --headless            Render without showing a window (works with no display
                         server at all); screenshots still work
+  --capture-videocore   Save VC2 packets, raw frames and diagnostics for testing
+                        (requires --headless; disabled by default)
   --instructions <n>    Stop after n guest instructions in a single callback.
                         A frame limit cannot bound a title that spins without
                         presenting; this can, and the register dump on the way
@@ -362,6 +365,8 @@ bool parse_options(int argc, char** argv, Options& options) {
             // Accepted for compatibility; VC2 is always enabled.
         } else if (arg == "--headless") {
             options.headless = true;
+        } else if (arg == "--capture-videocore") {
+            options.capture_videocore = true;
         } else if (arg == "--calls") {
             options.show_calls = true;
         } else if (arg == "--trace-pc") {
@@ -734,6 +739,11 @@ int main(int argc, char** argv) {
 
     clickhle::Emulator::Config config;
     config.executable = options.executable;
+    if (options.capture_videocore && !options.headless) {
+        std::cerr << "--capture-videocore requires --headless\n";
+        return 2;
+    }
+    config.capture_videocore = options.capture_videocore;
     config.cpu_backend = options.cpu_backend;
     if (options.clock_hz != 0) {
         config.emulated_hz = options.clock_hz;

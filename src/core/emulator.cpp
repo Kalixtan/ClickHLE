@@ -177,7 +177,7 @@ void fail(std::string* error, std::string message) {
 
 bool Emulator::load(Config config, std::string* error) {
     config_ = std::move(config);
-    videocore_ = std::make_unique<VideoCore>();
+    videocore_ = std::make_unique<VideoCore>(config_.capture_videocore);
     system_clock_start_ = std::chrono::steady_clock::now();
     last_system_clock_us_ = 0;
     metadata_state_ = {};
@@ -741,7 +741,10 @@ bool Emulator::on_svc(u32 immediate) {
             CLICKHLE_ERROR("vc2") << videocore_->error();
             last_guest_call_failure_ = videocore_->error();
             cpu_->request_stop();
-        } else if (frame_limit_ && videocore_->frames() >= frame_limit_) {
+        } else if (!single_frame_mode_ && frame_limit_ &&
+                   videocore_->frames() >= frame_limit_) {
+            // A GUI tick already stops after its callback returns. Stopping
+            // inside presentation would replay that same GL call next tick.
             cpu_->request_stop();
         }
     } else if (videocore_ && entry->function->module == "gl") {
@@ -1246,7 +1249,10 @@ RunResult Emulator::run_game(u64 max_instructions) {
     const GuestAddr main_vector = game_main_vector_;
 
     u64 frames = game_frame_index_;
-    for (; frame_limit_ == 0 || frames < frame_limit_; ++frames) {
+    // The GUI advances one callback per tick, including loading callbacks
+    // that present nothing. Its presentation limit cannot bound the callback
+    // index: after a non-presenting callback those counters diverge.
+    for (; single_frame_mode_ || frame_limit_ == 0 || frames < frame_limit_; ++frames) {
         const u64 missing_before = hle_missing_calls_;
         // Investigation hook: inject one correctly-shaped event on a cadence,
         // independent of the button plumbing, so a type/gate sweep tests the

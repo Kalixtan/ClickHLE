@@ -209,8 +209,9 @@ bool try_start_voice(HleCallFrame& f, u32 handle) {
     }
     snd.started = true;
     set_sound_state(f, sounds, handle, 1);
-    append_wav_dump(wav->pcm.data(), static_cast<u32>(wav->pcm.size()),
-                    wav->sample_rate, wav->channels, wav->bits_per_sample);
+    if (f.emulator.config().capture_videocore)
+        append_wav_dump(wav->pcm.data(), static_cast<u32>(wav->pcm.size()),
+                        wav->sample_rate, wav->channels, wav->bits_per_sample);
     CLICKHLE_DEBUG(kCategory)
         << "sfx play handle=" << handle << " " << wav->pcm.size()
         << " PCM bytes @" << wav->sample_rate << "/"

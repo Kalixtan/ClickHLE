@@ -18,6 +18,7 @@ struct DmaTransfer {
 struct DmaDescriptor {
     std::array<u32, 6> words;
 };
+enum class VectorKernel { General, Move, Add, Subtract, ReverseSubtract, And, Or, Complement, Multiply };
 class Core;
 struct VectorOperand {
     u32 base = 0;
@@ -63,6 +64,28 @@ class Core {
     u32 timer = 0;
 
   private:
+    struct VectorModes {
+        bool nibble = false;
+        bool blend = false;
+        bool byte_mask = false;
+        bool alpha_bit = false;
+        bool half_complement = false;
+        bool complement = false;
+        bool byte_or = false;
+        bool quant_sign = false;
+        bool edge_sign = false;
+        bool nibble_or = false;
+        bool split48 = false;
+        bool split80 = false;
+        bool lowcarry = false;
+        bool lowborrow = false;
+        bool vertical_carry = false;
+        bool highcarry = false;
+        bool highborrow = false;
+        bool carry_operands = false;
+        bool filtered_byte = false;
+        VectorKernel kernel = VectorKernel::General;
+    };
     struct VectorDecode {
         std::array<u32, 5> words{};
         unsigned length = 0;
@@ -71,6 +94,7 @@ class Core {
         bool setf = false, clear = false, accumulate = false, x15 = false;
         int bkind = 0;
         std::int64_t immediate = 0;
+        VectorModes modes;
     };
     static constexpr unsigned vector_cache_size = 1024;
     std::vector<VectorDecode> vector_cache_ = std::vector<VectorDecode>(vector_cache_size);
@@ -87,6 +111,9 @@ class Core {
     u32 ram_address(u32 address, u32 length) const;
     u32 alu(unsigned op, u32 a, u32 b);
     void vector(const std::array<u32, 5> &words, unsigned length);
+    VectorDecode decode_vector(const std::array<u32, 5> &words, unsigned length) const;
+    void execute_vector(const std::array<u32, 5> &words, unsigned length,
+                        const VectorDecode &decoded);
     void load_dma(unsigned channel, unsigned sub, u32 address);
     unsigned pending_source();
 };

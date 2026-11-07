@@ -52,6 +52,9 @@ public:
     struct Config {
         std::filesystem::path executable;
 
+        // Opt-in disk capture for headless reverse-engineering runs.
+        bool capture_videocore = false;
+
         /// Empty means the backend chosen at configure time.
         std::string cpu_backend;
 

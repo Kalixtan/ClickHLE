@@ -65,14 +65,26 @@ struct VideoCore::Impl {
     std::vector<u8> firmware;
     GraphicsApi api;
     bool started = false;
-    u32 device = 0, host = 0, ring = 0, sequence = 0, completion = 0;
+    u32 device = 0, host = 0, ring = 0, sequence = 0;
     // Experimental panel timing. GPIO49/source 11 follows firmware evidence;
     // the 60 Hz period is a fixture until panel timing is independently known.
     static constexpr u32 kDisplaySyncPeriod = 16667;
+    // A batch can queue a large DMA transfer after substantial rendering work.
+    // Allow its firmware wait loop to finish while retaining a finite guard.
+    static constexpr u32 kSubmissionInstructionLimit = 4'000'000;
     u32 next_display_sync = 0;
     std::filesystem::path output;
 
-    explicit Impl(VideoCore &instance) : owner(instance), api([this](std::span<const u8> bytes) { send(bytes); }) {
+    explicit Impl(VideoCore &instance) : owner(instance), api(
+        [this](std::span<const u8> bytes) { send(bytes); },
+        {[this](u32 size) {
+            return chip.copy_out(chip.read(0xc000000c), size);
+        }, [this] { boot(); return chip.read(device); }, [this](u32 marker) {
+            boot();
+            if (chip.read(device) < marker)
+                throw std::runtime_error("VC2 completion is pending");
+        }}) {
+        if (!owner.capture_) return;
         const char *path = std::getenv("CLICKHLE_VC2_OUTPUT");
         output = path ? path : "work/vc2";
         std::filesystem::create_directories(output);
@@ -105,6 +117,7 @@ struct VideoCore::Impl {
             throw std::runtime_error("VC2 ring initialization failed");
         next_display_sync = chip.timer + kDisplaySyncPeriod;
         started = true;
+        if (!owner.capture_) return;
         std::ofstream report(output / "native-startup.txt");
         report << "Native HLE uploaded " << firmware.size()
                << " bytes; VC2 firmware published readiness and command-ring addresses.\n"
@@ -113,12 +126,29 @@ struct VideoCore::Impl {
     void capture_pixels() {
         if (chip.descriptors.size() < 15)
             return;
-        const u32 address = chip.descriptors[0].words[2];
-        for (unsigned i = 0; i < 15; ++i) {
-            const auto &d = chip.descriptors[i].words;
-            if (d[2] != address + i * 10240 || d[3] != 320 || d[4] != 0x1025151)
-                return;
+        // A submission may upload textures before writing the framebuffer.
+        // Find the latest complete set of 15 RGB565 strips, wherever it
+        // occurs in the descriptor history for this API call.
+        u32 address = 0;
+        bool found = false;
+        for (std::size_t end = chip.descriptors.size(); end >= 15; --end) {
+            const auto start = end - 15;
+            const u32 candidate = chip.descriptors[start].words[2];
+            bool complete = true;
+            for (unsigned i = 0; i < 15; ++i) {
+                const auto &d = chip.descriptors[start + i].words;
+                if (d[2] != candidate + i * 10240 || d[3] != 320 || d[4] != 0x1025151) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                address = candidate;
+                found = true;
+                break;
+            }
         }
+        if (!found) return;
         auto raw = chip.copy_out(address, 320 * 240 * 2);
         std::vector<u8> rgb;
         rgb.reserve(320 * 240 * 3);
@@ -133,6 +163,8 @@ struct VideoCore::Impl {
             return;
         owner.pixels_ = std::move(rgb);
         ++owner.pixel_revision_;
+        if (!owner.capture_)
+            return;
         std::ostringstream label;
         label << "native-api-" << std::setfill('0') << std::setw(6) << sequence << "-RGB565";
         vc2::write_rgb_png(output / (label.str() + ".png"), 320, 240, owner.pixels_);
@@ -153,17 +185,18 @@ struct VideoCore::Impl {
         chip.copy_in(ring + producer, packets.first(first));
         chip.copy_in(ring, packets.subspan(first));
         chip.write(host + 4, (producer + static_cast<u32>(packets.size())) % 0x6000);
-        std::ofstream log(output / "native-packets.bin", std::ios::binary | std::ios::app);
-        log.write(reinterpret_cast<const char *>(packets.data()),
-                  static_cast<std::streamsize>(packets.size()));
-        if (!log)
-            throw std::runtime_error("Cannot write VC2 packet capture");
+        if (owner.capture_) {
+            std::ofstream log(output / "native-packets.bin", std::ios::binary | std::ios::app);
+            log.write(reinterpret_cast<const char *>(packets.data()),
+                      static_cast<std::streamsize>(packets.size()));
+            if (!log) throw std::runtime_error("Cannot write VC2 packet capture");
+        }
         // RetailOS 0x10275028 publishes the producer block, then writes
         // 0xa5a50002 to VC address 0x10000400. Resuming after sleep models
         // its observed purpose; the register's hardware semantics remain
         // provisional. RenderServer does not enable the VMCS host IRQ here.
         chip.r[31] += 2;
-        bool ok = chip.run();
+        bool ok = chip.run(kSubmissionInstructionLimit);
         for (unsigned i = 0; i < 512 && ok &&
                              (chip.dma_busy() || chip.read(device + 4) != chip.read(host + 4)); ++i) {
             chip.advance(100);
@@ -176,7 +209,7 @@ struct VideoCore::Impl {
             // Resume only through a pending, unmasked hardware interrupt.
             // The firmware itself acknowledges events and advances its queues.
             if (chip.sleeping && chip.interrupt(chip.r[31] + 2))
-                ok = chip.run();
+                ok = chip.run(kSubmissionInstructionLimit);
         }
         capture_pixels();
         if (!ok)
@@ -189,14 +222,6 @@ struct VideoCore::Impl {
         for (unsigned i = 0; i < 4; ++i)
             endian::store_le<u32>(reinterpret_cast<std::byte *>(bytes.data() + 4 * i), words[i]);
         send(bytes);
-    }
-    void finish(u32 marker = 0) {
-        api.flush();
-        if (++completion == 0) ++completion;
-        if (!marker) marker = completion;
-        packet({9, marker, 0, 0});
-        if (chip.read(device) != marker)
-            throw std::runtime_error("VC2 completion is pending");
     }
     u32 call(u32 ordinal, HleCallFrame &frame) {
         ++sequence;
@@ -229,24 +254,23 @@ struct VideoCore::Impl {
                 throw std::runtime_error("Invalid render-server output pointers");
             // RetailOS API 152 clears the graphics state and restores its
             // defaults after opening the render service (0x100cdb88).
-            api.reset();
+            api.reset(frame);
             return 1;
         }
         case 153:
             // RetailOS closes the service only after glFinish acknowledges
             // its completion marker, not merely after submitting the batch.
-            finish();
+            api.finish();
             started = false;
             return 1;
         case 41:
-            finish();
+            api.finish();
             return 0;
         case 42:
             api.flush();
             return 0;
         case 157:
-            api.queue({6, 0, 0, 0});
-            finish(0x40000000 | (sequence & 0x3fffffff));
+            api.call(ordinal, frame);
             ++owner.frames_;
             return 1;
         default: {
@@ -256,9 +280,24 @@ struct VideoCore::Impl {
         }
         }
     }
-    void failure() {
+    void failure(const HleCallFrame *frame = nullptr) {
+        if (!owner.capture_) return;
         std::ofstream report(output / "native-failure.txt");
         report << owner.error_ << "\nVC PC 0x" << std::hex << chip.r[31] << "\n";
+        if (frame) {
+            report << "ARM fault PC 0x" << frame->cpu.pc() << ", LR 0x" << frame->cpu.lr()
+                   << ", SP 0x" << frame->cpu.sp() << "\nArgument words at fault:";
+            ArgReader args(frame->cpu, frame->memory);
+            for (unsigned i = 0; i < 12; ++i) {
+                const u32 value = args.next_u32();
+                if (!args.ok()) {
+                    report << " [unmapped]";
+                    break;
+                }
+                report << " 0x" << value;
+            }
+            report << "\n";
+        }
         report << "Recent instruction PCs:";
         const u64 first = chip.recent_pc_count > chip.recent_pcs.size() ? chip.recent_pc_count - chip.recent_pcs.size() : 0;
         for (u64 i = first; i < chip.recent_pc_count; ++i)
@@ -275,6 +314,15 @@ struct VideoCore::Impl {
             report << "r" << std::dec << i << "=0x" << std::hex << chip.r[i] << "\n";
         report << "Instructions " << std::dec << chip.instructions << ", DMA words "
                << chip.dma_words << "\n";
+        report << "API sequence " << sequence << ", VC timer " << chip.timer << "\n";
+        report << "Vector lanes: lane acc acclo Z N C unknown-carry\n";
+        for (unsigned i = 0; i < chip.acc.size(); ++i)
+            report << std::dec << i << " " << chip.acc[i] << " 0x" << std::hex << chip.acclo[i]
+                   << std::dec << " " << chip.vz[i] << " " << chip.vn[i] << " " << chip.vc[i]
+                   << " " << chip.unknown_carry[i] << "\n";
+        std::ofstream vrf(output / "native-vrf.bin", std::ios::binary);
+        vrf.write(reinterpret_cast<const char *>(chip.vrf.data()),
+                  static_cast<std::streamsize>(chip.vrf.size()));
         report << "Sleeping " << chip.sleeping << ", DMA busy " << chip.dma_busy()
                << ", VC error: " << chip.error << "\n";
         if (started)
@@ -288,7 +336,7 @@ struct VideoCore::Impl {
         }
     }
 };
-VideoCore::VideoCore() = default;
+VideoCore::VideoCore(bool capture) : capture_(capture) {}
 VideoCore::~VideoCore() = default;
 bool VideoCore::initialize() {
     if (!error_.empty())
@@ -305,7 +353,7 @@ bool VideoCore::call(u32 ordinal, HleCallFrame &frame) {
         success = true;
     } catch (const std::exception &e) {
         error_ = "OpenGLES#" + std::to_string(ordinal) + ": " + e.what();
-        if (impl_) impl_->failure();
+        if (impl_) impl_->failure(&frame);
     }
     // Keep partial firmware output visible when execution stops on a fault.
     if (!pixels_.empty() && (pixel_revision_ != published_revision_ || ordinal == 157)) {

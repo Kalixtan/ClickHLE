@@ -14,7 +14,7 @@ struct HleCallFrame;
 // and native HLE packet-building state for the lifetime of a loaded game.
 class VideoCore {
   public:
-    VideoCore();
+    explicit VideoCore(bool capture = false);
     ~VideoCore();
     VideoCore(const VideoCore &) = delete;
     VideoCore &operator=(const VideoCore &) = delete;
@@ -29,6 +29,7 @@ class VideoCore {
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    bool capture_ = false;
     bool initialize();
     std::string error_;
     std::vector<u8> pixels_; // RGB8, in increasing framebuffer address order.

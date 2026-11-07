@@ -76,6 +76,11 @@ add_library(clickhle_core
     src/audio/audio_decoder.cpp
     src/video/videocore.cpp
     src/video/graphics_api.cpp
+    src/video/graphics_state.cpp
+    src/video/graphics_buffers.cpp
+    src/video/graphics_readback.cpp
+    src/video/graphics_overlay.cpp
+    src/video/graphics_uniforms.cpp
     src/video/graphics_math.cpp
     src/video/graphics_draw.cpp
     src/video/graphics_programs.cpp

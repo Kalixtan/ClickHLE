@@ -22,4 +22,5 @@ RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRM
 can override that path; games may also supply their own image.
 Built-in pipeline programs also need locally extracted VC2 records (not distributed).
 Unsupported APIs and instructions stop execution, and games are not yet expected to render
-correctly. Diagnostic PNGs and packets go to `work/vc2` (or `CLICKHLE_VC2_OUTPUT`).
+correctly. Normal play writes no diagnostic captures. Headless tests can opt in with
+`--headless --capture-videocore`; captures go to `work/vc2` (or `CLICKHLE_VC2_OUTPUT`).

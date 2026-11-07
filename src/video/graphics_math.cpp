@@ -1,10 +1,46 @@
 #include "graphics_api.h"
 #include "clickhle/common/endian.h"
 #include "clickhle/hle/call_frame.h"
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
 namespace clickhle {
+namespace {
+i32 fixed_sine(u32 angle) {
+    // The 257 retail samples equal floor(4096*sin(i*pi/512)), with the
+    // endpoint clamped to 4095. Linear interpolation uses eight fraction bits.
+    static const auto table = [] {
+        std::array<i32, 257> values{};
+        for (unsigned i = 0; i < values.size(); ++i)
+            values[i] = std::min(4095, static_cast<int>(4096 * std::sin(i * 0x1.921fb54442d18p+1 / 512)));
+        return values;
+    }();
+    const u32 index = (angle >> 16) & 1023;
+    u32 fraction = (angle >> 8) & 255;
+    i32 first, second;
+    if (index < 256) { first = table[index]; second = table[index + 1]; }
+    else if (index < 512) {
+        first = table[511 - index]; second = table[512 - index]; fraction = 256 - fraction;
+    } else if (index < 768) { first = -table[index - 512]; second = -table[index - 511]; }
+    else { first = -table[1023 - index]; second = -table[1024 - index]; fraction = 256 - fraction; }
+    return (first * static_cast<i32>(256 - fraction) + second * static_cast<i32>(fraction)) >> 4;
+}
+u32 fixed_root(u32 value) {
+    // 0x10120e78 starts from a sign-extended, 32-bit (value << 8),
+    // rounds the integer root, then scales the result by sixteen.
+    const i32 scaled = static_cast<i32>(value << 8);
+    if (scaled <= 0) return 0;
+    u32 remainder = static_cast<u32>(scaled), root = 0;
+    for (u32 bit = 1u << 30; bit; bit >>= 2) {
+        if (remainder >= root + bit) { remainder -= root + bit; root = (root >> 1) + bit; }
+        else root >>= 1;
+    }
+    if (remainder > root) ++root;
+    return root << 4;
+}
+} // namespace
+
 u32 GraphicsApi::matrix(u32 ordinal, HleCallFrame &frame, const std::array<u32, 16> &a) {
     using Matrix = std::array<u32, 16>;
     const auto read = [&](u32 address) {
@@ -43,6 +79,48 @@ u32 GraphicsApi::matrix(u32 ordinal, HleCallFrame &frame, const std::array<u32, 
         out[15] = 0x3f800000;
         write(out);
         return 0x3f800000;
+    }
+    if (ordinal == 168) {
+        // Perspective uses double precision for tan(fov/2), then rounds the
+        // cotangent to float. Host tan remains a numerical approximation to
+        // the retail polynomial; this is not a bit-exact transcendental port.
+        const double half_angle = static_cast<double>(f(a[1])) * 0.5 * 0x1.1df46a0000000p-6;
+        const float cotangent = static_cast<float>(1.0 / std::tan(half_angle));
+        const float reciprocal_depth = 1.0f / (f(a[3]) - f(a[4]));
+        out[0] = bits(cotangent / f(a[2]));
+        out[5] = bits(cotangent);
+        out[10] = bits((f(a[4]) + f(a[3])) * reciprocal_depth);
+        out[11] = 0xbf800000;
+        out[14] = bits(((f(a[4]) * 2.0f) * f(a[3])) * reciprocal_depth);
+        write(out);
+        return out[14];
+    }
+    if (ordinal == 174) {
+        const u32 angle = fixed_mul(a[1], 0x2d82d);
+        const u32 sine = static_cast<u32>(fixed_sine(angle));
+        const u32 cosine = static_cast<u32>(fixed_sine(angle + 0x1000000));
+        const u32 length = fixed_root(fixed_mul(a[2], a[2]) + fixed_mul(a[3], a[3]) + fixed_mul(a[4], a[4]));
+        if (!length) throw std::runtime_error("Invalid fixed rotation axis");
+        // Preserve the retail scaling bug: its 64-bit numerator is 0x10000,
+        // not 0x100000000, and the quotient is then shifted right by sixteen.
+        const u32 reciprocal = static_cast<u32>((uint64_t(0x10000) / length) >> 16);
+        const u32 x = fixed_mul(a[2], reciprocal), y = fixed_mul(a[3], reciprocal), z = fixed_mul(a[4], reciprocal);
+        const u32 xx = fixed_mul(x, x), yy = fixed_mul(y, y), zz = fixed_mul(z, z), t = 0x10000 - cosine;
+        const u32 xy = fixed_mul(fixed_mul(y, t), x), yz = fixed_mul(fixed_mul(z, t), y), zx = fixed_mul(fixed_mul(x, t), z);
+        const u32 xs = fixed_mul(x, sine), ys = fixed_mul(y, sine), zs = fixed_mul(z, sine);
+        const std::array<u32, 9> rotation{
+            fixed_mul(0x10000-xx, cosine)+xx, xy+zs, zx-ys,
+            xy-zs, fixed_mul(0x10000-yy, cosine)+yy, yz+xs,
+            zx+ys, yz-xs, fixed_mul(0x10000-zz, cosine)+zz};
+        out = read(a[0]);
+        for (unsigned row = 0; row < 4; ++row) {
+            const u32 first = out[row], second = out[row+4], third = out[row+8];
+            for (unsigned column = 0; column < 3; ++column)
+                out[row+column*4] = fixed_mul(first, rotation[column*3]) +
+                    fixed_mul(second, rotation[column*3+1]) + fixed_mul(third, rotation[column*3+2]);
+        }
+        write(out);
+        return out[11];
     }
     if (ordinal == 169 || ordinal == 170 || ordinal == 171 || ordinal == 172) {
         out = read(a[0]);

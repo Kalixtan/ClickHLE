@@ -522,7 +522,9 @@ private:
 
     void advanceFrame() {
         if (!emulator_) return;
-        constexpr u64 kGuiInstructionBudget = 10'000'000;
+        // Loading callbacks can convert whole textures on the ARM CPU.
+        // Keep a finite guard, with room for the verified loading paths.
+        constexpr u64 kGuiInstructionBudget = 50'000'000;
         const clickhle::RunResult result =
             emulator_->run_game_frame(kGuiInstructionBudget);
         int width = 0;
