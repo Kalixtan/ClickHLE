@@ -45,6 +45,7 @@ struct Operation {
     u32 next_pc = 0;
     bool immediate_source = false;
     bool stack_load = false;
+    bool memory_load = false;
     bool nop = false;
     bool branch = false;
     bool register_branch = false;
@@ -185,6 +186,10 @@ std::optional<Operation> decode_extended(u16 word, u16 second, u32 pc) {
             .destination = static_cast<unsigned>(word & 15),
             .left = static_cast<unsigned>((word >> 4) & 15),
             .immediate = static_cast<u32>(sign_extend(second, 16)), .immediate_source = true};
+    if ((word & 0xfc00) == 0x2800 && ((word >> 8) & 3) == 0 && !(second & 3))
+        return Operation{.word = word, .destination = static_cast<unsigned>(word & 15),
+            .source = static_cast<unsigned>((word >> 4) & 15),
+            .immediate = static_cast<u32>(sign_extend(second, 16)), .memory_load = true};
     if ((word & 0xfff0) == 0x2d40 && !(second & 3))
         return Operation{.word = word, .destination = static_cast<unsigned>(word & 15),
             .immediate = second, .stack_load = true};
@@ -222,6 +227,12 @@ struct Block {
     std::array<u16, 64> words{};
     unsigned length = 0;
     unsigned stack_read_bytes = 0;
+    struct MemoryRead {
+        unsigned base;
+        u32 offset;
+    };
+    std::array<MemoryRead, 32> memory_reads{};
+    unsigned memory_read_count = 0;
     unsigned repeats = 1;
     unsigned predicate = 0;
     bool dynamic_repeats = false;
@@ -779,6 +790,16 @@ struct Jit::Impl {
         for (const Operation &op : block.operations) {
             values[31] = build.getInt32(op.guest_pc ? op.guest_pc : block.pc);
             if (op.nop) continue;
+            if (op.memory_load) {
+                auto *address = build.CreateAdd(load(op.source), build.getInt32(op.immediate));
+                auto *mirrored = build.CreateICmpUGE(address, build.getInt32(0xfe000000));
+                auto *offset = build.CreateSelect(mirrored,
+                    build.CreateAdd(build.CreateSub(address, build.getInt32(0xfe000000)),
+                                    build.getInt32(0x2000000)), address);
+                auto *data_pointer = build.CreateGEP(build.getInt8Ty(), function->getArg(1), offset);
+                store(op.destination, build.CreateAlignedLoad(i32, data_pointer, llvm::Align(1)));
+                continue;
+            }
             if (op.stack_load) {
                 auto *offset = build.CreateAdd(load(25), build.getInt32(op.immediate));
                 auto *address = build.CreateGEP(build.getInt8Ty(), function->getArg(1), offset);
@@ -1725,7 +1746,8 @@ struct Jit::Impl {
             entry.block = &inserted->second;
             return execute(core, inserted->second, limit);
         }
-        if ((first_word & 0xfc00) == 0x2800 && pc + 4 <= 0x4000000) {
+        if ((first_word & 0xfc00) == 0x2800 && pc + 4 <= 0x4000000 &&
+            !(((first_word >> 8) & 3) == 0 && !(core.read(pc + 2, 2) & 3))) {
             static constexpr unsigned widths[] = {4, 4, 2, 2, 1, 1, 2, 1};
             const u16 second = static_cast<u16>(core.read(pc + 2, 2));
             unsigned op = (first_word >> 8) & 3;
@@ -2132,6 +2154,7 @@ struct Jit::Impl {
         block.pc = pc;
         Rejection rejected_words;
         bool changes_stack = false;
+        std::array<bool, 32> written_registers{};
         for (unsigned i = 0; i < std::min(limit, 32u); ++i) {
             const u32 address = pc + 2 * block.length;
             if (address >= 0x4000000) break;
@@ -2147,6 +2170,13 @@ struct Jit::Impl {
                 break;
             }
             if (block.length + words > block.words.size()) break;
+            if (op->memory_load) {
+                // Preflight every address against the entry register state.
+                // A base changed earlier in the region needs an in-code guard.
+                if (written_registers[op->source]) break;
+                block.memory_reads[block.memory_read_count++] =
+                    {op->source, op->immediate};
+            }
             if (op->stack_load) {
                 if (changes_stack) break;
                 block.stack_read_bytes = std::max(block.stack_read_bytes, op->immediate + 4);
@@ -2158,6 +2188,8 @@ struct Jit::Impl {
             block.words[block.length++] = word;
             if (words == 2) block.words[block.length++] = static_cast<u16>(core.read(address + 2, 2));
             block.operations.push_back(*op);
+            if (!op->branch && !op->nop)
+                written_registers[op->destination] = true;
             if (op->branch) break;
         }
         if (block.operations.empty()) {
@@ -2466,6 +2498,12 @@ struct Jit::Impl {
                 run_vector();
             }
             return 1;
+        }
+        for (unsigned i = 0; i < block.memory_read_count; ++i) {
+            const auto &read = block.memory_reads[i];
+            const u32 address = core.r[read.base] + read.offset;
+            if ((address & 3) || (address > core.ram_.size() - 4 &&
+                (address < 0xfe000000 || address > 0xfe400000 - 4))) return 0;
         }
         if (block.stack_read_bytes) {
             const u32 sp = core.r[25];
