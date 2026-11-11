@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <ctime>
 #include <cstdlib>
+#include <cstring>
+#include <optional>
 #include <stdexcept>
 
 namespace clickhle::vc2 {
@@ -248,16 +250,53 @@ void Core::progress_dma() {
                 unsigned cost = std::max(1u, t.unit / 4);
                 while (t.active && budget >= cost) {
                     unsigned width = std::min(t.unit, 4u);
-                    for (unsigned i = 0; i < t.unit; i += width) {
-                        u32 v = read(t.source + i, width);
-                        write(t.destination + (t.increment ? i : 0), v, width);
-                        ++dma_words;
+                    u32 copies = 0;
+                    if (t.increment && t.unit && !(t.unit % width) &&
+                        !((t.source | t.destination) & (width - 1)) &&
+                        t.column < t.columns) {
+                        const u64 available = std::min<u64>({t.columns - t.column,
+                            budget / cost, ram_.size() / t.unit});
+                        const u64 length = available * t.unit;
+                        auto backing = [&](u32 address) -> std::optional<u32> {
+                            if (length <= ram_.size() && address <= ram_.size() - length)
+                                return address;
+                            if (address >= 0xfe000000 && length <= 0x400000 &&
+                                address <= 0xfe400000 - length)
+                                return address - 0xfe000000 + 0x2000000;
+                            return std::nullopt;
+                        };
+                        if (length && length <= 0xffffffffu) {
+                            const auto source = backing(t.source);
+                            const auto destination = backing(t.destination);
+                            if (source && destination &&
+                                (*source + length <= *destination ||
+                                 *destination + length <= *source)) {
+                                bool watched = false;
+                                for (u32 page = *destination >> 12;
+                                     page <= (*destination + length - 1) >> 12; ++page)
+                                    watched |= code_page_watched_[page];
+                                if (!watched) {
+                                    std::memcpy(ram_.data() + *destination,
+                                        ram_.data() + *source, length);
+                                    copies = static_cast<u32>(available);
+                                    dma_words += available * (t.unit / width);
+                                }
+                            }
+                        }
                     }
-                    t.source += t.unit;
+                    if (!copies) {
+                        for (unsigned i = 0; i < t.unit; i += width) {
+                            u32 v = read(t.source + i, width);
+                            write(t.destination + (t.increment ? i : 0), v, width);
+                            ++dma_words;
+                        }
+                        copies = 1;
+                    }
+                    t.source += t.unit * copies;
                     if (t.increment)
-                        t.destination += t.unit;
-                    ++t.column;
-                    budget -= cost;
+                        t.destination += t.unit * copies;
+                    t.column += copies;
+                    budget -= static_cast<u64>(cost) * copies;
                     if (t.column == t.columns) {
                         t.column = 0;
                         ++t.row;
