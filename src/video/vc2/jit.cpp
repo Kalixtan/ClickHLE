@@ -41,6 +41,8 @@ struct Operation {
     unsigned destination = 0;
     unsigned left = 0;
     unsigned source = 0;
+    unsigned memory_index = 7;
+    unsigned memory_slot = 0;
     u32 immediate = 0;
     u32 next_pc = 0;
     bool immediate_source = false;
@@ -116,6 +118,11 @@ std::optional<Operation> decode(u16 word, u32 pc) {
                          .destination = static_cast<unsigned>(word & 15),
                          .left = 25, .immediate = 4u * static_cast<u32>((word >> 8) & 31),
                          .immediate_source = true};
+    if ((word & 0xc000) == 0x8000 && ((word >> 8) & 7) == 0)
+        return Operation{.word = word, .destination = static_cast<unsigned>(word & 15),
+                         .source = static_cast<unsigned>((word >> 4) & 15),
+                         .memory_index = static_cast<unsigned>((word >> 11) & 7),
+                         .memory_load = true};
     if ((word & 0xf000) == 0x6000) {
         const unsigned opcode = 2 * ((word >> 9) & 15);
         const unsigned destination = word & 15;
@@ -143,7 +150,7 @@ std::optional<Operation> decode(u16 word, u32 pc) {
 
 using NativeVectorRegion = void (*)(u8 *, const u32 *, bool *, bool *, bool *);
 using NativeIndexedH16 = void (*)(u8 *, const u8 *, u32, const std::int64_t *, const u32 *, u32, u32);
-using NativeBlock = void (*)(u32 *, const u8 *);
+using NativeBlock = void (*)(u32 *, const u8 *, const u32 *);
 using NativeAddress = u32 (*)(u32 *);
 using NativeFillLoop = void (*)(u32 *, u8 *, u32);
 using NativeMove = void (*)(u8 *, u32, u32);
@@ -229,6 +236,7 @@ struct Block {
     unsigned stack_read_bytes = 0;
     struct MemoryRead {
         unsigned base;
+        unsigned index;
         u32 offset;
     };
     std::array<MemoryRead, 32> memory_reads{};
@@ -376,7 +384,28 @@ struct Jit::Impl {
                 std::cerr << "pc=0x" << std::hex << item.first << std::dec
                           << " sampled_ns=" << item.second.nanoseconds
                           << " samples=" << item.second.samples
-                          << " kind=" << (block == blocks.end() ? -1 : static_cast<int>(block->second.kind)) << '\n';
+                          << " kind=" << (block == blocks.end() ? -1 : static_cast<int>(block->second.kind));
+                if (block != blocks.end()) {
+                    const auto &compiled = block->second;
+                    std::cerr << " words=";
+                    if (compiled.kind == Block::Kind::Scalar && !compiled.length) {
+                        for (const auto &op : compiled.operations)
+                            std::cerr << std::hex << op.word << ',';
+                    } else {
+                        for (unsigned word = 0; word < compiled.length; ++word)
+                            std::cerr << std::hex << compiled.words[word] << ',';
+                    }
+                    std::cerr << std::dec;
+                    if (compiled.kind == Block::Kind::BinaryVector)
+                        std::cerr << " predicate=" << compiled.predicate
+                                  << " repeats=" << compiled.repeats
+                                  << " dynamic=" << compiled.dynamic_repeats
+                                  << " widths=" << compiled.destination.width << '/'
+                                  << compiled.source.width << '/' << compiled.right.width
+                                  << " vertical=" << compiled.destination.vertical << '/'
+                                  << compiled.source.vertical << '/' << compiled.right.vertical;
+                }
+                std::cerr << '\n';
             }
         }
         if (!profile) return;
@@ -655,9 +684,12 @@ struct Jit::Impl {
                 build.CreateAnd(build.CreateAdd(base, column), 63));
         };
         for (const auto &plan : plans) {
-            auto *kernel_type = plan.setf
-                ? llvm::FunctionType::get(build.getVoidTy(), {pointer, i32, i32, i32, pointer, pointer, pointer}, false)
-                : llvm::FunctionType::get(build.getVoidTy(), {pointer, i32, i32, i32}, false);
+            const unsigned opcode = (plan.words[0] & 511) >> 3;
+            const bool carry = opcode == 34 || opcode == 35;
+            llvm::SmallVector<llvm::Type *, 7> parameters = {pointer, i32, i32, i32};
+            if (plan.setf) parameters.append(3, pointer);
+            else if (carry) parameters.push_back(pointer);
+            auto *kernel_type = llvm::FunctionType::get(build.getVoidTy(), parameters, false);
             auto *kernel = llvm::Function::Create(kernel_type, llvm::Function::InternalLinkage, "lanes", module.get());
             kernel->addFnAttr(llvm::Attribute::AlwaysInline);
             llvm::IRBuilder<> lanes(llvm::BasicBlock::Create(*context, "entry", kernel));
@@ -665,7 +697,8 @@ struct Jit::Impl {
             if (plan.setf)
                 emit_add_flags_simd(lanes, *kernel, plan.modes.lowcarry && plan.modes.carry_operands);
             else
-                emit_horizontal_simd(lanes, *kernel, (plan.words[0] & 511) >> 3, widths);
+                emit_horizontal_simd(lanes, *kernel, opcode, widths, false,
+                    carry ? kernel->getArg(4) : nullptr);
             // Admission requires 16-byte aligned columns. Adding the column
             // bank preserves alignment, so neither byte plane can wrap.
             lanes.CreateUnreachable();
@@ -673,6 +706,8 @@ struct Jit::Impl {
                 function->getArg(0), offset(plan.d), offset(plan.a), offset(plan.b)};
             if (plan.setf)
                 for (unsigned arg = 2; arg < 5; ++arg) arguments.push_back(function->getArg(arg));
+            else if (carry)
+                arguments.push_back(function->getArg(4));
             build.CreateCall(kernel, arguments);
         }
         build.CreateRetVoid();
@@ -693,7 +728,8 @@ struct Jit::Impl {
             const unsigned op = (first & 511) >> 3;
             switch (op) {
             case 4: case 8: case 9: case 10: case 11: case 12: case 13: case 14:
-            case 16: case 17: case 18: case 26: case 27: case 28: case 29: case 30: case 37: break;
+            case 16: case 17: case 18: case 26: case 27: case 28: case 29: case 30:
+            case 34: case 35: case 37: break;
             default: return plans.size() >= 2 ? finish_vector_region(core, block, plans) : false;
             }
             std::array<u32, 5> words{};
@@ -708,7 +744,12 @@ struct Jit::Impl {
             };
             const bool supported_flags = op == 8 && plan.d.width == 2 &&
                 plan.a.width == 2 && plan.b.width == 2;
-            if (plan.length != length || plan.count != 1 || plan.bkind || (plan.setf && !supported_flags) ||
+            const bool supported_carry = op == 34 ? !plan.setf && plan.modes.highcarry &&
+                    plan.modes.carry_operands
+                : op == 35 ? !plan.setf && plan.modes.highborrow &&
+                    plan.modes.carry_operands : true;
+            if (plan.length != length || plan.count != 1 || plan.bkind || !supported_carry ||
+                (plan.setf && !supported_flags) ||
                 plan.pred || plan.clear || plan.accumulate || plan.x15 || plan.sreg != 7 ||
                 !contiguous_operand(plan.d) || !contiguous_operand(plan.a) || !contiguous_operand(plan.b)) break;
             plan.words = words;
@@ -739,7 +780,7 @@ struct Jit::Impl {
         auto *i32 = llvm::Type::getInt32Ty(*context);
         auto *pointer = llvm::PointerType::getUnqual(i32);
         auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
-                                              {pointer, pointer}, false);
+                                              {pointer, pointer, pointer}, false);
         const std::string name = "vc2_block_" + std::to_string(next_symbol++);
         auto *function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
                                                  name, module.get());
@@ -791,11 +832,9 @@ struct Jit::Impl {
             values[31] = build.getInt32(op.guest_pc ? op.guest_pc : block.pc);
             if (op.nop) continue;
             if (op.memory_load) {
-                auto *address = build.CreateAdd(load(op.source), build.getInt32(op.immediate));
-                auto *mirrored = build.CreateICmpUGE(address, build.getInt32(0xfe000000));
-                auto *offset = build.CreateSelect(mirrored,
-                    build.CreateAdd(build.CreateSub(address, build.getInt32(0xfe000000)),
-                                    build.getInt32(0x2000000)), address);
+                auto *offset_pointer = build.CreateInBoundsGEP(i32, function->getArg(2),
+                    build.getInt32(op.memory_slot));
+                auto *offset = build.CreateLoad(i32, offset_pointer);
                 auto *data_pointer = build.CreateGEP(build.getInt8Ty(), function->getArg(1), offset);
                 store(op.destination, build.CreateAlignedLoad(i32, data_pointer, llvm::Align(1)));
                 continue;
@@ -1251,8 +1290,10 @@ struct Jit::Impl {
                 build.CreateShl(build.CreateZExt(high, i16), 8));
             return (modifiers & 336) ? build.CreateZExt(word, i64) : build.CreateSExt(word, i64);
         };
-        if (layout == 0 && (modifiers & ~128u) == 0)
-            emit_horizontal_simd(build, *function, opcode, widths, modifiers & 128);
+        const bool carry_simd = (opcode == 34 || opcode == 35) && modifiers == 64;
+        if (layout == 0 && ((modifiers & ~128u) == 0 || carry_simd))
+            emit_horizontal_simd(build, *function, opcode, widths,
+                modifiers & 128, carry_simd ? function->getArg(9) : nullptr);
         std::array<llvm::Value *, 16> values{}, shifted_carry{};
         for (unsigned lane = 0; lane < 16; ++lane) {
             llvm::Value *a = opcode == 4 ? llvm::ConstantInt::get(i64, 0)
@@ -1824,7 +1865,8 @@ struct Jit::Impl {
         // their base register; offset and indexed forms leave it alone.
         if ((first_word & 0xf800) == 0x7800 ||
              (first_word & 0xf800) == 0x7000 ||
-             (first_word & 0xc000) == 0x8000 ||
+             ((first_word & 0xc000) == 0x8000 &&
+              ((first_word >> 8) & 7) != 0) ||
              ((first_word & 0xe000) == 0xe000 &&
               (first_word & 0xff00) != 0xe000 &&
               (first_word & 0xff00) != 0xf000) ||
@@ -2173,9 +2215,11 @@ struct Jit::Impl {
             if (op->memory_load) {
                 // Preflight every address against the entry register state.
                 // A base changed earlier in the region needs an in-code guard.
-                if (written_registers[op->source]) break;
+                if (written_registers[op->source] ||
+                    (op->memory_index != 7 && written_registers[op->memory_index])) break;
+                op->memory_slot = block.memory_read_count;
                 block.memory_reads[block.memory_read_count++] =
-                    {op->source, op->immediate};
+                    {op->source, op->memory_index, op->immediate};
             }
             if (op->stack_load) {
                 if (changes_stack) break;
@@ -2499,11 +2543,15 @@ struct Jit::Impl {
             }
             return 1;
         }
+        std::array<u32, 32> memory_offsets;
         for (unsigned i = 0; i < block.memory_read_count; ++i) {
             const auto &read = block.memory_reads[i];
-            const u32 address = core.r[read.base] + read.offset;
+            const u32 address = core.r[read.base] + read.offset +
+                (read.index == 7 ? 0 : 4 * core.r[read.index]);
             if ((address & 3) || (address > core.ram_.size() - 4 &&
                 (address < 0xfe000000 || address > 0xfe400000 - 4))) return 0;
+            memory_offsets[i] = address >= 0xfe000000
+                ? address - 0xfe000000 + 0x2000000 : address;
         }
         if (block.stack_read_bytes) {
             const u32 sp = core.r[25];
@@ -2525,7 +2573,7 @@ struct Jit::Impl {
             for (unsigned i = 0; i < block.operations.size(); ++i)
                 core.recent_pcs[core.recent_pc_count++ % core.recent_pcs.size()] =
                     block.operations[i].guest_pc ? block.operations[i].guest_pc : block.pc + 2 * i;
-            block.native(core.r.data(), core.ram_.data());
+            block.native(core.r.data(), core.ram_.data(), memory_offsets.data());
             if (core.r != expected_regs || core.recent_pcs != expected_pcs ||
                 core.recent_pc_count != expected_count)
                 throw std::runtime_error("VC2 JIT/interpreter mismatch at PC " +
@@ -2534,7 +2582,7 @@ struct Jit::Impl {
             for (unsigned i = 0; i < block.operations.size(); ++i)
                 core.recent_pcs[core.recent_pc_count++ % core.recent_pcs.size()] =
                     block.operations[i].guest_pc ? block.operations[i].guest_pc : block.pc + 2 * i;
-            block.native(core.r.data(), core.ram_.data());
+            block.native(core.r.data(), core.ram_.data(), memory_offsets.data());
         }
         return static_cast<unsigned>(block.operations.size());
     }

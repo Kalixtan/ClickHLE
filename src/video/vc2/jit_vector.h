@@ -9,14 +9,17 @@ namespace clickhle::vc2 {
 // halfword uses two byte planes; crossing either plane's row boundary must
 // retain the general wrapping path. LLVM legalizes these vectors for the host.
 inline void emit_horizontal_simd(llvm::IRBuilder<> &build, llvm::Function &function,
-                                 unsigned opcode, unsigned widths, bool broadcast = false) {
+                                 unsigned opcode, unsigned widths, bool broadcast = false,
+                                 llvm::Value *carry_flags = nullptr) {
     switch (opcode) {
     case 4: case 8: case 9: case 10: case 11: case 12: case 13: case 14:
-    case 16: case 17: case 18: case 26: case 27: case 28: case 29: case 30: case 37:
+    case 16: case 17: case 18: case 26: case 27: case 28: case 29: case 30:
+    case 34: case 35: case 37:
         break;
     default:
         return;
     }
+    if ((opcode == 34 || opcode == 35) && !carry_flags) return;
     auto &context = function.getContext();
     auto *i8 = build.getInt8Ty();
     auto *i32 = build.getInt32Ty();
@@ -64,6 +67,9 @@ inline void emit_horizontal_simd(llvm::IRBuilder<> &build, llvm::Function &funct
     };
     llvm::Value *a = opcode == 4 ? constant(0) : load(left, widths & 2);
     auto *b = broadcast ? build.CreateVectorSplat(16, right) : load(right, widths & 4);
+    llvm::Value *carry = nullptr;
+    if (opcode == 34 || opcode == 35)
+        carry = build.CreateZExt(build.CreateAlignedLoad(bytes, carry_flags, llvm::Align(1)), lanes);
     llvm::Value *value = nullptr;
     switch (opcode) {
     case 4: value = b; break;
@@ -88,6 +94,8 @@ inline void emit_horizontal_simd(llvm::IRBuilder<> &build, llvm::Function &funct
         value = build.CreateSelect(build.CreateICmpSGE(a, b),
                                     build.CreateSub(a, b), build.CreateSub(b, a));
         break;
+    case 34: value = build.CreateAdd(build.CreateAdd(a, b), carry); break;
+    case 35: value = build.CreateSub(build.CreateSub(a, b), carry); break;
     }
     if (opcode == 9 || opcode == 11 || opcode == 13 || opcode == 17) {
         auto *minimum = constant((widths & 1) ? -32768 : 0);
