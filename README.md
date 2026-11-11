@@ -15,11 +15,17 @@ The command-line program is `build/bin/clickhle`. When Qt 6 Widgets is available
 `build/bin/clickhle-gui`. Unicorn Engine 2 is required at runtime; SDL3 adds window, input, and audio support. Dependencies, game images, firmware, and reference assets are not bundled. See
 [LICENSING.md](LICENSING.md) for dependency notes.
 
-Graphics use a native C++ VideoCore II interpreter running original firmware. Native HLE builds
+Graphics use a native C++ VideoCore II core running original firmware. The LLVM JIT is the
+default when available; the interpreter can be selected with `--vc2-engine interpreter` or under
+Options → VideoCore Engine in the GUI when LLVM is available at build time. Instructions the
+JIT cannot yet compile run in the interpreter. Native HLE builds
 its command packets; games do not execute RetailOS ARM code or require `osos.bin`. Both frontends
 display the raw framebuffer, with no shader replacement or Python runtime. Place the game
 RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRMWARE`
 can override that path; games may also supply their own image.
+The JIT keeps compiled objects in the user cache (`~/.cache/clickhle/vc2` on Linux).
+Set `CLICKHLE_VC2_CACHE_DIR` to choose another folder, or to an empty string to
+disable disk caching. Deleting the folder clears the cache.
 Built-in pipeline programs also need locally extracted VC2 records (not distributed).
 Unsupported APIs and instructions stop execution, and games are not yet expected to render
 correctly. Normal play writes no diagnostic captures. Headless tests can opt in with

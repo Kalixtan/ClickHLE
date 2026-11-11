@@ -27,13 +27,10 @@ void fail(std::string* error, std::string message) {
 
 /// The ABI hash RetailOS publishes for each framework.
 ///
-/// Every title in the corpus carries the same hash per framework, so there is
-/// no versioning to design for -- and that is exactly why a mismatch matters.
-/// The ordinals are positions in an interface; a different interface version
-/// means slot 137 is a different function, and every implementation here would
-/// silently be answering the wrong call. That is the "wrong answer that works"
-/// failure this project keeps running into, so an unknown ABI is refused rather
-/// than warned about.
+/// These hashes describe the framework versions implemented by ClickHLE.
+/// Some games also ship executables for other iPod platforms with different
+/// framework sizes and hashes. Their ordinal positions cannot be assumed to
+/// match this version, so an unknown ABI is refused rather than guessed.
 ///
 /// Values cross-checked against the LLE track's reading of the table inside
 /// RetailOS's own image; both sides agree.
@@ -210,10 +207,15 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
             const auto known = known_abi_hashes().find(block.name);
             if (known != known_abi_hashes().end() &&
                 block.hash != known->second) {
-                fail(error, "'" + block.name + "' has ABI hash " + block.hash +
-                                ", not the " + known->second +
-                                " every known title uses; its ordinals would "
-                                "mean something else");
+                std::string message = "unsupported '" + block.name +
+                    "' ABI: hash " + block.hash + " (" +
+                    std::to_string(count) + " imports); ClickHLE supports " +
+                    known->second;
+                const auto size = known_framework_sizes().find(block.name);
+                if (size != known_framework_sizes().end())
+                    message += " (" + std::to_string(size->second) + " imports)";
+                message += ". This executable may target another iPod platform";
+                fail(error, std::move(message));
                 return std::nullopt;
             }
             const auto size = known_framework_sizes().find(block.name);
@@ -370,7 +372,8 @@ std::optional<EappImage> EappImage::load_file(const std::filesystem::path& path,
     return parse(data, error);
 }
 
-bool EappImage::map_into(AddressSpace& memory, std::string* error) const {
+bool EappImage::map_into(AddressSpace& memory, GuestAddr arena_end,
+                         std::string* error) const {
     if (raw_.empty()) {
         fail(error, "no image to map");
         return false;
@@ -380,12 +383,10 @@ bool EappImage::map_into(AddressSpace& memory, std::string* error) const {
     // pointer table sits inside the image, so the whole thing has to be
     // writable for binding to patch it.
     //
-    // Rounded up to a page, and that is not cosmetic. The file ends where its
-    // initialised data ends; a game's zero-initialised statics live directly
-    // above it and are not stored. Tetris writes to image_top + 0 within
-    // eighteen instructions of entry. Mapping exactly size bytes leaves that
-    // write in the gap below the next page boundary and faults immediately.
-    // Rounding to a page is nowhere near enough, and this was a real bug.
+    // The file ends where its initialised data ends; zero-initialised statics
+    // continue above it. Keep the image and arena in one host region: a guest
+    // read may cross the page boundary between them. Two adjacent regions
+    // look contiguous to the ARM CPU but host_ptr() cannot span both buffers.
     //
     // The zero-initialised statics above the file are not a few bytes; they are
     // the whole BSS, and titles reach a long way into it:
@@ -399,15 +400,16 @@ bool EappImage::map_into(AddressSpace& memory, std::string* error) const {
     // completion mechanisms all produced one fault at one instruction. They
     // were not three bugs; they were three routes to the same unmapped load.
     //
-    // 4 MB of BSS, which is generous against the largest observed need and
-    // costs nothing but address space in a 32-bit guest map.
     const auto size = static_cast<u32>(raw_.size());
-    const u32 mapped = (size + 0xFFFu) & ~0xFFFu;
+    const u64 minimum_end = eapp::kImageBase +
+                            ((static_cast<u64>(size) + 0xFFFu) & ~0xFFFull);
+    const u64 end = std::max<u64>(arena_end, minimum_end);
+    const u32 mapped = static_cast<u32>(end - eapp::kImageBase);
     if (!memory.map(eapp::kImageBase, mapped,
                     AddressSpace::kRead | AddressSpace::kWrite |
                         AddressSpace::kExec,
-                    "image")) {
-        fail(error, "failed to map the image at 0x18000000");
+                    "image-and-arena")) {
+        fail(error, "failed to map the image and arena at 0x18000000");
         return false;
     }
     if (!memory.write_bytes(eapp::kImageBase, raw_.data(), size)) {

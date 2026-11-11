@@ -3,14 +3,23 @@ cmake_minimum_required(VERSION 3.20)
 project(ClickHLE
     VERSION 0.1.0
     DESCRIPTION "An iPod click-wheel game emulator"
-    LANGUAGES CXX)
+    LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND
+   NOT DEFINED CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT clickhle_ipo_supported OUTPUT clickhle_ipo_error)
+    if(clickhle_ipo_supported)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
+    endif()
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
@@ -99,6 +108,21 @@ target_link_libraries(clickhle_core PRIVATE clickhle_flags)
 
 # Unicorn is dynamically loaded from the host system at runtime.
 target_link_libraries(clickhle_core PRIVATE ${CMAKE_DL_LIBS})
+
+# Native VC2 translation is optional; the interpreter remains available on
+# hosts without LLVM and is the reference backend for debugging.
+option(CLICKHLE_WITH_VC2_JIT "Build the optional VC2 JIT backend" ON)
+if(CLICKHLE_WITH_VC2_JIT)
+    find_package(LLVM 16 QUIET CONFIG)
+    if(LLVM_FOUND AND TARGET LLVM)
+        target_sources(clickhle_core PRIVATE src/video/vc2/jit.cpp src/video/vc2/jit_cache.cpp)
+        target_include_directories(clickhle_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+        target_link_libraries(clickhle_core PRIVATE LLVM)
+        target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_VC2_JIT=1)
+    else()
+        message(STATUS "LLVM 16 not found; VC2 JIT disabled")
+    endif()
+endif()
 
 target_compile_definitions(clickhle_core PUBLIC
     CLICKHLE_CPU_BACKEND_DEFAULT="${CLICKHLE_CPU_BACKEND}")

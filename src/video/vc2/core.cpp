@@ -1,9 +1,12 @@
 
 #include "core.h"
+#if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
+#include "jit.h"
+#endif
 #include <algorithm>
 #include <bit>
+#include <cstring>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -49,11 +52,43 @@ void Core::copy_in(u32 a, std::span<const u8> b) {
     if (b.empty())
         return;
     const auto offset = ram_address(a, static_cast<u32>(b.size()));
+    const u32 last_page = (offset + static_cast<u32>(b.size()) - 1) >> 12;
+    for (u32 page = offset >> 12; page <= last_page; ++page)
+        if (code_page_watched_[page])
+            ++code_page_generation_[page];
     std::copy(b.begin(), b.end(), ram_.begin() + offset);
 }
 std::vector<u8> Core::copy_out(u32 a, u32 n) const {
     const auto offset = ram_address(a, n);
     return {ram_.begin() + offset, ram_.begin() + offset + n};
+}
+bool Core::read_ram16(u32 address, std::array<u8, 16> &bytes) const noexcept {
+    u32 offset;
+    if (address <= ram_.size() - bytes.size())
+        offset = address;
+    else if (address >= 0xfe000000 && address <= 0xfe400000 - bytes.size())
+        offset = address - 0xfe000000 + 0x2000000;
+    else
+        return false;
+    std::memcpy(bytes.data(), ram_.data() + offset, bytes.size());
+    return true;
+}
+bool Core::write_ram16(u32 address, const std::array<u8, 16> &bytes) noexcept {
+    u32 offset;
+    if (address <= ram_.size() - bytes.size())
+        offset = address;
+    else if (address >= 0xfe000000 && address <= 0xfe400000 - bytes.size())
+        offset = address - 0xfe000000 + 0x2000000;
+    else
+        return false;
+    const u32 first = offset >> 12;
+    const u32 last = (offset + 15) >> 12;
+    const u32 first_bytes = std::min<u32>(16, 0x1000 - (offset & 0xfff));
+    if (code_page_watched_[first]) code_page_generation_[first] += first_bytes;
+    if (last != first && code_page_watched_[last])
+        code_page_generation_[last] += 16 - first_bytes;
+    std::memcpy(ram_.data() + offset, bytes.data(), bytes.size());
+    return true;
 }
 u32 Core::alu(unsigned op, u32 a, u32 b) {
     const unsigned shift = b & 31;
@@ -133,10 +168,10 @@ u32 Core::alu(unsigned op, u32 a, u32 b) {
         throw std::runtime_error("Unsupported VC2 scalar ALU operation " + std::to_string(op));
     }
 }
-void Core::step() {
+void Core::step(std::optional<u16> prefetched) {
     const u32 pc = r[31];
     recent_pcs[recent_pc_count++ % recent_pcs.size()] = pc;
-    const u32 h = read(pc, 2);
+    const u32 h = prefetched ? *prefetched : read(pc, 2);
     u32 next = pc + 2;
     auto word = [&](unsigned index) { return read(pc + 2 * index, 2); };
     auto target = [&](u32 v, unsigned bits, unsigned scale = 2) {
@@ -406,12 +441,41 @@ bool Core::run(u64 budget) {
     sleeping = false;
     error.clear();
     try {
-        for (u64 n = 0; n < budget; ++n) {
-            step();
-            ++instructions;
+#if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
+        if (jit_enabled_ && !jit_) jit_ = std::make_shared<Jit>();
+#else
+        if (jit_enabled_)
+            throw std::runtime_error("VC2 JIT was not built on this host");
+#endif
+        for (u64 n = 0;;) {
+            unsigned executed = 0;
+            std::optional<u16> fetched;
+#if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
+            if (jit_enabled_ && jit_ && r[31] < 0x4000000 && !(r[31] & 1)) {
+                fetched = static_cast<u16>(read(r[31], 2));
+                const auto remaining = 32 - (n & 31);
+                executed = jit_->try_execute(*this, static_cast<unsigned>(remaining), *fetched);
+                jit_instructions += executed;
+                jit_executions += executed != 0;
+            }
+#endif
+            if (!executed) {
+                step(fetched);
+                executed = 1;
+            }
+            instructions += executed;
+            n += executed;
             if (sleeping)
                 return true;
-            if ((n & 31) == 31) {
+            bool budget_return = false;
+            if (n >= budget && recent_pc_count) {
+                const u32 last_pc = recent_pcs[(recent_pc_count - 1) % recent_pcs.size()];
+                const u32 last = read(last_pc, 2);
+                // RET and a stack restore including PC are the supported
+                // function-return forms. A loop backedge is not a return.
+                budget_return = last == 0x4430 || (last & 0xff80) == 0xe080;
+            }
+            if ((n & 31) == 0) {
                 time_fraction_ += 32;
                 if (time_fraction_ >= 100) {
                     advance(time_fraction_ / 100);
@@ -419,8 +483,9 @@ bool Core::run(u64 budget) {
                 }
                 interrupt(r[31]);
             }
+            if (budget_return)
+                throw std::runtime_error("VC2 instruction budget exhausted at function return");
         }
-        throw std::runtime_error("VC2 instruction budget exhausted");
     } catch (const std::exception &e) {
         std::ostringstream out;
         out << e.what() << " at 0x" << std::hex << r[31];

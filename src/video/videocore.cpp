@@ -5,10 +5,12 @@
 #include "vc2/png.h"
 #include "graphics_api.h"
 #include <algorithm>
+#include <ctime>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <iterator>
 #include <sstream>
 #include <stdexcept>
@@ -23,6 +25,15 @@
 
 namespace clickhle {
 namespace {
+struct CpuTimer {
+    double *total;
+    std::clock_t start;
+    explicit CpuTimer(double *value) : total(value), start(value ? std::clock() : 0) {}
+    ~CpuTimer() {
+        if (total) *total += static_cast<double>(std::clock() - start) / CLOCKS_PER_SEC;
+    }
+};
+
 std::vector<u8> read_file(const std::filesystem::path &path) {
     std::ifstream file(path, std::ios::binary);
     if (!file)
@@ -74,6 +85,24 @@ struct VideoCore::Impl {
     static constexpr u32 kSubmissionInstructionLimit = 4'000'000;
     u32 next_display_sync = 0;
     std::filesystem::path output;
+    bool timing = std::getenv("CLICKHLE_VC2_TIMING") != nullptr;
+    double boot_cpu = 0, send_cpu = 0, run_cpu = 0, pixels_cpu = 0;
+    double run_compile_cpu = 0;
+    u64 send_count = 0;
+    u64 pixel_scans = 0, complete_frames = 0, changed_frames = 0;
+    u64 last_complete_sequence = 0, last_changed_sequence = 0;
+    u64 last_scene_sequence = 0, last_scene_pixels = 0;
+    std::size_t maximum_descriptors = 0;
+    u64 trace_from = [] {
+        if (const char *value = std::getenv("CLICKHLE_VC2_TRACE_FROM"))
+            return std::strtoull(value, nullptr, 0);
+        return 0ull;
+    }();
+    u32 current_ordinal = 0;
+
+    bool tracing() const {
+        return trace_from && sequence >= trace_from && sequence < trace_from + 200;
+    }
 
     explicit Impl(VideoCore &instance) : owner(instance), api(
         [this](std::span<const u8> bytes) { send(bytes); },
@@ -94,9 +123,41 @@ struct VideoCore::Impl {
         if (!packets)
             throw std::runtime_error("Cannot create VC2 packet capture");
     }
+    ~Impl() {
+        if (!timing) return;
+        std::cerr << "VC2 CPU seconds: boot=" << boot_cpu
+                  << " send=" << send_cpu << " run=" << run_cpu
+                  << " run excluding compilation=" << run_cpu - run_compile_cpu
+                  << " compilation=" << run_compile_cpu
+                  << " pixels=" << pixels_cpu << ", submissions=" << send_count
+                  << ", instructions=" << chip.instructions
+                  << ", JIT instructions=" << chip.jit_instructions
+                  << ", JIT executions=" << chip.jit_executions
+                  << ", DMA words=" << chip.dma_words
+                  << ", DMA CPU seconds=" << chip.dma_cpu_seconds
+                  << ", DMA passes=" << chip.dma_passes
+                  << ", JIT materializations=" << chip.jit_compilations
+                  << ", JIT setup wall us=" << chip.jit_compile_us << '\n';
+        std::cerr << "VC2 pixels: scans=" << pixel_scans
+                  << ", complete=" << complete_frames
+                  << ", changed=" << changed_frames
+                  << ", max descriptors=" << maximum_descriptors
+                  << ", last complete sequence=" << last_complete_sequence
+                  << ", last change sequence=" << last_changed_sequence
+                  << ", last scene sequence=" << last_scene_sequence
+                  << ", last scene pixels=" << last_scene_pixels << '\n';
+    }
+    bool run_chip(u64 budget = 2'000'000) {
+        CpuTimer timer(timing ? &run_cpu : nullptr);
+        const double compile_before = chip.jit_compile_cpu;
+        const bool result = chip.run(budget);
+        run_compile_cpu += chip.jit_compile_cpu - compile_before;
+        return result;
+    }
     void boot() {
         if (started)
             return;
+        CpuTimer timer(timing ? &boot_cpu : nullptr);
         if (firmware.empty())
             firmware = read_file(default_firmware_path());
         if (firmware.size() < 0x206 || firmware.size() > 0x140000 || firmware.size() % 4)
@@ -104,10 +165,11 @@ struct VideoCore::Impl {
         // Upload bytes to VC SRAM and execute the firmware entry. Host-port
         // cache/clock setup is abstracted by HLE, not replayed as ARM code.
         chip.load(firmware);
+        chip.set_jit_enabled(owner.engine_ == VideoCoreEngine::Jit);
         // The game-image loader clears readiness after uploading the image.
         // Only executing the new firmware may publish a ready state.
         chip.write(0x1f8, 0);
-        if (!chip.run()) throw std::runtime_error(chip.error);
+        if (!run_chip()) throw std::runtime_error(chip.error);
         if (chip.read(0x1f8) != 1)
             throw std::runtime_error("VC2 firmware readiness handshake failed");
         device = chip.read(0xc0000000);
@@ -124,6 +186,11 @@ struct VideoCore::Impl {
                << "Host transport and panel timing remain HLE fixtures.\n";
     }
     void capture_pixels() {
+        CpuTimer timer(timing ? &pixels_cpu : nullptr);
+        if (timing) {
+            ++pixel_scans;
+            maximum_descriptors = std::max(maximum_descriptors, chip.descriptors.size());
+        }
         if (chip.descriptors.size() < 15)
             return;
         // A submission may upload textures before writing the framebuffer.
@@ -149,6 +216,10 @@ struct VideoCore::Impl {
             }
         }
         if (!found) return;
+        if (timing) {
+            ++complete_frames;
+            last_complete_sequence = sequence;
+        }
         auto raw = chip.copy_out(address, 320 * 240 * 2);
         std::vector<u8> rgb;
         rgb.reserve(320 * 240 * 3);
@@ -161,6 +232,20 @@ struct VideoCore::Impl {
         }
         if (rgb == owner.pixels_)
             return;
+        if (timing) {
+            ++changed_frames;
+            last_changed_sequence = sequence;
+            u64 scene_pixels = 0;
+            for (std::size_t pixel = 16 * 320; pixel < 320 * 240; ++pixel) {
+                const auto offset = pixel * 3;
+                scene_pixels += rgb[offset] || rgb[offset + 1] || rgb[offset + 2];
+            }
+            if (last_scene_pixels && !scene_pixels)
+                std::cerr << "VC2 scene became blank at sequence " << sequence
+                          << ", ordinal " << current_ordinal << '\n';
+            last_scene_pixels = scene_pixels;
+            if (scene_pixels) last_scene_sequence = sequence;
+        }
         owner.pixels_ = std::move(rgb);
         ++owner.pixel_revision_;
         if (!owner.capture_)
@@ -175,7 +260,20 @@ struct VideoCore::Impl {
     void send(std::span<const u8> packets) {
         if (packets.empty())
             return;
+        CpuTimer timer(timing ? &send_cpu : nullptr);
+        ++send_count;
         boot();
+        const auto before_instructions = chip.instructions;
+        const auto before_dma = chip.dma_words;
+        if (tracing()) {
+            std::cerr << "VC2 packet seq=" << sequence << " ordinal=" << current_ordinal
+                      << " bytes=" << packets.size();
+            for (unsigned i = 0; i < 4 && 4 * (i + 1) <= packets.size(); ++i)
+                std::cerr << " word" << i << "=0x" << std::hex
+                          << endian::load_le<u32>(reinterpret_cast<const std::byte *>(
+                              packets.data() + 4 * i)) << std::dec;
+            std::cerr << '\n';
+        }
         if (!chip.sleeping || chip.read(chip.r[31], 2) != 0x4330)
             throw std::runtime_error("VC2 is not idle");
         u32 consumer = chip.read(device + 4), producer = chip.read(host + 4);
@@ -196,7 +294,7 @@ struct VideoCore::Impl {
         // its observed purpose; the register's hardware semantics remain
         // provisional. RenderServer does not enable the VMCS host IRQ here.
         chip.r[31] += 2;
-        bool ok = chip.run(kSubmissionInstructionLimit);
+        bool ok = run_chip(kSubmissionInstructionLimit);
         for (unsigned i = 0; i < 512 && ok &&
                              (chip.dma_busy() || chip.read(device + 4) != chip.read(host + 4)); ++i) {
             chip.advance(100);
@@ -209,9 +307,15 @@ struct VideoCore::Impl {
             // Resume only through a pending, unmasked hardware interrupt.
             // The firmware itself acknowledges events and advances its queues.
             if (chip.sleeping && chip.interrupt(chip.r[31] + 2))
-                ok = chip.run(kSubmissionInstructionLimit);
+                ok = run_chip(kSubmissionInstructionLimit);
         }
         capture_pixels();
+        if (tracing())
+            std::cerr << "VC2 result seq=" << sequence
+                      << " instructions=" << chip.instructions - before_instructions
+                      << " DMA words=" << chip.dma_words - before_dma
+                      << " descriptors=" << chip.descriptors.size()
+                      << " scene pixels=" << last_scene_pixels << '\n';
         if (!ok)
             throw std::runtime_error(chip.error);
         if (chip.read(device + 4) != chip.read(host + 4))
@@ -225,6 +329,17 @@ struct VideoCore::Impl {
     }
     u32 call(u32 ordinal, HleCallFrame &frame) {
         ++sequence;
+        current_ordinal = ordinal;
+        if (tracing()) {
+            std::cerr << "VC2 call seq=" << sequence << " ordinal=" << ordinal;
+            ArgReader snapshot(frame.cpu, frame.memory);
+            for (unsigned i = 0; i < 4; ++i) {
+                const auto value = snapshot.next_u32();
+                if (!snapshot.ok()) break;
+                std::cerr << " arg" << i << "=0x" << std::hex << value << std::dec;
+            }
+            std::cerr << '\n';
+        }
         chip.descriptors.clear();
         switch (ordinal) {
         case 164: {
@@ -313,7 +428,9 @@ struct VideoCore::Impl {
         for (unsigned i = 0; i < 32; ++i)
             report << "r" << std::dec << i << "=0x" << std::hex << chip.r[i] << "\n";
         report << "Instructions " << std::dec << chip.instructions << ", DMA words "
-               << chip.dma_words << "\n";
+               << chip.dma_words << ", JIT instructions "
+               << chip.jit_instructions << ", JIT materializations " << chip.jit_compilations
+               << ", JIT setup time (us) " << chip.jit_compile_us << "\n";
         report << "API sequence " << sequence << ", VC timer " << chip.timer << "\n";
         report << "Vector lanes: lane acc acclo Z N C\n";
         for (unsigned i = 0; i < chip.acc.size(); ++i)
@@ -335,8 +452,20 @@ struct VideoCore::Impl {
         }
     }
 };
-VideoCore::VideoCore(bool capture) : capture_(capture) {}
+bool videocore_jit_available() noexcept {
+#if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
+    return true;
+#else
+    return false;
+#endif
+}
+VideoCore::VideoCore(bool capture, VideoCoreEngine engine)
+    : capture_(capture), engine_(engine) {}
 VideoCore::~VideoCore() = default;
+void VideoCore::set_engine(VideoCoreEngine engine) {
+    engine_ = engine;
+    if (impl_) impl_->chip.set_jit_enabled(engine == VideoCoreEngine::Jit);
+}
 bool VideoCore::initialize() {
     if (!error_.empty())
         return false;

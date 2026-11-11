@@ -512,9 +512,9 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
     execute_vector(w, length, decoded);
 }
 
-Core::VectorDecode Core::decode_vector(const std::array<u32, 5> &w, unsigned length) const {
+VectorPlan Core::decode_vector(const std::array<u32, 5> &w, unsigned length) const {
     const unsigned op9 = w[0] & 511, op = op9 >> 3, select = (op9 >> 1) & 3;
-    VectorDecode decoded;
+    VectorPlan decoded;
     auto &[words, decoded_length, d, a, b, count, pred, sru, sreg, scalar,
            setf, clear, accumulate, x15, bkind, immediate, modes] = decoded;
     if (length == 5) {
@@ -770,7 +770,7 @@ Core::VectorDecode Core::decode_vector(const std::array<u32, 5> &w, unsigned len
 }
 
 void Core::execute_vector(const std::array<u32, 5> &w, unsigned length,
-                          const VectorDecode &decoded) {
+                          const VectorPlan &decoded) {
     const unsigned op = (w[0] & 511) >> 3;
     const auto &[words, decoded_length, d, a, b, count, pred, sru, sreg, scalar,
            setf, clear, accumulate, x15, bkind, immediate, modes] = decoded;

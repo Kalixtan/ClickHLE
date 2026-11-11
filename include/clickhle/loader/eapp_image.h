@@ -170,7 +170,7 @@ public:
     /// because the import pointer tables live inside it and have to be writable
     /// for the thunk addresses to be patched in, exactly as the firmware
     /// patches them with real ones.
-    [[nodiscard]] bool map_into(AddressSpace& memory,
+    [[nodiscard]] bool map_into(AddressSpace& memory, GuestAddr arena_end,
                                 std::string* error = nullptr) const;
 
     /// Vectors the header declares. Five in every image seen, but the format

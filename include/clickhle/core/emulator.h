@@ -55,6 +55,7 @@ public:
 
         // Opt-in disk capture for headless reverse-engineering runs.
         bool capture_videocore = false;
+        VideoCoreEngine videocore_engine = VideoCoreEngine::Interpreter;
 
         /// Empty means the backend chosen at configure time.
         std::string cpu_backend;
@@ -500,6 +501,7 @@ public:
     [[nodiscard]] std::string load_state(const std::filesystem::path& path);
     [[nodiscard]] Display& display() noexcept { return *display_; }
     [[nodiscard]] VideoCore* videocore() noexcept { return videocore_.get(); }
+    void set_videocore_engine(VideoCoreEngine engine);
 
     /// Host audio output.
     ///

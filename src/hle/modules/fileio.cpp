@@ -77,7 +77,7 @@ bool store_guest_or_stop(HleCallFrame& frame, GuestAddr address, T value) {
 /// established by the DogParty project's reversing and reused here as facts.
 /// None of their code is copied; see LICENSING.md section 5.
 namespace request {
-constexpr u32 kOperation = 0x04;   ///< byte: 3 = read, 4 = WRITE, 5 = seek
+constexpr u32 kOperation = 0x04;   ///< byte: 3 = read, 4 = write, 5 = seek, 8 = remove
 constexpr u32 kFileObject = 0x08;  ///< the game's file object
 constexpr u32 kSeekOffset = 0x0C;
 constexpr u32 kSeekWhence = 0x10;  ///< byte: 0 set, 1 current, 2 end
@@ -681,6 +681,38 @@ void register_fileio(HleRegistry& registry) {
         f.emulator.queue_io_completion(req, path);
         // 1 means the composite request was accepted. Its status and byte
         // count are delivered through the request completion.
+        f.ret(1);
+    });
+
+    // #5 queues opcode 8: remove a path. The RetailOS wrapper checks all
+    // three inputs before enqueueing; the worker writes its result to +0x20.
+    // The host VFS confines removal to saves so dumped game assets stay intact.
+    registry.add(kModule, 5, "afio_remove", 3, [](HleCallFrame& f) {
+        const u32 mode = f.args.next_u32() & 0xffu;
+        const GuestAddr path_address = f.args.next_ptr();
+        const GuestAddr req = f.args.next_ptr();
+        const auto operation = f.memory.read<u8>(req + request::kOperation);
+        if (!operation.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (mode == 0 || path_address == 0 || *operation != 8) {
+            f.ret(0);
+            return;
+        }
+        const auto path = read_path_strict(f, path_address);
+        if (!path.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        const bool removed = f.emulator.vfs().remove_saved(*path);
+        // The firmware's filesystem method returns a status word. The exact
+        // missing-path code is not established; success is zero.
+        if (!store_guest_or_stop(f, req + request::kStatus,
+                                 removed ? 0u : kFailure)) return;
+        CLICKHLE_INFO(kCategory) << "remove(\"" << *path << "\") "
+                                 << (removed ? "ok" : "failed");
+        f.emulator.queue_io_completion(req, *path);
         f.ret(1);
     });
 

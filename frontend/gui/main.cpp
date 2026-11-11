@@ -290,6 +290,8 @@ public:
 
         QSettings settings;
         restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
+        if (settings.value(QStringLiteral("video/engine")).toString() == QStringLiteral("interpreter"))
+            interpreter_action_->setChecked(true);
         recent_games_ = settings.value(QStringLiteral("games/recent")).toStringList();
         rebuildRecentMenu();
         updateActions();
@@ -348,6 +350,9 @@ protected:
         QSettings settings;
         settings.setValue(QStringLiteral("window/geometry"), saveGeometry());
         settings.setValue(QStringLiteral("games/recent"), recent_games_);
+        settings.setValue(QStringLiteral("video/engine"),
+                          jit_action_->isChecked() ? QStringLiteral("jit")
+                                                   : QStringLiteral("interpreter"));
         QMainWindow::closeEvent(event);
     }
 
@@ -399,6 +404,23 @@ private:
         connect(integer_scale_action_, &QAction::toggled, canvas_,
                 [this](bool checked) { canvas_->setIntegerScaling(checked); });
 
+        auto* engine_actions = new QActionGroup(this);
+        engine_actions->setExclusive(true);
+        interpreter_action_ = new QAction(tr("Interpreter"), engine_actions);
+        jit_action_ = new QAction(tr("JIT"), engine_actions);
+        interpreter_action_->setCheckable(true);
+        jit_action_->setCheckable(true);
+        const bool jit_available = clickhle::videocore_jit_available();
+        interpreter_action_->setChecked(!jit_available);
+        jit_action_->setChecked(jit_available);
+        jit_action_->setEnabled(jit_available);
+        connect(interpreter_action_, &QAction::triggered, this, [this] {
+            if (emulator_) emulator_->set_videocore_engine(clickhle::VideoCoreEngine::Interpreter);
+        });
+        connect(jit_action_, &QAction::triggered, this, [this] {
+            if (emulator_) emulator_->set_videocore_engine(clickhle::VideoCoreEngine::Jit);
+        });
+
         about_action_ = new QAction(tr("About ClickHLE"), this);
         connect(about_action_, &QAction::triggered, this, [this] {
             QMessageBox::about(this, tr("About ClickHLE"),
@@ -424,6 +446,9 @@ private:
 
         QMenu* options = bar->addMenu(tr("Options"));
         options->addAction(integer_scale_action_);
+        QMenu* video_engine = options->addMenu(tr("VideoCore Engine"));
+        video_engine->addAction(interpreter_action_);
+        video_engine->addAction(jit_action_);
 
         QMenu* emulation = bar->addMenu(tr("Emulation"));
         emulation->addAction(pause_action_);
@@ -465,7 +490,7 @@ private:
         cpu_view_ = new QPlainTextEdit;
         cpu_view_->setReadOnly(true);
         cpu_view_->setMinimumSize(320, 280);
-        makeTool(tr("CPU Registers & Disassembly"), cpu_view_);
+        cpu_dock_ = makeTool(tr("CPU Registers & Disassembly"), cpu_view_);
 
         auto* memory_panel = new QWidget;
         auto* memory_layout = new QVBoxLayout(memory_panel);
@@ -499,7 +524,7 @@ private:
         auto* videocore_control_layout = new QHBoxLayout(videocore_controls);
         videocore_control_layout->setContentsMargins(0, 0, 0, 0);
         videocore_trace_enabled_ = new QCheckBox(tr("Trace render-server calls"));
-        videocore_trace_enabled_->setChecked(true);
+        videocore_trace_enabled_->setChecked(false);
         videocore_pause_on_call_ = new QCheckBox(tr("Pause after a call"));
         auto* clear_videocore = new QPushButton(tr("Clear"), videocore_controls);
         videocore_control_layout->addWidget(videocore_trace_enabled_);
@@ -509,7 +534,7 @@ private:
         videocore_layout->addWidget(videocore_controls);
         auto* videocore_note = new QLabel(
             tr("Watches ARM calls at the OpenGLES render-server boundary. "
-               "VideoCore instructions are not executed by this emulator."),
+               "Enable tracing only when inspecting a game."),
             videocore_panel);
         videocore_note->setWordWrap(true);
         videocore_layout->addWidget(videocore_note);
@@ -550,7 +575,7 @@ private:
         map_view_ = new QPlainTextEdit;
         map_view_->setReadOnly(true);
         map_view_->setMinimumSize(360, 280);
-        makeTool(tr("Memory Map"), map_view_);
+        map_dock_ = makeTool(tr("Memory Map"), map_view_);
 
         log_view_ = new QPlainTextEdit;
         log_view_->setReadOnly(true);
@@ -580,6 +605,8 @@ private:
             reinterpret_cast<const char8_t*>(encoded_path.constData());
         config.executable = std::filesystem::path(std::u8string(
             path_bytes, static_cast<std::size_t>(encoded_path.size())));
+        config.videocore_engine = jit_action_->isChecked()
+            ? clickhle::VideoCoreEngine::Jit : clickhle::VideoCoreEngine::Interpreter;
         std::string error;
         if (!next->load(std::move(config), &error)) {
             const QString reason = QString::fromStdString(error);
@@ -617,7 +644,9 @@ private:
         canvas_->setMessage({});
         statusBar()->showMessage(tr("Game closed"));
         updateActions();
-        refreshTools();
+        if (cpu_dock_->isVisible() || hle_dock_->isVisible() ||
+            map_dock_->isVisible() || videocore_dock_->isVisible())
+            refreshTools();
     }
 
     void restartGame() {
@@ -661,7 +690,9 @@ private:
                          QImage::Format_RGBA8888);
             canvas_->setFrame(image.mirrored(false, true).copy());
         }
-        refreshTools();
+        if (cpu_dock_->isVisible() || hle_dock_->isVisible() ||
+            map_dock_->isVisible() || videocore_dock_->isVisible())
+            refreshTools();
         u64 frames = 0;
         u64 draws = 0;
         clickhle::gles_statistics(*emulator_, frames, draws);
@@ -720,7 +751,7 @@ private:
             videocore_detail_->setPlainText(tr("No game loaded"));
             return;
         }
-        if (const auto* cpu = emulator_->cpu()) {
+        if (const auto* cpu = emulator_->cpu(); cpu_dock_->isVisible() && cpu) {
             const auto context = cpu->save_context();
             QString text;
             for (unsigned i = 0; i < 16; ++i) {
@@ -753,37 +784,41 @@ private:
             cpu_view_->setPlainText(text);
         }
 
-        const auto coverage = emulator_->coverage();
-        QString hle = tr("HLE coverage: %1 / %2 imports\nCalls serviced: %3\n")
-                          .arg(coverage.implemented).arg(coverage.total)
-                          .arg(emulator_->hle_call_count());
-        if (!emulator_->last_missing_import().empty()) {
-            hle += tr("\nStopped at: %1\n")
-                       .arg(QString::fromStdString(emulator_->last_missing_import()));
+        if (hle_dock_->isVisible()) {
+            const auto coverage = emulator_->coverage();
+            QString hle = tr("HLE coverage: %1 / %2 imports\nCalls serviced: %3\n")
+                              .arg(coverage.implemented).arg(coverage.total)
+                              .arg(emulator_->hle_call_count());
+            if (!emulator_->last_missing_import().empty()) {
+                hle += tr("\nStopped at: %1\n")
+                           .arg(QString::fromStdString(emulator_->last_missing_import()));
+            }
+            hle += tr("\nRecent calls\n");
+            for (const std::string& call : emulator_->recent_hle_calls()) {
+                hle += QString::fromStdString(call) + QLatin1Char('\n');
+            }
+            hle_view_->setPlainText(hle);
         }
-        hle += tr("\nRecent calls\n");
-        for (const std::string& call : emulator_->recent_hle_calls()) {
-            hle += QString::fromStdString(call) + QLatin1Char('\n');
-        }
-        hle_view_->setPlainText(hle);
 
-        QString map;
-        for (const auto& region : emulator_->memory().regions()) {
-            if (!region) continue;
-            QString flags;
-            if ((region->prot & AddressSpace::kRead) != 0) flags += QLatin1Char('R');
-            if ((region->prot & AddressSpace::kWrite) != 0) flags += QLatin1Char('W');
-            if ((region->prot & AddressSpace::kExec) != 0) flags += QLatin1Char('X');
-            map += QStringLiteral("%1  +%2  %3  %4%5\n")
-                .arg(hex(region->base))
-                .arg(hex(region->size))
-                .arg(flags.leftJustified(3))
-                .arg(QString::fromStdString(region->name))
-                .arg(region->is_mirror
-                         ? tr(" → %1").arg(hex(region->mirror_source)) : QString());
+        if (map_dock_->isVisible()) {
+            QString map;
+            for (const auto& region : emulator_->memory().regions()) {
+                if (!region) continue;
+                QString flags;
+                if ((region->prot & AddressSpace::kRead) != 0) flags += QLatin1Char('R');
+                if ((region->prot & AddressSpace::kWrite) != 0) flags += QLatin1Char('W');
+                if ((region->prot & AddressSpace::kExec) != 0) flags += QLatin1Char('X');
+                map += QStringLiteral("%1  +%2  %3  %4%5\n")
+                    .arg(hex(region->base))
+                    .arg(hex(region->size))
+                    .arg(flags.leftJustified(3))
+                    .arg(QString::fromStdString(region->name))
+                    .arg(region->is_mirror
+                             ? tr(" → %1").arg(hex(region->mirror_source)) : QString());
+            }
+            map_view_->setPlainText(map);
         }
-        map_view_->setPlainText(map);
-        refreshVideoCoreEvents();
+        if (videocore_dock_->isVisible()) refreshVideoCoreEvents();
     }
 
     void refreshVideoCoreEvents() {
@@ -954,10 +989,14 @@ private:
     QAction* resume_action_ = nullptr;
     QAction* restart_action_ = nullptr;
     QAction* integer_scale_action_ = nullptr;
+    QAction* interpreter_action_ = nullptr;
+    QAction* jit_action_ = nullptr;
     QAction* about_action_ = nullptr;
     QPlainTextEdit* cpu_view_ = nullptr;
     QPlainTextEdit* memory_view_ = nullptr;
     QPlainTextEdit* hle_view_ = nullptr;
+    QDockWidget* cpu_dock_ = nullptr;
+    QDockWidget* map_dock_ = nullptr;
     QDockWidget* hle_dock_ = nullptr;
     QDockWidget* memory_dock_ = nullptr;
     QDockWidget* videocore_dock_ = nullptr;

@@ -47,8 +47,8 @@ public:
     /// assets means a corpus that quietly diverges from the one that was
     /// dumped.
     ///
-    /// Reads look in the game root first and then here, so a save that has been
-    /// written is found again; writes only ever land here.
+    /// Reads check the save area first, so a saved file shadows a shipped file;
+    /// writes only ever land here.
     void set_save_root(std::filesystem::path root);
 
     [[nodiscard]] const std::filesystem::path& save_root() const noexcept {
@@ -88,6 +88,9 @@ public:
                            bool allow_write = true);
 
     [[nodiscard]] bool close(u32 handle);
+
+    /// Remove an existing saved file or empty directory, never a game asset.
+    [[nodiscard]] bool remove_saved(const std::string& guest_path);
 
     /// Bytes read, or -1 if the handle is unknown.
     [[nodiscard]] i64 read(u32 handle, void* buffer, u32 length);

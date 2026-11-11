@@ -1,5 +1,6 @@
 #include "graphics_api.h"
 #include "clickhle/hle/call_frame.h"
+#include <sstream>
 #include <stdexcept>
 
 namespace clickhle {
@@ -82,7 +83,16 @@ u32 GraphicsApi::draw(u32 ordinal, HleCallFrame &frame, const std::array<u32, 16
             const u32 base = attribute.buffer ? buffers_[attribute.buffer].address : attribute.address;
             const uint64_t address = uint64_t(base) + uint64_t(index) * stride;
             const auto *source = address <= 0xffffffff ? frame.memory.host_ptr(static_cast<u32>(address), width) : nullptr;
-            if (!source) throw std::runtime_error("Unmapped vertex data");
+            if (!source) {
+                std::ostringstream error;
+                error << "Unmapped vertex data: attribute " << i
+                      << ", vertex " << vertex << ", index " << index
+                      << ", base 0x" << std::hex << base
+                      << ", address 0x" << address << std::dec
+                      << ", width " << width << ", stride " << stride
+                      << ", buffer " << attribute.buffer;
+                throw std::runtime_error(error.str());
+            }
             const auto *bytes = reinterpret_cast<const u8 *>(source);
             data.insert(data.end(), bytes, bytes + width);
         }

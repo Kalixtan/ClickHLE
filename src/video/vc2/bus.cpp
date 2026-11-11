@@ -1,6 +1,8 @@
 
 #include "core.h"
 #include <algorithm>
+#include <ctime>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace clickhle::vc2 {
@@ -74,6 +76,8 @@ void Core::write(u32 address, u32 value, unsigned width) {
         throw std::runtime_error("Unaligned VC2 bus write");
     if (address < ram_.size() || (address >= 0xfe000000 && address < 0xfe400000)) {
         const u32 a = ram_address(address, width);
+        if (code_page_watched_[a >> 12])
+            ++code_page_generation_[a >> 12];
         ram_[a] = static_cast<u8>(value);
         if (width >= 2)
             ram_[a + 1] = static_cast<u8>(value >> 8);
@@ -231,6 +235,9 @@ void Core::progress_dma() {
     dma_time_ = timer;
     if (!delta || !dma_busy())
         return;
+    static const bool timing = std::getenv("CLICKHLE_VC2_TIMING") != nullptr;
+    const std::clock_t started = timing ? std::clock() : 0;
+    ++dma_passes;
     progressing_ = true;
     try {
         for (unsigned ch = 0; ch < 8; ++ch)
@@ -276,5 +283,7 @@ void Core::progress_dma() {
         throw;
     }
     progressing_ = false;
+    if (timing)
+        dma_cpu_seconds += static_cast<double>(std::clock() - started) / CLOCKS_PER_SEC;
 }
 } // namespace clickhle::vc2

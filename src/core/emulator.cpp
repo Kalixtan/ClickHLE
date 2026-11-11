@@ -175,9 +175,15 @@ void fail(std::string* error, std::string message) {
 
 }  // namespace
 
+void Emulator::set_videocore_engine(VideoCoreEngine engine) {
+    config_.videocore_engine = engine;
+    if (videocore_) videocore_->set_engine(engine);
+}
+
 bool Emulator::load(Config config, std::string* error) {
     config_ = std::move(config);
-    videocore_ = std::make_unique<VideoCore>(config_.capture_videocore);
+    videocore_ = std::make_unique<VideoCore>(config_.capture_videocore,
+                                              config_.videocore_engine);
     system_clock_start_ = std::chrono::steady_clock::now();
     last_system_clock_us_ = 0;
     metadata_state_ = {};
@@ -209,7 +215,7 @@ bool Emulator::load(Config config, std::string* error) {
         return false;
     }
 
-    if (!image_->map_into(memory_, error)) {
+    if (!image_->map_into(memory_, config_.image_arena_end, error)) {
         return false;
     }
 
@@ -254,26 +260,6 @@ bool Emulator::load(Config config, std::string* error) {
                              sizeof(kLowMirrorRealBytes))) {
         fail(error, "failed to seed the low-memory mirror");
         return false;
-    }
-
-    // Working memory above the image. The firmware gives a game a contiguous
-    // arena starting after its image; nothing in the format says how big, so
-    // this is sized generously and will be tightened once an allocator export
-    // is identified.
-    {
-        const u64 image_top = static_cast<u64>(image_->image_base()) +
-                              image_->size_of_image();
-        const GuestAddr arena_start =
-            static_cast<GuestAddr>((image_top + 0xFFFu) & ~0xFFFull);
-        if (arena_start < config_.image_arena_end) {
-            const auto arena_size =
-                static_cast<u32>(config_.image_arena_end - arena_start);
-            if (!memory_.map(arena_start, arena_size, AddressSpace::kRW,
-                             "image-arena")) {
-                fail(error, "failed to map the arena above the image");
-                return false;
-            }
-        }
     }
 
     if (!memory_.map(config_.stack_base, config_.stack_size,

@@ -55,6 +55,9 @@ struct Options {
     bool plan = false;
     bool headless = false;
     bool capture_videocore = false;
+    clickhle::VideoCoreEngine videocore_engine =
+        clickhle::videocore_jit_available() ? clickhle::VideoCoreEngine::Jit
+                                           : clickhle::VideoCoreEngine::Interpreter;
     bool show_calls = false;
     std::vector<unsigned long> tracepoints;
     unsigned long profile_period = 0;
@@ -121,6 +124,7 @@ Options:
   --run                 Execute the image after loading it
   --plan                Group every import by subsystem and show what is left
   --cpu <backend>       CPU backend to use (default: build default)
+  --vc2-engine <name>   VideoCore engine: interpreter or jit
   --names <file>        Ordinal->name file, used to make reports about
                         unimplemented ordinals readable.
   --clock-hz <n>        Emulated clock rate (default 20000000). Guest time
@@ -321,6 +325,16 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (arg == "--cpu") {
             options.cpu_backend = value_for("--cpu");
             if (options.cpu_backend.empty()) return false;
+        } else if (arg == "--vc2-engine") {
+            const std::string value = value_for("--vc2-engine");
+            if (value == "jit") {
+                options.videocore_engine = clickhle::VideoCoreEngine::Jit;
+            } else if (value == "interpreter") {
+                options.videocore_engine = clickhle::VideoCoreEngine::Interpreter;
+            } else {
+                std::cerr << "--vc2-engine must be jit or interpreter\n";
+                return false;
+            }
         } else if (arg == "--scale") {
             const std::string value = value_for("--scale");
             if (value.empty()) return false;
@@ -782,6 +796,12 @@ int main(int argc, char** argv) {
         return 2;
     }
     config.capture_videocore = options.capture_videocore;
+    if (options.videocore_engine == clickhle::VideoCoreEngine::Jit &&
+        !clickhle::videocore_jit_available()) {
+        std::cerr << "VC2 JIT is unavailable in this build\n";
+        return 2;
+    }
+    config.videocore_engine = options.videocore_engine;
     config.cpu_backend = options.cpu_backend;
     if (options.clock_hz != 0) {
         config.emulated_hz = options.clock_hz;

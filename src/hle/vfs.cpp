@@ -130,12 +130,32 @@ u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write) {
             save_root_.empty() ? root_ : save_root_;
         std::string leaf = guest_path;
         std::replace(leaf.begin(), leaf.end(), '\\', '/');
-        if (leaf.find("..") != std::string::npos || leaf.front() == '/') {
+        // Guest paths are rooted at the game's virtual filesystem. A leading
+        // slash names that root, not the host root (Crystal Defenders opens
+        // "/userdata" this way). Keep all writes under the save directory.
+        const auto first = leaf.find_first_not_of('/');
+        leaf = first == std::string::npos ? std::string{} : leaf.substr(first);
+        if (leaf.empty() || leaf.find("..") != std::string::npos) {
             CLICKHLE_WARN(kCategory)
                 << "refusing to write '" << guest_path << "'";
             return 0;
         }
-        const std::filesystem::path host = base / leaf;
+        // Reuse each existing spelling in the save area. FAT treats Save.DAT
+        // and save.dat as one file, including when a parent directory differs
+        // only by case. Missing components keep the guest's spelling.
+        std::filesystem::path host = base;
+        std::size_t start = 0;
+        while (start < leaf.size()) {
+            const auto slash = leaf.find('/', start);
+            const auto part = leaf.substr(start, slash == std::string::npos
+                ? std::string::npos : slash - start);
+            if (!part.empty() && part != ".") {
+                const auto existing = find_insensitive(host, part);
+                host = existing.empty() ? host / part : existing;
+            }
+            if (slash == std::string::npos) break;
+            start = slash + 1;
+        }
         std::error_code error;
         std::filesystem::create_directories(host.parent_path(), error);
         // "r+b" keeps what is already there, which is the whole point of an
@@ -212,6 +232,19 @@ bool Vfs::close(u32 handle) {
     std::fclose(it->second.handle);
     files_.erase(it);
     return true;
+}
+
+bool Vfs::remove_saved(const std::string& guest_path) {
+    if (save_root_.empty() || guest_path.empty()) return false;
+    const auto host = resolve_under(save_root_, guest_path);
+    if (host.empty() || host == save_root_) return false;
+    std::error_code error;
+    const auto canonical = std::filesystem::weakly_canonical(host, error);
+    if (error) return false;
+    const auto relative = canonical.lexically_relative(save_root_);
+    if (relative.empty() || relative.begin() == relative.end() ||
+        *relative.begin() == "..") return false;
+    return std::filesystem::remove(host, error) && !error;
 }
 
 i64 Vfs::read(u32 handle, void* buffer, u32 length) {

@@ -202,6 +202,20 @@ void register_metadata(HleRegistry& registry) {
         f.ret(f.emulator.audio_state().registered_stream_count != 0 ? 1u : 0u);
     });
 
+    // The #62 singleton's vtable slot +8 points to 0x10190afc in the 5.5G
+    // firmware. That method returns whether object+4 is nonzero. #135 calls
+    // the slot indirectly; reading the field also covers the empty service
+    // state created above without embedding firmware code or a guest vtable.
+    fn(135, "audio_service_active", 1, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        const auto active = f.memory.read<u32>(object + 4);
+        if (!active.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret(*active != 0 ? 1u : 0u);
+    });
+
     // These setters are direct byte stores in the track-state object.
     fn(131, "set_state_flag_1a", 2, [](HleCallFrame& f) {
         const GuestAddr object = f.args.next_ptr();
@@ -260,6 +274,25 @@ void register_metadata(HleRegistry& registry) {
             return;
         }
         f.ret(0);
+    });
+
+    // FUN_10190708 enters its playlist update only when object+4 is set and
+    // object+0x1a is clear. The empty #62 service takes the early return.
+    fn(123, "playlist_update", 2, [](HleCallFrame& f) {
+        const GuestAddr object = f.args.next_ptr();
+        (void)f.args.next_u32();
+        const auto service = f.memory.read<u32>(object + 4);
+        const auto disabled = f.memory.read<u8>(object + 0x1a);
+        if (!service.has_value() || !disabled.has_value()) {
+            f.cpu.request_stop();
+            return;
+        }
+        if (*service != 0 && *disabled == 0) {
+            CLICKHLE_ERROR(kCategory) << "Metadata#123 active playlist update is not implemented";
+            f.cpu.request_stop();
+            return;
+        }
+        f.ret_void();
     });
 
     CLICKHLE_DEBUG(kCategory) << kModule << ": empty library reported";

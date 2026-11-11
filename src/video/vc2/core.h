@@ -1,9 +1,12 @@
 
 #pragma once
 #include "clickhle/common/types.h"
+#include "vector_plan.h"
 #include <array>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -18,26 +21,18 @@ struct DmaTransfer {
 struct DmaDescriptor {
     std::array<u32, 6> words;
 };
-enum class VectorKernel { General, Move, Add, Subtract, ReverseSubtract, And, Or, Complement, Multiply };
-class Core;
-struct VectorOperand {
-    u32 base = 0;
-    bool vertical = false;
-    unsigned width = 1;
-    int reg = -1;
-    bool step = false, discard = false;
-    char role = 0;
-    bool packed_columns = false;
-    u32 offset(const Core &c, unsigned k) const;
-};
+class Jit;
 
 class Core {
   public:
     Core();
     void load(std::span<const u8> image);
-    // Stops at sleep, an unsupported instruction, or the instruction budget.
+    // The instruction budget is a soft limit checked at function returns.
+    // Sleep and unsupported instructions stop immediately; hardware service
+    // points remain independent of the budget.
     bool run(u64 budget = 2'000'000);
-    void step();
+    void set_jit_enabled(bool enabled) noexcept { jit_enabled_ = enabled; }
+    void step(std::optional<u16> prefetched = std::nullopt);
     void advance(u32 microseconds);
     void set_gpio_input(unsigned pin, bool high);
     void progress_dma();
@@ -47,6 +42,8 @@ class Core {
     void write(u32 address, u32 value, unsigned width = 4);
     void copy_in(u32 address, std::span<const u8> bytes);
     std::vector<u8> copy_out(u32 address, u32 size) const;
+    bool read_ram16(u32 address, std::array<u8, 16> &bytes) const noexcept;
+    bool write_ram16(u32 address, const std::array<u8, 16> &bytes) noexcept;
     std::array<u32, 128> recent_pcs{};
     u64 recent_pc_count = 0;
     std::array<u32, 32> r{};
@@ -58,46 +55,25 @@ class Core {
     bool sleeping = false;
     std::string error;
     u64 instructions = 0, dma_words = 0;
+    u64 jit_instructions = 0;
+    u64 jit_executions = 0;
+    u64 jit_compilations = 0, jit_compile_us = 0;
+    double jit_compile_cpu = 0;
+    double dma_cpu_seconds = 0;
+    u64 dma_passes = 0;
     u32 timer = 0;
 
   private:
-    struct VectorModes {
-        bool nibble = false;
-        bool blend = false;
-        bool byte_mask = false;
-        bool texture_nibble_mask = false;
-        bool alpha_bit = false;
-        bool half_complement = false;
-        bool complement = false;
-        bool byte_or = false;
-        bool halfword_or = false;
-        bool quant_sign = false;
-        bool edge_sign = false;
-        bool nibble_or = false;
-        bool split48 = false;
-        bool split80 = false;
-        bool lowcarry = false;
-        bool lowborrow = false;
-        bool vertical_carry = false;
-        bool highcarry = false;
-        bool highborrow = false;
-        bool carry_operands = false;
-        bool filtered_byte = false;
-        VectorKernel kernel = VectorKernel::General;
-    };
-    struct VectorDecode {
-        std::array<u32, 5> words{};
-        unsigned length = 0;
-        VectorOperand d, a, b;
-        unsigned count = 1, pred = 0, sru = 0, sreg = 7, scalar = 7;
-        bool setf = false, clear = false, accumulate = false, x15 = false;
-        int bkind = 0;
-        std::int64_t immediate = 0;
-        VectorModes modes;
-    };
+    friend class Jit;
     static constexpr unsigned vector_cache_size = 1024;
-    std::vector<VectorDecode> vector_cache_ = std::vector<VectorDecode>(vector_cache_size);
+    std::vector<VectorPlan> vector_cache_ = std::vector<VectorPlan>(vector_cache_size);
+    std::shared_ptr<Jit> jit_;
+    bool jit_enabled_ = false;
     std::vector<u8> ram_;
+    // A compiled instruction is valid until a write touches one of its pages.
+    // Unwatched data pages do not pay for generation updates.
+    std::vector<u64> code_page_generation_ = std::vector<u64>(0x4000000 / 4096);
+    std::vector<u8> code_page_watched_ = std::vector<u8>(0x4000000 / 4096);
     std::map<u32, u32> registers_, reads_;
     std::array<u32, 4> compare_{};
     std::array<bool, 4> armed_{};
@@ -110,9 +86,9 @@ class Core {
     u32 ram_address(u32 address, u32 length) const;
     u32 alu(unsigned op, u32 a, u32 b);
     void vector(const std::array<u32, 5> &words, unsigned length);
-    VectorDecode decode_vector(const std::array<u32, 5> &words, unsigned length) const;
+    VectorPlan decode_vector(const std::array<u32, 5> &words, unsigned length) const;
     void execute_vector(const std::array<u32, 5> &words, unsigned length,
-                        const VectorDecode &decoded);
+                        const VectorPlan &decoded);
     void load_dma(unsigned channel, unsigned sub, u32 address);
     unsigned pending_source();
 };
