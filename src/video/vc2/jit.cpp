@@ -487,6 +487,40 @@ struct Jit::Impl {
                core.code_page_generation_[last] == versions[1];
     }
 
+    static bool vector_block(Block::Kind kind) {
+        switch (kind) {
+        case Block::Kind::VectorRegion:
+        case Block::Kind::VectorLoad:
+        case Block::Kind::RasterStore:
+        case Block::Kind::MoveH16:
+        case Block::Kind::Broadcast:
+        case Block::Kind::BinaryVector:
+        case Block::Kind::AddSetfH16:
+        case Block::Kind::IndexedH16:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    unsigned execute_cached_vector(Core &core, unsigned limit, u32 expected_pc) {
+        if (!limit || core.r[31] != expected_pc || expected_pc >= 0x4000000 ||
+            (expected_pc & 1)) return 0;
+        const auto &page = pages[expected_pc >> 12];
+        if (!page) return 0;
+        const auto &entry = page->entries[(expected_pc & 4095) >> 1];
+        const Block *block = entry.block;
+        if (!block || !vector_block(block->kind) ||
+            (block->kind == Block::Kind::VectorRegion &&
+             block->vector_pcs.size() > limit) ||
+            !code_unchanged(core, expected_pc, block->length, block->code_versions))
+            return 0;
+        const u16 word = profile ? static_cast<u16>(core.read(expected_pc, 2)) : 0;
+        const unsigned executed = execute(core, *block, limit);
+        if (profile) record(expected_pc, word, executed);
+        return executed;
+    }
+
     Impl() {
         static_assert(sizeof(bool) == 1, "VC2 JIT flag storage requires byte bools");
         if (llvm::InitializeNativeTarget() || llvm::InitializeNativeTargetAsmPrinter())
@@ -647,6 +681,87 @@ struct Jit::Impl {
             indexed_h16_resources, "indexed-h16").toPtr<NativeIndexedH16>();
     }
 
+    static void emit_plain_vector(llvm::IRBuilder<> &build, llvm::Function &function,
+                                  const VectorPlan &plan, llvm::Value *destination,
+                                  llvm::Value *left, llvm::Value *right) {
+        const unsigned opcode = (plan.words[0] & 511) >> 3;
+        auto *i8 = build.getInt8Ty();
+        auto *i16 = build.getInt16Ty();
+        auto *i64 = build.getInt64Ty();
+        auto constant = [&](std::int64_t value) { return llvm::ConstantInt::getSigned(i64, value); };
+        auto address = [&](llvm::Value *base, unsigned lane, bool vertical,
+                           unsigned plane = 0) {
+            llvm::Value *row, *column;
+            if (vertical) {
+                row = build.CreateShl(build.CreateAnd(build.CreateAdd(build.CreateLShr(base, 6),
+                    build.getInt32(lane)), build.getInt32(63)), 6);
+                column = build.CreateAnd(base, 63);
+            } else {
+                row = build.CreateAnd(base, ~63u);
+                column = build.CreateAnd(build.CreateAdd(build.CreateAnd(base, 63),
+                    build.getInt32(lane)), 63);
+            }
+            column = build.CreateAnd(build.CreateAdd(column, build.getInt32(16 * plane)), 63);
+            return build.CreateInBoundsGEP(i8, function.getArg(0), build.CreateOr(row, column));
+        };
+        auto load = [&](llvm::Value *base, unsigned lane, const VectorOperand &operand) {
+            auto *low = build.CreateLoad(i8, address(base, lane, operand.vertical));
+            if (operand.width == 1) return static_cast<llvm::Value *>(build.CreateZExt(low, i64));
+            auto *high = build.CreateLoad(i8, address(base, lane, operand.vertical, 1));
+            auto *word = build.CreateOr(build.CreateZExt(low, i16),
+                                        build.CreateShl(build.CreateZExt(high, i16), 8));
+            return static_cast<llvm::Value *>(build.CreateSExt(word, i64));
+        };
+        std::array<llvm::Value *, 16> values{};
+        for (unsigned lane = 0; lane < 16; ++lane) {
+            auto *a = opcode == 4 ? static_cast<llvm::Value *>(constant(0))
+                                  : load(left, lane, plan.a);
+            auto *b = load(right, lane, plan.b);
+            auto *shift = build.CreateAnd(b, constant(31));
+            llvm::Value *value;
+            switch (opcode) {
+            case 4: value = b; break;
+            case 5: value = build.CreateAnd(a, b); break;
+            case 6: value = build.CreateOr(a, b); break;
+            case 8: case 9: value = build.CreateAdd(a, b); break;
+            case 10: case 11: value = build.CreateSub(a, b); break;
+            case 12: case 13: value = build.CreateSub(b, a); break;
+            case 14: value = build.CreateMul(a, b); break;
+            case 16: case 17: value = build.CreateAShr(build.CreateMul(a, b), 8); break;
+            case 18: value = build.CreateAShr(build.CreateMul(a, b), 16); break;
+            case 19: value = build.CreateAShr(build.CreateMul(a, build.CreateAnd(b, constant(65535))), 16); break;
+            case 24: value = build.CreateShl(a, shift); break;
+            case 26: value = build.CreateAShr(a, shift); break;
+            case 27: value = build.CreateLShr(build.CreateAnd(a,
+                constant(plan.a.width == 2 ? 65535 : 255)), shift); break;
+            case 28: case 37:
+                value = build.CreateSelect(build.CreateICmpSLT(a, b), a, b);
+                if (opcode == 37)
+                    value = build.CreateSelect(build.CreateICmpSLT(value, constant(0)),
+                                               constant(0), value);
+                break;
+            case 29: value = build.CreateSelect(build.CreateICmpSGT(a, b), a, b); break;
+            case 30: value = build.CreateSelect(build.CreateICmpSGE(a, b),
+                build.CreateSub(a, b), build.CreateSub(b, a)); break;
+            default: throw std::runtime_error("Unsupported plain VC2 vector region operation");
+            }
+            if (opcode == 9 || opcode == 11 || opcode == 13 || opcode == 17) {
+                auto *minimum = constant(plan.d.width == 2 ? -32768 : 0);
+                auto *maximum = constant(plan.d.width == 2 ? 32767 : 255);
+                value = build.CreateSelect(build.CreateICmpSLT(value, minimum), minimum, value);
+                value = build.CreateSelect(build.CreateICmpSGT(value, maximum), maximum, value);
+            }
+            values[lane] = value;
+        }
+        for (unsigned lane = 0; lane < 16; ++lane) {
+            build.CreateStore(build.CreateTrunc(values[lane], i8),
+                address(destination, lane, plan.d.vertical));
+            if (plan.d.width == 2)
+                build.CreateStore(build.CreateTrunc(build.CreateLShr(values[lane], 8), i8),
+                    address(destination, lane, plan.d.vertical, 1));
+        }
+    }
+
     NativeVectorRegion compile_vector_region(Block &block, const std::vector<VectorPlan> &plans) {
         CompilationTimer compile_timer{compile_cpu};
         auto context = std::make_unique<llvm::LLVMContext>();
@@ -685,6 +800,11 @@ struct Jit::Impl {
         };
         for (const auto &plan : plans) {
             const unsigned opcode = (plan.words[0] & 511) >> 3;
+            if (plan.d.vertical || plan.a.vertical || plan.b.vertical) {
+                emit_plain_vector(build, *function, plan, offset(plan.d),
+                                  offset(plan.a), offset(plan.b));
+                continue;
+            }
             const bool carry = opcode == 34 || opcode == 35;
             llvm::SmallVector<llvm::Type *, 7> parameters = {pointer, i32, i32, i32};
             if (plan.setf) parameters.append(3, pointer);
@@ -727,8 +847,9 @@ struct Jit::Impl {
             if (!length || block.length + length > block.words.size() || pc + 2 * length > 0x4000000) break;
             const unsigned op = (first & 511) >> 3;
             switch (op) {
-            case 4: case 8: case 9: case 10: case 11: case 12: case 13: case 14:
-            case 16: case 17: case 18: case 26: case 27: case 28: case 29: case 30:
+            case 4: case 5: case 6: case 8: case 9: case 10: case 11: case 12:
+            case 13: case 14: case 16: case 17: case 18: case 19: case 24:
+            case 26: case 27: case 28: case 29: case 30:
             case 34: case 35: case 37: break;
             default: return plans.size() >= 2 ? finish_vector_region(core, block, plans) : false;
             }
@@ -742,6 +863,19 @@ struct Jit::Impl {
                     (operand.reg < 0 || operand.width == 2) &&
                     !operand.packed_columns && operand.width <= 2 && (operand.base & 15) == 0;
             };
+            const auto plain_operand = [](const VectorOperand &operand) {
+                return !operand.discard && operand.reg < 0 &&
+                    !operand.packed_columns && operand.width <= 2;
+            };
+            const bool vertical = plan.d.vertical || plan.a.vertical || plan.b.vertical;
+            const auto &mode = plan.modes;
+            const bool plain_mode = !mode.nibble && !mode.blend && !mode.byte_mask &&
+                !mode.texture_nibble_mask && !mode.alpha_bit && !mode.half_complement &&
+                !mode.complement && !mode.byte_or && !mode.halfword_or &&
+                !mode.quant_sign && !mode.edge_sign && !mode.nibble_or &&
+                !mode.split48 && !mode.split80 && !mode.lowcarry &&
+                !mode.lowborrow && !mode.vertical_carry && !mode.highcarry &&
+                !mode.highborrow && !mode.carry_operands && !mode.filtered_byte;
             const bool supported_flags = op == 8 && plan.d.width == 2 &&
                 plan.a.width == 2 && plan.b.width == 2;
             const bool supported_carry = op == 34 ? !plan.setf && plan.modes.highcarry &&
@@ -749,9 +883,14 @@ struct Jit::Impl {
                 : op == 35 ? !plan.setf && plan.modes.highborrow &&
                     plan.modes.carry_operands : true;
             if (plan.length != length || plan.count != 1 || plan.bkind || !supported_carry ||
-                (plan.setf && !supported_flags) ||
+                (plan.setf && (!supported_flags || vertical)) ||
                 plan.pred || plan.clear || plan.accumulate || plan.x15 || plan.sreg != 7 ||
-                !contiguous_operand(plan.d) || !contiguous_operand(plan.a) || !contiguous_operand(plan.b)) break;
+                (vertical && (!plain_mode || op == 34 || op == 35 ||
+                    !plain_operand(plan.d) || !plain_operand(plan.a) ||
+                    !plain_operand(plan.b) || plans.size() >= 8)) ||
+                (!vertical && ((op == 5 || op == 6 || op == 19 || op == 24) ||
+                    !contiguous_operand(plan.d) ||
+                    !contiguous_operand(plan.a) || !contiguous_operand(plan.b)))) break;
             plan.words = words;
             block.vector_pcs.push_back(pc);
             for (unsigned j = 0; j < length; ++j) block.words[block.length++] = static_cast<u16>(words[j]);
@@ -2592,9 +2731,23 @@ Jit::Jit() : impl_(std::make_unique<Impl>()) {}
 Jit::~Jit() { impl_->report(); }
 unsigned Jit::try_execute(Core &core, unsigned limit, u16 first_word) {
     const u32 pc = core.r[31];
-    const unsigned executed = impl_->try_execute(core, limit, first_word);
+    unsigned executed = impl_->try_execute(core, limit, first_word);
     core.jit_compile_cpu = impl_->compile_cpu;
     impl_->record(pc, first_word, executed);
+    if (!executed || pc >= 0x4000000) return executed;
+    const auto &page = impl_->pages[pc >> 12];
+    const Block *block = page->entries[(pc & 4095) >> 1].block;
+    if (!block || !Impl::vector_block(block->kind)) return executed;
+    u32 expected_pc = pc + 2 * block->length;
+    while (executed < limit) {
+        const unsigned next = impl_->execute_cached_vector(core, limit - executed,
+                                                            expected_pc);
+        if (!next) break;
+        executed += next;
+        const auto &next_page = impl_->pages[expected_pc >> 12];
+        block = next_page->entries[(expected_pc & 4095) >> 1].block;
+        expected_pc += 2 * block->length;
+    }
     return executed;
 }
 
