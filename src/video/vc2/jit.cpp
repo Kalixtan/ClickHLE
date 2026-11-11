@@ -141,6 +141,7 @@ std::optional<Operation> decode(u16 word, u32 pc) {
 }
 
 using NativeVectorRegion = void (*)(u8 *, const u32 *, bool *, bool *, bool *);
+using NativeIndexedH16 = void (*)(u8 *, const u8 *, u32, const std::int64_t *, const u32 *, u32, u32);
 using NativeBlock = void (*)(u32 *, const u8 *);
 using NativeAddress = u32 (*)(u32 *);
 using NativeFillLoop = void (*)(u32 *, u8 *, u32);
@@ -213,7 +214,7 @@ std::optional<Operation> decode_extended(u16 word, u16 second, u32 pc) {
 }
 
 struct Block {
-    enum class Kind { Scalar, Memory, Stack, TableBranch, VectorLoad, RasterStore, MoveH16, Broadcast, BinaryVector, AddSetfH16, FillLoop, VectorRegion } kind = Kind::Scalar;
+    enum class Kind { Scalar, Memory, Stack, TableBranch, VectorLoad, RasterStore, MoveH16, Broadcast, BinaryVector, AddSetfH16, FillLoop, VectorRegion, IndexedH16 } kind = Kind::Scalar;
     NativeVectorRegion vector_native = nullptr;
     std::vector<u32> vector_pcs;
     u32 pc = 0;
@@ -232,6 +233,7 @@ struct Block {
     unsigned scalar_register = 7;
     unsigned reduction_register = 7;
     NativeFillLoop fill_native = nullptr;
+    NativeIndexedH16 indexed_native = nullptr;
     unsigned fill_counter = 0;
     NativeBlock native = nullptr;
     NativeAddress native_address = nullptr;
@@ -283,6 +285,8 @@ struct Jit::Impl {
     NativeMove move_kernel = nullptr;
     llvm::orc::ResourceTrackerSP move_resources;
     NativeLoadBytes load_bytes_kernel = nullptr;
+    NativeIndexedH16 indexed_h16_kernel = nullptr;
+    llvm::orc::ResourceTrackerSP indexed_h16_resources;
     llvm::orc::ResourceTrackerSP load_bytes_resources;
     NativeGatherBytes gather_bytes_kernel = nullptr;
     llvm::orc::ResourceTrackerSP gather_bytes_resources;
@@ -337,7 +341,7 @@ struct Jit::Impl {
     std::unordered_map<u64, u64> native_counts;
     std::unordered_map<u64, u64> native_edges;
     std::optional<u32> previous_native_pc;
-    mutable std::array<u64, 12> block_kind_counts{};
+    mutable std::array<u64, 13> block_kind_counts{};
 
     void record(u32 pc, u16 word, unsigned executed) {
         if (!profile) return;
@@ -391,10 +395,10 @@ struct Jit::Impl {
                       << " word=0x" << (key & 65535) << std::dec
                       << " native=" << ranked[i].second << '\n';
         }
-        constexpr std::array<const char *, 12> kinds = {
+        constexpr std::array<const char *, 13> kinds = {
             "scalar", "memory", "stack", "table branch", "vector load",
             "raster store", "vector move", "broadcast", "binary vector",
-            "vector add/flags", "store loop", "vector region"
+            "vector add/flags", "store loop", "vector region", "indexed H16"
         };
         std::cerr << "VC2 JIT executions by block kind:\n";
         for (unsigned i = 0; i < kinds.size(); ++i)
@@ -556,6 +560,53 @@ struct Jit::Impl {
         return *symbol;
     }
 
+    NativeIndexedH16 compile_indexed_h16() {
+        CompilationTimer compile_timer{compile_cpu};
+        auto context = std::make_unique<llvm::LLVMContext>();
+        auto module = std::make_unique<llvm::Module>("vc2-indexed-h16", *context);
+        module->setDataLayout(engine->getDataLayout());
+        module->setTargetTriple(engine->getTargetTriple().str());
+        auto *i8 = llvm::Type::getInt8Ty(*context);
+        auto *i32 = llvm::Type::getInt32Ty(*context);
+        auto *i64 = llvm::Type::getInt64Ty(*context);
+        auto *ptr = llvm::PointerType::getUnqual(i8);
+        auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
+            {ptr, ptr, i32, llvm::PointerType::getUnqual(i64),
+             llvm::PointerType::getUnqual(i32), i32, i32}, false);
+        auto *function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
+            "vc2_indexed_h16_" + std::to_string(next_symbol++), module.get());
+        llvm::IRBuilder<> build(llvm::BasicBlock::Create(*context, "entry", function));
+        auto argument = [&](unsigned i) { return function->getArg(i); };
+        for (unsigned lane = 0; lane < 16; ++lane) {
+            auto *lane_index = build.getInt32(lane);
+            auto *high = build.CreateLoad(i64, build.CreateGEP(i64, argument(3), lane_index));
+            auto *low = build.CreateLoad(i32, build.CreateGEP(i32, argument(4), lane_index));
+            auto *index = build.CreateAdd(build.CreateShl(build.CreateTrunc(high, i32), 16), low);
+            auto *address = build.CreateAdd(argument(2),
+                build.CreateAdd(build.CreateShl(index, 1), argument(6)));
+            auto *ram_address = build.CreateSelect(build.CreateICmpUGE(address,
+                build.getInt32(0xfe000000)),
+                build.CreateAdd(build.CreateSub(address, build.getInt32(0xfe000000)),
+                                build.getInt32(0x2000000)), address);
+            auto *value = build.CreateAlignedLoad(build.getInt16Ty(),
+                build.CreateGEP(i8, argument(1), ram_address), llvm::Align(1));
+            auto *row = build.CreateAnd(build.CreateAdd(
+                build.CreateLShr(argument(5), 6), lane_index), 63);
+            auto *column = build.CreateAnd(argument(5), 63);
+            for (unsigned byte = 0; byte < 2; ++byte) {
+                auto *offset = build.CreateOr(build.CreateShl(row, 6),
+                    build.CreateAnd(build.CreateAdd(column, build.getInt32(16 * byte)), 63));
+                auto *part = byte ? build.CreateTrunc(build.CreateLShr(value, 8), i8)
+                                  : build.CreateTrunc(value, i8);
+                build.CreateStore(part, build.CreateGEP(i8, argument(0), offset));
+            }
+        }
+        build.CreateRetVoid();
+        indexed_h16_resources = engine->getMainJITDylib().createResourceTracker();
+        return materialize(std::move(context), std::move(module), function,
+            indexed_h16_resources, "indexed-h16").toPtr<NativeIndexedH16>();
+    }
+
     NativeVectorRegion compile_vector_region(Block &block, const std::vector<VectorPlan> &plans) {
         CompilationTimer compile_timer{compile_cpu};
         auto context = std::make_unique<llvm::LLVMContext>();
@@ -621,7 +672,7 @@ struct Jit::Impl {
 
     bool build_vector_region(Core &core, Block &block, unsigned limit) {
         std::vector<VectorPlan> plans;
-        for (unsigned i = 0; i < std::min(limit, 16u); ++i) {
+        for (unsigned i = 0; i < std::min(limit, 32u); ++i) {
             const u32 pc = block.pc + 2 * block.length;
             if (pc + 6 > 0x4000000) break;
             const u32 first = core.read(pc, 2);
@@ -1545,6 +1596,40 @@ struct Jit::Impl {
                 return execute(core, inserted->second, limit);
             }
         }
+        // Observed palette-shader halfword texture reads. Keep unsupported
+        // indexed forms on the interpreter path.
+        if (first_word == 0x2156 && pc + 10 <= 0x4000000) {
+            const u16 destination = static_cast<u16>(core.read(pc + 2, 2));
+            const u16 index = static_cast<u16>(core.read(pc + 4, 2));
+            const u16 offset = static_cast<u16>(core.read(pc + 6, 2));
+            const u16 modifier = static_cast<u16>(core.read(pc + 8, 2));
+            const unsigned bank = destination >> 8;
+            if ((destination & 255) == 0 && ((bank & 0xf0) == 0x60 || (bank & 0xf0) == 0xa0) &&
+                !(bank & 1) && index == 0x1f && modifier == 0x80e7 &&
+                (offset == 0 || (offset == 0x2000 && (bank & 3) == 2))) {
+                if (!indexed_h16_kernel) {
+                    const auto start = std::chrono::steady_clock::now();
+                    indexed_h16_kernel = compile_indexed_h16();
+                    core.jit_compile_us += static_cast<u64>(std::chrono::duration_cast<
+                        std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+                    ++core.jit_compilations;
+                }
+                Block indexed;
+                indexed.kind = Block::Kind::IndexedH16;
+                indexed.pc = pc; indexed.length = 5;
+                indexed.words = {first_word, destination, index, offset, modifier};
+                indexed.destination.base = (((bank >> 6) * 16) << 6) | (32 + (bank & 15));
+                indexed.destination.vertical = true;
+                indexed.destination.width = 2;
+                indexed.load_offset = offset == 0x2000 ? 2 : 0;
+                indexed.indexed_native = indexed_h16_kernel;
+                indexed.code_versions = watch_code(core, pc, 5);
+                auto [inserted, fresh] = blocks.emplace(pc, std::move(indexed));
+                (void)fresh;
+                entry.block = &inserted->second;
+                return execute(core, inserted->second, limit);
+            }
+        }
         // Postincrement word store followed by decrement/compare-zero/backedge.
         // Register separation makes every iteration independent of the stored value.
         if ((first_word & 0xff00) == 0x7900 && pc + 6 <= 0x4000000) {
@@ -2131,6 +2216,35 @@ struct Jit::Impl {
                 core.r[31] = block.pc + 2 * block.length;
             }
             return static_cast<unsigned>(block.vector_pcs.size());
+        }
+        if (block.kind == Block::Kind::IndexedH16) {
+            // The native kernel reads ordinary RAM or its 0xfe000000 mirror.
+            // MMIO and misaligned reads retain the interpreter's bus behavior.
+            for (unsigned lane = 0; lane < 16; ++lane) {
+                const u32 index = static_cast<u32>(core.acc[lane]) * 65536u + core.acclo[lane];
+                const u32 address = core.r[3] + index * 2u + block.load_offset;
+                if (address & 1) return 0;
+                if (address > core.ram_.size() - 2 &&
+                    (address < 0xfe000000 || address > 0xfe400000 - 2)) return 0;
+            }
+            const u32 destination = block.destination.offset(core, 0);
+            if (compare) {
+                const auto original = core.vrf;
+                const auto before = core.r;
+                core.step();
+                const auto expected = core.vrf;
+                core.vrf = original;
+                block.indexed_native(core.vrf.data(), core.ram_.data(), before[3],
+                    core.acc.data(), core.acclo.data(), destination, block.load_offset);
+                if (core.vrf != expected || core.r[31] != block.pc + 10)
+                    throw std::runtime_error("VC2 indexed H16 native mismatch");
+            } else {
+                block.indexed_native(core.vrf.data(), core.ram_.data(), core.r[3],
+                    core.acc.data(), core.acclo.data(), destination, block.load_offset);
+                core.recent_pcs[core.recent_pc_count++ % core.recent_pcs.size()] = block.pc;
+                core.r[31] = block.pc + 10;
+            }
+            return 1;
         }
         if (block.kind == Block::Kind::FillLoop) {
             const u32 address = core.r[block.memory_base];
