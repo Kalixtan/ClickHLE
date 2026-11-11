@@ -32,6 +32,16 @@ namespace clickhle {
 /// buildable and testable with nothing but a compiler.
 class Emulator {
 public:
+    struct DeviceSettings {
+        // Unset values retain the CLI environment overrides and defaults.
+        std::optional<u32> language;
+        std::optional<bool> time_format_24;
+        bool hold_switch = false;
+    };
+
+    DeviceSettings& device_settings() noexcept { return device_settings_; }
+    [[nodiscard]] const DeviceSettings& device_settings() const noexcept { return device_settings_; }
+
     /// One observed call at the ARM-to-render-server boundary. VideoCore
     /// tracing records the host-visible API traffic
     /// and any small input prefix that can help reverse its contract.
@@ -637,6 +647,7 @@ public:
     }
 
 private:
+    DeviceSettings device_settings_;
     [[nodiscard]] bool bind_imports(std::string* error);
     void dump_call_history() const;
     /// Returns false to ask the core to stop.

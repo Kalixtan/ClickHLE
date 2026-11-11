@@ -18,10 +18,14 @@
 #include <QByteArray>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDockWidget>
 #include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QImage>
@@ -40,6 +44,7 @@
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSettings>
+#include <QSpinBox>
 #include <QStatusBar>
 #include <QStringList>
 #include <QTableWidget>
@@ -289,6 +294,9 @@ public:
         fps_timer_.start();
 
         QSettings settings;
+        device_settings_.language = settings.value(QStringLiteral("device/language"), 0).toUInt();
+        device_settings_.time_format_24 = settings.value(QStringLiteral("device/timeFormat24"), false).toBool();
+        device_settings_.hold_switch = settings.value(QStringLiteral("device/holdSwitch"), false).toBool();
         restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
         if (settings.value(QStringLiteral("video/engine")).toString() == QStringLiteral("interpreter"))
             interpreter_action_->setChecked(true);
@@ -404,6 +412,10 @@ private:
         connect(integer_scale_action_, &QAction::toggled, canvas_,
                 [this](bool checked) { canvas_->setIntegerScaling(checked); });
 
+        device_settings_action_ = new QAction(tr("iPod Settings…"), this);
+        connect(device_settings_action_, &QAction::triggered, this,
+                [this] { showDeviceSettings(); });
+
         auto* engine_actions = new QActionGroup(this);
         engine_actions->setExclusive(true);
         interpreter_action_ = new QAction(tr("Interpreter"), engine_actions);
@@ -445,6 +457,8 @@ private:
         file->addAction(quit_action_);
 
         QMenu* options = bar->addMenu(tr("Options"));
+        options->addAction(device_settings_action_);
+        options->addSeparator();
         options->addAction(integer_scale_action_);
         QMenu* video_engine = options->addMenu(tr("VideoCore Engine"));
         video_engine->addAction(interpreter_action_);
@@ -461,6 +475,42 @@ private:
 
         QMenu* help = bar->addMenu(tr("Help"));
         help->addAction(about_action_);
+    }
+
+    void showDeviceSettings() {
+        QDialog dialog(this);
+        dialog.setWindowTitle(tr("iPod Settings"));
+        auto* layout = new QVBoxLayout(&dialog);
+        auto* form = new QFormLayout;
+        auto* language = new QSpinBox(&dialog);
+        language->setRange(0, 65535);
+        language->setSpecialValueText(tr("English (0)"));
+        language->setValue(static_cast<int>(device_settings_.language.value_or(0)));
+        language->setToolTip(tr("Language index 0 selects English. Available languages depend on the game."));
+        form->addRow(tr("Language index:"), language);
+        auto* time_format = new QComboBox(&dialog);
+        time_format->addItem(tr("12-hour"));
+        time_format->addItem(tr("24-hour"));
+        time_format->setCurrentIndex(device_settings_.time_format_24.value_or(false) ? 1 : 0);
+        form->addRow(tr("Time format:"), time_format);
+        auto* hold = new QCheckBox(tr("Hold switch on"), &dialog);
+        hold->setChecked(device_settings_.hold_switch);
+        form->addRow(hold);
+        layout->addLayout(form);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+        if (dialog.exec() != QDialog::Accepted) return;
+
+        device_settings_.language = static_cast<u32>(language->value());
+        device_settings_.time_format_24 = time_format->currentIndex() == 1;
+        device_settings_.hold_switch = hold->isChecked();
+        if (emulator_) emulator_->device_settings() = device_settings_;
+        QSettings settings;
+        settings.setValue(QStringLiteral("device/language"), language->value());
+        settings.setValue(QStringLiteral("device/timeFormat24"), *device_settings_.time_format_24);
+        settings.setValue(QStringLiteral("device/holdSwitch"), device_settings_.hold_switch);
     }
 
     QDockWidget* makeTool(const QString& title, QWidget* content) {
@@ -598,6 +648,7 @@ private:
         canvas_->setMessage(tr("Loading %1…").arg(QFileInfo(path).fileName()));
         statusBar()->showMessage(tr("Loading %1…").arg(QFileInfo(path).fileName()));
         auto next = std::make_unique<Emulator>();
+        next->device_settings() = device_settings_;
         next->display().set_headless(true);
         Emulator::Config config;
         const QByteArray encoded_path = path.toUtf8();
@@ -970,6 +1021,7 @@ private:
     }
 
     std::unique_ptr<Emulator> emulator_;
+    Emulator::DeviceSettings device_settings_;
     QString current_game_;
     QStringList recent_games_;
     bool paused_ = true;
@@ -989,6 +1041,7 @@ private:
     QAction* resume_action_ = nullptr;
     QAction* restart_action_ = nullptr;
     QAction* integer_scale_action_ = nullptr;
+    QAction* device_settings_action_ = nullptr;
     QAction* interpreter_action_ = nullptr;
     QAction* jit_action_ = nullptr;
     QAction* about_action_ = nullptr;

@@ -369,19 +369,20 @@ void poll_hardware_input(Emulator& emulator) {
     }
 
     const u32 port = emulator.sample_hardware_port();
+    const bool locked = emulator.device_settings().hold_switch;
     // Rockbox validates this mask; RetailOS checks the same signature
     // through a mask loaded at runtime. Other packets leave this state.
-    if ((port & 0x800000ffu) == 0x8000001au) {
-        const u8 buttons = static_cast<u8>((port >> 8) & 0x3f);
+    if (locked || (port & 0x800000ffu) == 0x8000001au) {
+        const u8 buttons = locked ? 0 : static_cast<u8>((port >> 8) & 0x3f);
         for (u8 bit = 0; bit < 6; ++bit)
             apply_hardware_bit_internal(emulator, bit,
                                         (buttons & (1u << bit)) != 0);
-        state.hardware_wheel_raw = (port & kWheelTouched)
+        state.hardware_wheel_raw = !locked && (port & kWheelTouched)
             ? std::optional<u8>{static_cast<u8>((port >> 16) & 0x7f)}
             : std::nullopt;
     }
     static const std::string_view mode = button_record_mode();
-    repost_held(emulator, state, mode, &event_type_for_button);
+    if (!locked) repost_held(emulator, state, mode, &event_type_for_button);
 
     WheelState wheel{state.wheel_raw, state.wheel_touched};
     const bool was_touched = wheel.touched;

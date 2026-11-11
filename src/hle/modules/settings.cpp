@@ -2,7 +2,6 @@
 
 #include <cstdlib>
 #include <cstdio>
-#include <algorithm>
 #include "clickhle/hle/modules.h"
 
 #include <optional>
@@ -94,7 +93,7 @@ void register_settings(HleRegistry& registry) {
             return;
         }
         const std::string& key = *key_value;
-        if (key != "Language" && key != "TimeFormat") {
+        if (key != "Language" && key != "HoldSwitch" && key != "TimeFormat") {
             CLICKHLE_DEBUG(kCategory)
                 << "get_setting(\"" << key << "\") -> absent";
             f.ret(kUnknownSetting);
@@ -109,53 +108,67 @@ void register_settings(HleRegistry& registry) {
         }
         const u32 capacity = *capacity_value;
         if (key == "Language") {
-            // The caller treats this as a four-byte language index. Index 0
-            // selects English, the default resource set used by the corpus.
-            // The comparison emulator reports the handler's required size
-            // even when capacity is short, while leaving the output untouched.
-            // Do not turn a matched key into the dispatcher's unknown-name
-            // error just because the handler cannot write its value.
-            if (capacity >= sizeof(u32)) {
-                const char* want = std::getenv("CLICKHLE_LANGUAGE");
-                const u32 value = want != nullptr
-                                      ? static_cast<u32>(std::strtoul(want, nullptr, 0))
-                                      : 0u;
-                if (!f.store<u32>(out, value)) {
-                    f.cpu.request_stop();
-                    return;
-                }
-                CLICKHLE_DEBUG(kCategory)
-                    << "get_setting(\"Language\") -> " << value
-                    << (value == 0 ? " (English)" : "");
+            // RetailOS 0x100ccc54 requires space for a four-byte index.
+            if (size == kNullGuest) {
+                f.cpu.request_stop();
+                return;
             }
-            if (size != kNullGuest) {
-                if (!f.store<u32>(size, sizeof(u32))) {
-                    f.cpu.request_stop();
-                    return;
-                }
+            if (capacity < sizeof(u32)) {
+                f.ret(0xffffffd0u);
+                return;
+            }
+            const char* want = std::getenv("CLICKHLE_LANGUAGE");
+            const u32 value = f.emulator.device_settings().language.value_or(
+                want != nullptr ? static_cast<u32>(std::strtoul(want, nullptr, 0)) : 0u);
+            if (!f.store<u32>(size, sizeof(u32)) || !f.store<u32>(out, value)) {
+                f.cpu.request_stop();
+                return;
+            }
+            CLICKHLE_DEBUG(kCategory) << "get_setting(\"Language\") -> " << value;
+            f.ret(0);
+            return;
+        }
+        if (key == "HoldSwitch") {
+            // RetailOS 0x100d57b8 requires a size pointer and one byte of
+            // capacity, then writes the current hold state and a size of one.
+            if (size == kNullGuest) {
+                f.cpu.request_stop();
+                return;
+            }
+            if (capacity < 1) {
+                f.ret(0xffffffd0u); // -48: buffer too small
+                return;
+            }
+            if (!f.store<u32>(size, 1) ||
+                !f.store<u8>(out, f.emulator.device_settings().hold_switch ? 1 : 0)) {
+                f.cpu.request_stop();
+                return;
             }
             f.ret(0);
             return;
         }
         if (key == "TimeFormat") {
             const char* want = std::getenv("CLICKHLE_TIME_FORMAT");
-            const char* value = (want != nullptr && std::string(want) == "24")
-                                    ? "24"
-                                    : "12";
+            const bool twenty_four = f.emulator.device_settings().time_format_24.value_or(
+                want != nullptr && std::string(want) == "24");
+            const char* value = twenty_four ? "24" : "12";
             const u32 length = 3;  // includes the terminating NUL
-            const u32 written = std::min(capacity, length);
-            for (u32 i = 0; i < written; ++i) {
-                if (!f.store<u8>(out + i, static_cast<u8>(value[i]))) {
-                    f.cpu.request_stop();
-                    return;
-                }
-            }
-            if (written == 0) {
-                f.ret(kUnknownSetting);
+            // RetailOS 0x100c8dc0 either copies the complete table entry or
+            // returns -48 without changing the caller's buffer or size.
+            if (size == kNullGuest) {
+                f.cpu.request_stop();
                 return;
             }
-            if (size != kNullGuest) {
-                if (!f.store<u32>(size, written)) {
+            if (static_cast<i32>(capacity) < static_cast<i32>(length)) {
+                f.ret(0xffffffd0u);
+                return;
+            }
+            if (!f.store<u32>(size, length)) {
+                f.cpu.request_stop();
+                return;
+            }
+            for (u32 i = 0; i < length; ++i) {
+                if (!f.store<u8>(out + i, static_cast<u8>(value[i]))) {
                     f.cpu.request_stop();
                     return;
                 }

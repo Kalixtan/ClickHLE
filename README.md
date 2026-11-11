@@ -23,6 +23,9 @@ its command packets; games do not execute RetailOS ARM code or require `osos.bin
 display the raw framebuffer, with no shader replacement or Python runtime. Place the game
 RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRMWARE`
 can override that path; games may also supply their own image.
+The GUI's Options → iPod Settings window controls the game-facing language
+index, time format, and hold switch. Language index 0 is English; available
+translations depend on the game.
 The JIT keeps compiled objects in the user cache (`~/.cache/clickhle/vc2` on Linux).
 Set `CLICKHLE_VC2_CACHE_DIR` to choose another folder, or to an empty string to
 disable disk caching. Deleting the folder clears the cache.
