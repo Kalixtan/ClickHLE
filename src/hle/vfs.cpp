@@ -93,12 +93,21 @@ void Vfs::set_shared_root(std::filesystem::path root) {
     CLICKHLE_INFO(kCategory) << "shared " << shared_root_.string();
 }
 
+void Vfs::set_device_root(std::filesystem::path root) {
+    if (root.empty()) { device_root_.clear(); return; }
+    std::error_code error;
+    device_root_ = std::filesystem::weakly_canonical(root, error);
+    if (error) device_root_ = std::move(root);
+    CLICKHLE_INFO(kCategory) << "device " << device_root_.string();
+}
+
 const std::filesystem::path& Vfs::root_for(Namespace name_space) const noexcept {
     switch (name_space) {
     case Namespace::kGame: return root_;
     case Namespace::kData: return save_root_;
     case Namespace::kStats: return stats_root_;
     case Namespace::kShared: return shared_root_;
+    case Namespace::kDevice: return device_root_;
     }
     return root_;
 }
@@ -106,6 +115,23 @@ const std::filesystem::path& Vfs::root_for(Namespace name_space) const noexcept 
 std::filesystem::path Vfs::resolve(std::string guest_path,
                                    Namespace name_space) const {
     return resolve_under(root_for(name_space), std::move(guest_path));
+}
+
+std::filesystem::path Vfs::resolve_media(std::string device_path) const {
+    if (device_root_.empty()) return {};
+    // iTunesDB stores paths as :iPod_Control:Music:Fxx:name.ext. A leading
+    // colon denotes the volume root; never interpret it as a host path.
+    if (!device_path.empty() && device_path.front() == ':') {
+        std::replace(device_path.begin(), device_path.end(), ':', '/');
+    }
+    const auto first = device_path.find_first_not_of('/');
+    if (first == std::string::npos) return {};
+    device_path.erase(0, first);
+    constexpr std::string_view prefix = "ipod_control";
+    if (device_path.size() <= prefix.size() ||
+        to_lower(device_path.substr(0, prefix.size())) != prefix ||
+        device_path[prefix.size()] != '/') return {};
+    return resolve(device_path, Namespace::kDevice);
 }
 
 std::filesystem::path Vfs::resolve_under(const std::filesystem::path& root,
@@ -153,7 +179,8 @@ std::filesystem::path Vfs::resolve_under(const std::filesystem::path& root,
 u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write,
               Namespace name_space) {
     // Games_RO is immutable. Each writable namespace has its own root.
-    if (name_space == Namespace::kGame && mode != Mode::kRead) return 0;
+    if ((name_space == Namespace::kGame || name_space == Namespace::kDevice) &&
+        mode != Mode::kRead) return 0;
     const auto& base = root_for(name_space);
     if (base.empty()) return 0;
     if (mode == Mode::kWrite || mode == Mode::kUpdate) {
@@ -252,7 +279,8 @@ bool Vfs::close(u32 handle) {
 }
 
 bool Vfs::remove_saved(const std::string& guest_path, Namespace name_space) {
-    if (name_space == Namespace::kGame || guest_path.empty()) return false;
+    if (name_space == Namespace::kGame || name_space == Namespace::kDevice ||
+        guest_path.empty()) return false;
     const auto& root = root_for(name_space);
     if (root.empty()) return false;
     const auto host = resolve_under(root, guest_path);

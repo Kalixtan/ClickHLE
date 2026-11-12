@@ -832,6 +832,7 @@ int main(int argc, char** argv) {
 
     clickhle::Emulator::Config config;
     config.executable = options.executable;
+    config.hdd_root = std::filesystem::weakly_canonical(argv[0]).parent_path() / "hdd";
     config.platform_id = options.platform_id;
     if (options.capture_videocore && !options.headless) {
         std::cerr << "--capture-videocore requires --headless\n";

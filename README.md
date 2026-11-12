@@ -29,8 +29,11 @@ remain unbound and stop when called.
 Installed games read assets from `hdd/iPod_Control/Games_RO/<id>` and write
 saves to `GameData_RW/<id>` and statistics to `GameStats_WO/<id>` under the
 same `iPod_Control` folder. Shared game data uses `GameData_ShareRW`.
-Music-library calls are separate from game file access and currently report an
-empty library.
+Loose executables also put their saves under this HDD, using their filename as
+the directory name. Metadata reads `hdd/iPod_Control/iTunes/iTunesDB`; music
+paths in that database resolve under `hdd/iPod_Control/Music`. The database
+reader supports tracks and playlists, but most RetailOS Metadata calls still
+need their ABI contracts traced before games can browse a populated library.
 
 Graphics use a native C++ VideoCore II core running original firmware. The LLVM JIT is the
 default when available; the interpreter can be selected with `--vc2-engine interpreter` or under

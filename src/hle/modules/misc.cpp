@@ -498,6 +498,9 @@ void register_misc(HleRegistry& registry) {
             extension == ".aac" || extension == ".mp4") {
             f.emulator.audio_state().pending_stream_asset =
                 f.emulator.vfs().resolve(text);
+            if (f.emulator.audio_state().pending_stream_asset.empty())
+                f.emulator.audio_state().pending_stream_asset =
+                    f.emulator.vfs().resolve_media(text);
         }
         f.ret(static_cast<u32>(text.size()));
     });

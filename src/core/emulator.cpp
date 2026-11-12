@@ -306,25 +306,38 @@ bool Emulator::load(Config config, std::string* error) {
     } else {
         vfs_.mount(config_.content_root);
     }
-    // Installed games use the same three per-title directories as RetailOS.
-    // Standalone executables keep an isolated host-side save directory.
+    // Guest-owned files live on the emulated iPod volume, even when loading a
+    // loose executable from outside Games_RO.
     const auto game_root = vfs_.root();
     const auto control = game_root.parent_path().parent_path();
     const bool installed = game_root.parent_path().filename() == "Games_RO" &&
                            control.filename() == "iPod_Control";
+    const auto device_root = installed ? control.parent_path() :
+        (config_.hdd_root.empty() ? std::filesystem::current_path() / "hdd"
+                                  : config_.hdd_root);
+    vfs_.set_device_root(device_root);
+    if (!vfs_.device_root().empty()) {
+        const auto database = vfs_.resolve(
+            "iPod_Control/iTunes/iTunesDB", Vfs::Namespace::kDevice);
+        std::string database_error;
+        metadata_state_.music_database_available =
+            metadata_state_.music_database.load(database, &database_error);
+        if (metadata_state_.music_database_available) {
+            CLICKHLE_INFO(kCategory) << "music library: "
+                << metadata_state_.music_database.tracks.size() << " tracks, "
+                << metadata_state_.music_database.playlists.size() << " playlists";
+        } else {
+            CLICKHLE_WARN(kCategory) << "music library: " << database_error;
+        }
+    }
+    const auto title_id = installed ? game_root.filename() : config_.executable.stem();
     if (config_.save_root.empty()) {
-        vfs_.set_save_root(installed
-            ? control / "GameData_RW" / game_root.filename()
-            : std::filesystem::current_path() / "saves" / game_root.filename());
+        vfs_.set_save_root(device_root / "iPod_Control" / "GameData_RW" / title_id);
     } else {
         vfs_.set_save_root(config_.save_root);
     }
-    vfs_.set_stats_root(installed
-        ? control / "GameStats_WO" / game_root.filename()
-        : vfs_.save_root().parent_path() / "stats" / game_root.filename());
-    vfs_.set_shared_root(installed
-        ? control / "GameData_ShareRW"
-        : vfs_.save_root().parent_path() / "shared");
+    vfs_.set_stats_root(device_root / "iPod_Control" / "GameStats_WO" / title_id);
+    vfs_.set_shared_root(device_root / "iPod_Control" / "GameData_ShareRW");
 
     heap_.initialise(config_.heap_base, config_.heap_size);
     scheduler_.initialise(config_.thread_stack_base, config_.thread_stack_arena,

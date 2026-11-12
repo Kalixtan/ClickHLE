@@ -20,6 +20,7 @@
 #include "clickhle/hle/vfs.h"
 #include "clickhle/input/replay.h"
 #include "clickhle/loader/eapp_image.h"
+#include "clickhle/loader/music_database.h"
 #include "clickhle/video/display.h"
 #include "clickhle/video/videocore.h"
 
@@ -62,6 +63,8 @@ public:
 
     struct Config {
         std::filesystem::path executable;
+        /// The emulated iPod volume, normally hdd beside the frontend binary.
+        std::filesystem::path hdd_root;
         /// Zero selects the first matching entry in the package manifest.
         u32 platform_id = 0;
 
@@ -118,8 +121,7 @@ public:
         /// an installed executable, or the executable's parent directory.
         std::filesystem::path content_root;
 
-        /// GameData_RW/<id> for installed games. Standalone executables use
-        /// "saves/<title>" under the current directory unless overridden.
+        /// GameData_RW/<id> on the emulated volume unless overridden for tests.
         std::filesystem::path save_root;
 
         /// The device has 64 MB of SDRAM. Stack and heap are carved out well
@@ -222,6 +224,8 @@ public:
     struct MetadataState {
         std::vector<bool> music_library_slots;
         std::vector<bool> artwork_library_slots;
+        MusicDatabase music_database;
+        bool music_database_available = false;
         GuestAddr service_object = 0;
     };
 

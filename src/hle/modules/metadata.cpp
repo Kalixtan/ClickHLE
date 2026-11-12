@@ -3,11 +3,13 @@
 // The library includes music and artwork services. Most ordinal names and
 // object contracts are still being recovered from the firmware.
 //
-// The emulator has no device music database, so data queries must report an
-// empty result while honoring the firmware's object and handle rules.
+// Music queries use iPod_Control/iTunes/iTunesDB on the mounted device volume.
+// Unrecovered firmware contracts remain unregistered rather than fabricating
+// empty values for a library that may contain tracks.
 
 #include "clickhle/hle/modules.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -57,6 +59,18 @@ bool valid_music_handle(HleCallFrame& f, u32 handle) {
     return false;
 }
 
+bool known_empty_library(HleCallFrame& f, u32 ordinal) {
+    const auto& state = f.emulator.metadata_state();
+    if (state.music_database_available && state.music_database.tracks.empty() &&
+        std::all_of(state.music_database.playlists.begin(),
+                    state.music_database.playlists.end(),
+                    [](const auto& playlist) { return playlist.master; })) return true;
+    CLICKHLE_ERROR(kCategory) << "Metadata#" << ordinal
+        << ": operation needs a RetailOS contract for this music library";
+    f.cpu.request_stop();
+    return false;
+}
+
 }  // namespace
 
 void register_metadata(HleRegistry& registry) {
@@ -66,8 +80,7 @@ void register_metadata(HleRegistry& registry) {
                      std::move(handler));
     };
 
-    // RetailOS inserts a new library object and returns its table index. Index
-    // zero is valid even though the represented music library is empty.
+    // RetailOS inserts a new library object and returns its table index.
     fn(0, "music_library_create", 0, [](HleCallFrame& f) {
         const u32 handle =
             allocate_slot(f.emulator.metadata_state().music_library_slots);
@@ -94,6 +107,19 @@ void register_metadata(HleRegistry& registry) {
         f.ret_void();
     });
 
+    // The firmware queries its playlist collection and subtracts one for the
+    // master playlist. The collection comes from the primary (type 2) iTunesDB
+    // playlist dataset, including its master entry.
+    fn(43, "user_playlist_count", 4, [](HleCallFrame& f) {
+        if (!f.emulator.metadata_state().music_database_available) {
+            CLICKHLE_ERROR(kCategory) << "Metadata#43: iTunesDB unavailable";
+            f.cpu.request_stop();
+            return;
+        }
+        const auto& playlists = f.emulator.metadata_state().music_database.playlists;
+        f.ret(static_cast<u32>(playlists.size() - 1));
+    });
+
     // These two exports are literal zero-return stubs in RetailOS.
     fn(121, "metadata_zero_121", 0,
        [](HleCallFrame& f) { f.ret(0); });
@@ -107,24 +133,28 @@ void register_metadata(HleRegistry& registry) {
         const u32 handle = f.args.next_u32();
         for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
         if (!valid_music_handle(f, handle)) return;
+        if (!known_empty_library(f, 29)) return;
         f.ret_void();
     });
     fn(31, "metadata_31", 4, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
         for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
         if (!valid_music_handle(f, handle)) return;
+        if (!known_empty_library(f, 31)) return;
         f.ret_void();
     });
     fn(45, "metadata_45", 4, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
         for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
         if (!valid_music_handle(f, handle)) return;
+        if (!known_empty_library(f, 45)) return;
         f.ret(0);
     });
     fn(47, "metadata_47", 4, [](HleCallFrame& f) {
         const u32 handle = f.args.next_u32();
         for (u32 i = 1; i < 4; ++i) (void)f.args.next_u32();
         if (!valid_music_handle(f, handle)) return;
+        if (!known_empty_library(f, 47)) return;
         f.ret_void();
     });
 
@@ -295,7 +325,7 @@ void register_metadata(HleRegistry& registry) {
         f.ret_void();
     });
 
-    CLICKHLE_DEBUG(kCategory) << kModule << ": empty library reported";
+    CLICKHLE_DEBUG(kCategory) << kModule << ": iTunesDB-backed library";
 }
 
 }  // namespace clickhle

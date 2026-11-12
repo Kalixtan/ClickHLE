@@ -842,6 +842,7 @@ private:
             reinterpret_cast<const char8_t*>(encoded_path.constData());
         config.executable = std::filesystem::path(std::u8string(
             path_bytes, static_cast<std::size_t>(encoded_path.size())));
+        config.hdd_root = hdd_root_;
         config.platform_id = platform_id;
         config.videocore_engine = jit_action_->isChecked()
             ? clickhle::VideoCoreEngine::Jit : clickhle::VideoCoreEngine::Interpreter;

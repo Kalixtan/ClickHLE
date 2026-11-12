@@ -694,6 +694,7 @@ void register_audio(HleRegistry& registry) {
             if (extension == ".m4a" || extension == ".mp3" ||
                 extension == ".aac" || extension == ".mp4") {
                 asset = f.emulator.vfs().resolve(name);
+                if (asset.empty()) asset = f.emulator.vfs().resolve_media(name);
             }
         }
         audio.stream_assets.push_back(std::move(asset));

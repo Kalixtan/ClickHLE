@@ -44,10 +44,16 @@ public:
     void set_stats_root(std::filesystem::path root);
     void set_shared_root(std::filesystem::path root);
 
-    enum class Namespace { kGame, kData, kStats, kShared };
+    enum class Namespace { kGame, kData, kStats, kShared, kDevice };
+
+    /// The root of the emulated iPod volume (contains iPod_Control).
+    void set_device_root(std::filesystem::path root);
 
     [[nodiscard]] const std::filesystem::path& save_root() const noexcept {
         return save_root_;
+    }
+    [[nodiscard]] const std::filesystem::path& device_root() const noexcept {
+        return device_root_;
     }
 
     [[nodiscard]] const std::filesystem::path& root() const noexcept {
@@ -62,6 +68,9 @@ public:
     /// `"RSERVER.BIN"` must find `rserver.bin`. A Linux host would not.
     [[nodiscard]] std::filesystem::path resolve(
         std::string guest_path, Namespace name_space = Namespace::kGame) const;
+
+    /// Resolve a media path from iTunesDB (colon-separated, volume-relative).
+    [[nodiscard]] std::filesystem::path resolve_media(std::string device_path) const;
 
     [[nodiscard]] const std::filesystem::path& root_for(Namespace name_space) const noexcept;
 
@@ -128,6 +137,7 @@ private:
     std::filesystem::path save_root_;
     std::filesystem::path stats_root_;
     std::filesystem::path shared_root_;
+    std::filesystem::path device_root_;
     std::map<u32, OpenFile> files_;
     std::vector<std::string> missing_;
     /// Handles start above zero because the guest tests for zero as failure.
