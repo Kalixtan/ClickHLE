@@ -116,6 +116,10 @@ u32 Core::alu(unsigned op, u32 a, u32 b) {
         return a & b;
     case 8:
         return a >> shift;
+    case 9:
+        // The bit-plane writers rotate a 16-bit lane mask into the opposite
+        // halfword; another firmware site rotates a bit into the sign position.
+        return std::rotr(a, static_cast<int>(shift));
     case 10:
         return a * b;
     case 11:
@@ -207,6 +211,15 @@ void Core::step(std::optional<u16> prefetched) {
     if (h == 0x4430)
         next = r[26];
     else if (h == 0x4230) {
+    } else if (h == 0x5230) {
+        // Sites in both boot images guard failed assertions and exhausted
+        // waits. The hardware's debug exception path is still unknown.
+        throw std::runtime_error("VC2 breakpoint instruction");
+    } else if ((h & 0xfff0) == 0x4630) {
+        // The firmware loads a code address into this register and reaches
+        // this instruction by a conditional tail path. The ordinary caller's
+        // return address must be preserved.
+        next = r[h & 15];
     } else if (h == 0x5430 || h == 0x5530 || h == 0x5630 || h == 0x5730) {
         // Provisional column-base controls: firmware uses these around vector
         // blocks advancing 16/32/48 bytes. The analogous VC4 controls place CB
@@ -404,6 +417,11 @@ void Core::step(std::optional<u16> prefetched) {
                          (op == 8 ? static_cast<std::int64_t>(sign_extend(b, 32))
                                   : -static_cast<std::int64_t>(sign_extend(b, 32)));
                 value = static_cast<u32>(std::clamp<std::int64_t>(v, -2147483648LL, 2147483647LL));
+            } else if (op == 11) {
+                // Candidate VC2 clipsh: all four VMCS sites clamp a signed
+                // arithmetic result immediately before a halfword store.
+                // The first source register is unused in these routines.
+                value = static_cast<u32>(std::clamp<i32>(sign_extend(b, 32), -32768, 32767));
             } else if (op >= 12 && op <= 15)
                 value = a + (b << (op - 7));
             else

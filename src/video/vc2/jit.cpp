@@ -63,7 +63,7 @@ struct Operation {
 
 bool native_alu(unsigned opcode) {
     switch (opcode) {
-    case 2: case 3: case 4: case 5: case 6: case 7: case 8:
+    case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9:
     case 10: case 11: case 12: case 13: case 14: case 15: case 16:
     case 18: case 19: case 20: case 21: case 22: case 23: case 24:
     case 26: case 27: case 30: case 31:
@@ -82,6 +82,10 @@ std::optional<Operation> decode(u16 word, u32 pc) {
                          .source = static_cast<unsigned>(word & 15),
                          .next_pc = pc + 2, .branch = true,
                          .register_branch = true, .link = true};
+    if ((word & 0xfff0) == 0x4630)
+        return Operation{.word = word,
+                         .source = static_cast<unsigned>(word & 15),
+                         .branch = true, .register_branch = true};
     if (word == 0x4230)
         return Operation{.word = word, .nop = true};
     if (word == 0x4a30 || word == 0x4b30)
@@ -209,7 +213,7 @@ std::optional<Operation> decode_extended(u16 word, u16 second, u32 pc) {
         const unsigned opcode = (second >> 10) & 31;
         const bool ordinary = word & 32;
         if ((word & 31) == 31 && (!ordinary || opcode != 16)) return std::nullopt;
-        if ((ordinary && native_alu(opcode)) || (!ordinary && opcode < 4))
+        if ((ordinary && native_alu(opcode)) || (!ordinary && (opcode < 4 || opcode == 11)))
             return Operation{.word = word, .opcode = ordinary ? opcode : 32 + opcode,
                 .destination = static_cast<unsigned>(word & 31),
                 .left = static_cast<unsigned>(second & 31),
@@ -1033,6 +1037,13 @@ struct Jit::Impl {
             case 6: result = build.CreateShl(a, build.CreateAnd(b, 31)); break;
             case 7: result = build.CreateAnd(a, b); break;
             case 8: result = build.CreateLShr(a, build.CreateAnd(b, 31)); break;
+            case 9: {
+                auto *shift = build.CreateAnd(b, 31);
+                result = build.CreateOr(build.CreateLShr(a, shift),
+                    build.CreateShl(a, build.CreateAnd(
+                        build.CreateSub(llvm::ConstantInt::get(i32, 32), shift), 31)));
+                break;
+            }
             case 10: result = build.CreateMul(a, b); break;
             case 11: result = build.CreateSub(b, a); break;
             case 12: result = build.CreateAdd(a, b); break;
@@ -1073,6 +1084,13 @@ struct Jit::Impl {
                     : build.CreateZExt(b, build.getInt64Ty());
                 result = build.CreateTrunc(build.CreateLShr(
                     build.CreateMul(wide_a, wide_b), 32), i32);
+                break;
+            }
+            case 43: {
+                auto *low = llvm::ConstantInt::getSigned(i32, -32768);
+                auto *high = llvm::ConstantInt::getSigned(i32, 32767);
+                auto *bounded_low = build.CreateSelect(build.CreateICmpSLT(b, low), low, b);
+                result = build.CreateSelect(build.CreateICmpSGT(bounded_low, high), high, bounded_low);
                 break;
             }
             default: throw std::runtime_error("VC2 JIT internal opcode error");
