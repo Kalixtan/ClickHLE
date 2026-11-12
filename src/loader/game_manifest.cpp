@@ -18,7 +18,9 @@ std::string_view value(std::string_view dict, std::string_view key, std::string_
     const std::string open = "<" + std::string(type) + ">";
     const std::string close = "</" + std::string(type) + ">";
     const auto start = dict.find(open, key_at + marker.size());
-    if (start == std::string_view::npos)
+    const auto next_key = dict.find("<key>", key_at + marker.size());
+    if (start == std::string_view::npos ||
+        (next_key != std::string_view::npos && start > next_key))
         return {};
     const auto end = dict.find(close, start + open.size());
     if (end == std::string_view::npos)
@@ -99,6 +101,11 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
     InstalledGame game;
     game.guid = decode_xml(value(view, "GUID", "string"));
     game.name = decode_xml(value(view, "Name", "string"));
+    game.version = decode_xml(value(view, "Version", "string"));
+    game.build_identifier = decode_xml(value(view, "BuildIdentifier", "string"));
+    while (!game.build_identifier.empty() &&
+           std::isspace(static_cast<unsigned char>(game.build_identifier.back())))
+        game.build_identifier.pop_back();
     game.directory = directory;
     const auto files_key = view.find("<key>Files</key>");
     if (files_key != std::string_view::npos) {
@@ -145,6 +152,10 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
         if (!number(value(dict, "PlatformID", "integer"), variant.platform_id) ||
             !number(value(dict, "PlatformVersion", "integer"), variant.platform_version))
             return std::nullopt;
+        // Older manifests may omit these display fields. The executable path
+        // and platform fields above are the only fields needed to launch.
+        number(value(dict, "BuildID", "integer"), variant.build_id);
+        number(value(dict, "Size", "integer"), variant.size);
         variant.executable = directory / path;
         if (!std::filesystem::is_regular_file(variant.executable))
             return std::nullopt;

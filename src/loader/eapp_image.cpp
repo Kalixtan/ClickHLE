@@ -5,8 +5,6 @@
 
 #include <cstdio>
 
-#include <map>
-
 #include <algorithm>
 #include <fstream>
 
@@ -14,6 +12,7 @@
 #include "clickhle/common/log.h"
 #include "clickhle/core/address_space.h"
 #include "clickhle/loader/game_manifest.h"
+#include "clickhle/loader/framework_abi.h"
 
 namespace clickhle {
 namespace {
@@ -25,44 +24,6 @@ void fail(std::string* error, std::string message) {
     if (error != nullptr) {
         *error = std::move(message);
     }
-}
-
-/// The ABI hash RetailOS publishes for each framework.
-///
-/// These hashes describe the framework versions implemented by ClickHLE.
-/// Some games also ship executables for other iPod platforms with different
-/// framework sizes and hashes. Their ordinal positions cannot be assumed to
-/// match this version, so an unknown ABI is refused rather than guessed.
-///
-/// Values cross-checked against the LLE track's reading of the table inside
-/// RetailOS's own image; both sides agree.
-/// The interface size RetailOS publishes for each framework.
-///
-/// The firmware's own resolver compares the record's count against this and
-/// rejects the record if either the count or the hash disagrees -- both must
-/// match. We had only been checking the hash.
-const std::map<std::string, u32>& known_framework_sizes() {
-    static const std::map<std::string, u32> kSizes = {
-        {"OpenGLES", 179}, {"Metadata", 152},   {"Audio", 61},
-        {"AsyncFileIO", 17}, {"miscTBD", 15},   {"Filesytem", 4},
-        {"Settings", 3},   {"InputEvents", 2},
-    };
-    return kSizes;
-}
-
-const std::map<std::string, std::string>& known_abi_hashes() {
-    static const std::map<std::string, std::string> kHashes = {
-        {"OpenGLES",    "041f4da520603c37d8ef9b879efbf280"},
-        {"Metadata",    "71def8ce4eedefcd5b42dc23a5f45d4d"},
-        {"Audio",       "d9c859f2325e3831f974c1218c35672d"},
-        {"AsyncFileIO", "0012f0601105c3a75125314e17aa989a"},
-        {"miscTBD",     "4fa949cb7829a3264e908a7296366cf8"},
-        // Apple's own typo. Keep it: it is what the binaries say.
-        {"Filesytem",   "9aff0ee8f4485b4006ef4c0e578c3c0c"},
-        {"Settings",    "91e11cfe3c1f4eda92a085db26c09dba"},
-        {"InputEvents", "c73357d0487174bd02f378e54437e1e6"},
-    };
-    return kHashes;
 }
 
 }  // namespace
@@ -201,11 +162,7 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
 
         // Parse every platform's descriptors. Only an exact hash AND count
         // match is safe to bind to the existing Platform 1 HLE ordinals.
-        const auto hash = known_abi_hashes().find(block.name);
-        const auto size = known_framework_sizes().find(block.name);
-        block.compatible_abi = count != 0 && hash != known_abi_hashes().end() &&
-            size != known_framework_sizes().end() && block.hash == hash->second &&
-            count == size->second;
+        block.compatible_abi = has_compatible_framework_abi(block.name, block.hash, count);
 
         block.count = count;
         block.stub_table = eapp::kImageBase + stubs;

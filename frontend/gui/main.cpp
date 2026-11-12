@@ -35,6 +35,7 @@
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
@@ -406,16 +407,19 @@ private:
         controls->addWidget(platform_selector_);
         controls->addStretch();
         library_search_ = new QLineEdit(page);
-        library_search_->setPlaceholderText(tr("Search games"));
+        library_search_->setPlaceholderText(tr("Search name or game ID"));
         controls->addWidget(library_search_);
         auto* refresh = new QPushButton(tr("Refresh"), page);
         controls->addWidget(refresh);
         layout->addLayout(controls);
 
         library_table_ = new QTableWidget(page);
-        library_table_->setColumnCount(2);
-        library_table_->setHorizontalHeaderLabels({tr("Game"), tr("Version")});
-        library_table_->horizontalHeader()->setStretchLastSection(true);
+        library_table_->setColumnCount(6);
+        library_table_->setHorizontalHeaderLabels(
+            {tr("Game"), tr("Version"), tr("Game ID"), tr("Build ID"),
+             tr("EXE size"), tr("Platform version")});
+        library_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        library_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
         library_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
         library_table_->setSelectionMode(QAbstractItemView::SingleSelection);
         library_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -462,6 +466,8 @@ private:
         const u32 platform = platform_selector_->currentData().toUInt();
         for (const auto& game : installed_games_) {
             if (!QString::fromStdString(game.name).contains(library_search_->text(),
+                                                          Qt::CaseInsensitive) &&
+                !QString::fromStdString(game.guid).contains(library_search_->text(),
                                                           Qt::CaseInsensitive))
                 continue;
             const auto variant = std::find_if(game.variants.begin(), game.variants.end(),
@@ -469,10 +475,24 @@ private:
             if (variant == game.variants.end()) continue;
             const int row = library_table_->rowCount();
             library_table_->insertRow(row);
-            library_table_->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(game.name)));
-            library_table_->setItem(row, 1, new QTableWidgetItem(
-                QString::number(variant->platform_version)));
-            library_rows_.push_back(variant->executable);
+            const QString details = tr("Build: %1\nExecutable: %2")
+                .arg(QString::fromStdString(game.build_identifier),
+                     QString::fromStdString(
+                         variant->executable.lexically_relative(game.directory).generic_string()));
+            const QStringList columns{
+                QString::fromStdString(game.name),
+                QString::fromStdString(game.version),
+                QString::fromStdString(game.guid),
+                variant->build_id ? QString::number(variant->build_id) : QStringLiteral("—"),
+                variant->size ? QLocale().formattedDataSize(static_cast<qint64>(variant->size))
+                              : QStringLiteral("—"),
+                QString::number(variant->platform_version)};
+            for (int column = 0; column < columns.size(); ++column) {
+                auto* item = new QTableWidgetItem(columns[column]);
+                item->setToolTip(details);
+                library_table_->setItem(row, column, item);
+            }
+            library_rows_.push_back(*variant);
         }
         library_message_->setText(library_rows_.empty()
             ? tr("No installed games found in the hdd folder.")
@@ -482,8 +502,8 @@ private:
 
     void launchInstalledGame(int row) {
         if (row < 0 || static_cast<std::size_t>(row) >= library_rows_.size()) return;
-        loadGame(QString::fromStdString(library_rows_[static_cast<std::size_t>(row)].string()),
-                 platform_selector_->currentData().toUInt());
+        const auto& variant = library_rows_[static_cast<std::size_t>(row)];
+        loadGame(QString::fromStdString(variant.executable.string()), variant.platform_id);
     }
 
     void showGameLibrary() {
@@ -1228,7 +1248,7 @@ private:
     std::filesystem::path hdd_root_;
     QThread* install_thread_ = nullptr;
     std::vector<clickhle::InstalledGame> installed_games_;
-    std::vector<std::filesystem::path> library_rows_;
+    std::vector<clickhle::GameVariant> library_rows_;
     QStackedWidget* central_stack_ = nullptr;
     QTableWidget* library_table_ = nullptr;
     QComboBox* platform_selector_ = nullptr;

@@ -12,6 +12,8 @@ namespace clickhle {
 struct GameVariant {
     u32 platform_id = 0;
     u32 platform_version = 0;
+    u32 build_id = 0;
+    u64 size = 0;
     std::filesystem::path executable;
 };
 
@@ -23,6 +25,8 @@ struct ManifestFile {
 struct InstalledGame {
     std::string guid;
     std::string name;
+    std::string version;
+    std::string build_identifier;
     std::filesystem::path directory;
     std::vector<GameVariant> variants;
     std::vector<ManifestFile> files;

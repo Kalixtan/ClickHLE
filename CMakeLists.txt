@@ -71,6 +71,7 @@ add_library(clickhle_core
     src/core/cpu_unicorn.cpp
     src/core/emulator.cpp
     src/loader/eapp_image.cpp
+    src/loader/framework_abi.cpp
     src/loader/game_manifest.cpp
     src/loader/music_database.cpp
     src/hle/call_frame.cpp
@@ -113,6 +114,11 @@ target_link_libraries(clickhle_core PRIVATE clickhle_flags)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_game_manifest_test
+        tests/game_manifest_test.cpp src/loader/game_manifest.cpp)
+    target_include_directories(clickhle_game_manifest_test PRIVATE include)
+    target_link_libraries(clickhle_game_manifest_test PRIVATE clickhle_flags)
+    add_test(NAME game_manifest COMMAND clickhle_game_manifest_test)
     add_executable(clickhle_music_database_test
         tests/music_database_test.cpp src/loader/music_database.cpp
         src/hle/vfs.cpp src/common/log.cpp)
