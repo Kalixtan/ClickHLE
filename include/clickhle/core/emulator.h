@@ -114,17 +114,12 @@ public:
         /// useful for replay and bitmap regression runs.
         bool deterministic_system_clock = false;
 
-        /// Host directory the guest filesystem is rooted at. Empty means the
-        /// executable's own directory, which is what a game shipped on an SD
-        /// card expects: it looks for "Data/..." beside itself.
-        ///
-        /// PROVISIONAL: the right root is the installed game directory,
-        /// Games_RO/<id>/, once the AsyncFileIO and filesystem ordinals are
-        /// implemented and their path namespace is known.
+        /// Host directory for game assets. Empty derives Games_RO/<id> from
+        /// an installed executable, or the executable's parent directory.
         std::filesystem::path content_root;
 
-        /// Where saves are written. Empty means "saves/<title>" beside the
-        /// emulator. Never the game directory -- see Vfs::set_save_root.
+        /// GameData_RW/<id> for installed games. Standalone executables use
+        /// "saves/<title>" under the current directory unless overridden.
         std::filesystem::path save_root;
 
         /// The device has 64 MB of SDRAM. Stack and heap are carved out well

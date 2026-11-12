@@ -306,16 +306,25 @@ bool Emulator::load(Config config, std::string* error) {
     } else {
         vfs_.mount(config_.content_root);
     }
-    // Saves go beside the emulator, never into the game directory. A corpus
-    // that quietly diverges from the one that was dumped is a corpus you can no
-    // longer trust, and a title saving over an asset it shipped with would do
-    // exactly that.
+    // Installed games use the same three per-title directories as RetailOS.
+    // Standalone executables keep an isolated host-side save directory.
+    const auto game_root = vfs_.root();
+    const auto control = game_root.parent_path().parent_path();
+    const bool installed = game_root.parent_path().filename() == "Games_RO" &&
+                           control.filename() == "iPod_Control";
     if (config_.save_root.empty()) {
-        vfs_.set_save_root(std::filesystem::current_path() / "saves" /
-                           vfs_.root().filename());
+        vfs_.set_save_root(installed
+            ? control / "GameData_RW" / game_root.filename()
+            : std::filesystem::current_path() / "saves" / game_root.filename());
     } else {
         vfs_.set_save_root(config_.save_root);
     }
+    vfs_.set_stats_root(installed
+        ? control / "GameStats_WO" / game_root.filename()
+        : vfs_.save_root().parent_path() / "stats" / game_root.filename());
+    vfs_.set_shared_root(installed
+        ? control / "GameData_ShareRW"
+        : vfs_.save_root().parent_path() / "shared");
 
     heap_.initialise(config_.heap_base, config_.heap_size);
     scheduler_.initialise(config_.thread_stack_base, config_.thread_stack_arena,

@@ -17,6 +17,16 @@ std::string to_lower(std::string text) {
     return text;
 }
 
+bool valid_component(std::string_view part) {
+    for (const char raw : part) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (c < 32 || c == 127 ||
+            std::string_view("\\:*?\"<>|").find(static_cast<char>(c)) != std::string_view::npos)
+            return false;
+    }
+    return true;
+}
+
 /// Finds `name` in `directory` ignoring case.
 ///
 /// The iPod's filesystem is FAT, so the games were built against
@@ -38,6 +48,13 @@ std::filesystem::path find_insensitive(const std::filesystem::path& directory,
         }
     }
     return {};
+}
+
+std::filesystem::path prepare_directory(std::filesystem::path root) {
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    const auto canonical = std::filesystem::weakly_canonical(root, error);
+    return error || canonical.empty() ? std::move(root) : canonical;
 }
 
 }  // namespace
@@ -62,25 +79,33 @@ void Vfs::mount(std::filesystem::path root) {
 }
 
 void Vfs::set_save_root(std::filesystem::path root) {
-    std::error_code error;
-    std::filesystem::create_directories(root, error);
-    save_root_ = std::filesystem::weakly_canonical(root, error);
-    if (error || save_root_.empty()) {
-        save_root_ = std::move(root);
-    }
+    save_root_ = prepare_directory(std::move(root));
     CLICKHLE_INFO(kCategory) << "saves " << save_root_.string();
 }
 
-std::filesystem::path Vfs::resolve(std::string guest_path) const {
-    // A written file shadows the shipped one: a save is found where the game
-    // left it, not where the game was installed.
-    if (!save_root_.empty()) {
-        std::filesystem::path saved = resolve_under(save_root_, guest_path);
-        if (!saved.empty()) {
-            return saved;
-        }
+void Vfs::set_stats_root(std::filesystem::path root) {
+    stats_root_ = prepare_directory(std::move(root));
+    CLICKHLE_INFO(kCategory) << "stats " << stats_root_.string();
+}
+
+void Vfs::set_shared_root(std::filesystem::path root) {
+    shared_root_ = prepare_directory(std::move(root));
+    CLICKHLE_INFO(kCategory) << "shared " << shared_root_.string();
+}
+
+const std::filesystem::path& Vfs::root_for(Namespace name_space) const noexcept {
+    switch (name_space) {
+    case Namespace::kGame: return root_;
+    case Namespace::kData: return save_root_;
+    case Namespace::kStats: return stats_root_;
+    case Namespace::kShared: return shared_root_;
     }
-    return resolve_under(root_, guest_path);
+    return root_;
+}
+
+std::filesystem::path Vfs::resolve(std::string guest_path,
+                                   Namespace name_space) const {
+    return resolve_under(root_for(name_space), std::move(guest_path));
 }
 
 std::filesystem::path Vfs::resolve_under(const std::filesystem::path& root,
@@ -112,22 +137,26 @@ std::filesystem::path Vfs::resolve_under(const std::filesystem::path& root,
                 << "refusing '" << guest_path << "': escapes the game root";
             return {};
         }
+        if (!valid_component(part)) return {};
         const std::filesystem::path found = find_insensitive(current, part);
         if (found.empty()) {
             return {};
         }
+        std::error_code error;
+        if (std::filesystem::is_symlink(std::filesystem::symlink_status(found, error)) || error)
+            return {};
         current = found;
     }
     return current;
 }
 
-u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write) {
-    // Writes never touch the game directory. Resolving first and then writing
-    // wherever the file happened to be found would modify the user's copy the
-    // moment a title saved over something it shipped with.
+u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write,
+              Namespace name_space) {
+    // Games_RO is immutable. Each writable namespace has its own root.
+    if (name_space == Namespace::kGame && mode != Mode::kRead) return 0;
+    const auto& base = root_for(name_space);
+    if (base.empty()) return 0;
     if (mode == Mode::kWrite || mode == Mode::kUpdate) {
-        const std::filesystem::path base =
-            save_root_.empty() ? root_ : save_root_;
         std::string leaf = guest_path;
         std::replace(leaf.begin(), leaf.end(), '\\', '/');
         // Guest paths are rooted at the game's virtual filesystem. A leading
@@ -150,7 +179,12 @@ u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write) {
             const auto part = leaf.substr(start, slash == std::string::npos
                 ? std::string::npos : slash - start);
             if (!part.empty() && part != ".") {
+                if (!valid_component(part)) return 0;
                 const auto existing = find_insensitive(host, part);
+                std::error_code type_error;
+                if (!existing.empty() &&
+                    (std::filesystem::is_symlink(std::filesystem::symlink_status(existing, type_error)) ||
+                     type_error)) return 0;
                 host = existing.empty() ? host / part : existing;
             }
             if (slash == std::string::npos) break;
@@ -182,31 +216,14 @@ u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write) {
         return handle;
     }
 
-    std::filesystem::path host = resolve(guest_path);
+    std::filesystem::path host = resolve(guest_path, name_space);
     if (host.empty()) {
-        if (mode == Mode::kRead) {
-            if (std::find(missing_.begin(), missing_.end(), guest_path) ==
-                missing_.end()) {
-                missing_.push_back(guest_path);
-            }
-            CLICKHLE_INFO(kCategory) << "missing '" << guest_path << "'";
-            return 0;
+        if (std::find(missing_.begin(), missing_.end(), guest_path) ==
+            missing_.end()) {
+            missing_.push_back(guest_path);
         }
-        // A file being written need not exist yet. Only the directory has to,
-        // and resolve() cannot find a name that is not there, so build the
-        // host path from the parent instead.
-        const std::size_t slash = guest_path.find_last_of("/\\");
-        const std::string leaf = slash == std::string::npos
-                                     ? guest_path
-                                     : guest_path.substr(slash + 1);
-        const std::filesystem::path parent =
-            slash == std::string::npos
-                ? root_
-                : resolve(guest_path.substr(0, slash));
-        if (parent.empty() || leaf.empty()) {
-            return 0;
-        }
-        host = parent / leaf;
+        CLICKHLE_INFO(kCategory) << "missing '" << guest_path << "'";
+        return 0;
     }
 
     std::FILE* file = std::fopen(host.string().c_str(),
@@ -234,14 +251,16 @@ bool Vfs::close(u32 handle) {
     return true;
 }
 
-bool Vfs::remove_saved(const std::string& guest_path) {
-    if (save_root_.empty() || guest_path.empty()) return false;
-    const auto host = resolve_under(save_root_, guest_path);
-    if (host.empty() || host == save_root_) return false;
+bool Vfs::remove_saved(const std::string& guest_path, Namespace name_space) {
+    if (name_space == Namespace::kGame || guest_path.empty()) return false;
+    const auto& root = root_for(name_space);
+    if (root.empty()) return false;
+    const auto host = resolve_under(root, guest_path);
+    if (host.empty() || host == root) return false;
     std::error_code error;
     const auto canonical = std::filesystem::weakly_canonical(host, error);
     if (error) return false;
-    const auto relative = canonical.lexically_relative(save_root_);
+    const auto relative = canonical.lexically_relative(root);
     if (relative.empty() || relative.begin() == relative.end() ||
         *relative.begin() == "..") return false;
     return std::filesystem::remove(host, error) && !error;
@@ -252,6 +271,10 @@ i64 Vfs::read(u32 handle, void* buffer, u32 length) {
     if (it == files_.end()) {
         return -1;
     }
+    // C update streams need a positioning operation when switching between
+    // reads and writes. A zero-distance seek preserves the guest file offset.
+    if (it->second.mode == Mode::kUpdate &&
+        std::fseek(it->second.handle, 0, SEEK_CUR) != 0) return -1;
     return static_cast<i64>(
         std::fread(buffer, 1, length, it->second.handle));
 }
@@ -261,6 +284,8 @@ i64 Vfs::write(u32 handle, const void* buffer, u32 length) {
     if (it == files_.end() || !it->second.allow_write) {
         return -1;
     }
+    if (it->second.mode == Mode::kUpdate &&
+        std::fseek(it->second.handle, 0, SEEK_CUR) != 0) return -1;
     return static_cast<i64>(
         std::fwrite(buffer, 1, length, it->second.handle));
 }

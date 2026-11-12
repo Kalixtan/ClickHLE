@@ -62,6 +62,22 @@ std::optional<std::string> read_path_strict(HleCallFrame& frame,
     return std::nullopt;
 }
 
+std::optional<Vfs::Namespace> file_namespace(u32 mode) {
+    switch (mode) {
+    case 0: case 4: return Vfs::Namespace::kGame;
+    case 1: return Vfs::Namespace::kData;
+    case 2: return Vfs::Namespace::kStats;
+    case 3: return Vfs::Namespace::kShared;
+    default: return std::nullopt;
+    }
+}
+
+Vfs::Mode open_mode(Vfs::Namespace name_space) {
+    if (name_space == Vfs::Namespace::kGame) return Vfs::Mode::kRead;
+    if (name_space == Vfs::Namespace::kStats) return Vfs::Mode::kWrite;
+    return Vfs::Mode::kUpdate;
+}
+
 template <typename T>
 bool store_guest_or_stop(HleCallFrame& frame, GuestAddr address, T value) {
     if (frame.store<T>(address, value)) return true;
@@ -211,9 +227,13 @@ void register_fileio(HleRegistry& registry) {
         // mode 0 is an asset ("Strings.dta", "audio/bad.wav"); mode 1 is a
         // save ("savefile.dat", "pac_man.dat", "jdmgp.sav"). A save is opened
         // for update, not for writing -- see Vfs::Mode::kUpdate.
-        const auto vfs_mode = mode == 0 ? Vfs::Mode::kRead : Vfs::Mode::kUpdate;
+        const auto name_space = file_namespace(mode);
+        if (!name_space) { f.ret(0); return; }
         Vfs& vfs = f.emulator.vfs();
-        const u32 handle = vfs.open(path, vfs_mode);
+        const auto vfs_mode = *name_space == Vfs::Namespace::kStats
+            ? Vfs::Mode::kRead : open_mode(*name_space);
+        const u32 handle = vfs.open(path, vfs_mode,
+                                    vfs_mode != Vfs::Mode::kRead, *name_space);
         if (handle == 0) {
             if (!store_guest_or_stop(f, req + request::kStatus, kFailure) ||
                 !store_guest_or_stop(f, req + request::kHandle, kFailure)) return;
@@ -648,7 +668,12 @@ void register_fileio(HleRegistry& registry) {
         }
         const std::string& path = *path_value;
         Vfs& vfs = f.emulator.vfs();
-        const u32 handle = vfs.open(path, Vfs::Mode::kUpdate);
+        const auto name_space = file_namespace(mode);
+        if (!name_space || *name_space == Vfs::Namespace::kGame) {
+            f.ret(0);
+            return;
+        }
+        const u32 handle = vfs.open(path, open_mode(*name_space), true, *name_space);
         if (handle == 0) {
             if (!store_guest_or_stop(f, req + request::kHandle, kFailure) ||
                 !store_guest_or_stop(f, req + request::kSizeResult, 0u) ||
@@ -705,7 +730,9 @@ void register_fileio(HleRegistry& registry) {
             f.cpu.request_stop();
             return;
         }
-        const bool removed = f.emulator.vfs().remove_saved(*path);
+        const auto name_space = file_namespace(mode);
+        const bool removed = name_space &&
+            f.emulator.vfs().remove_saved(*path, *name_space);
         // The firmware's filesystem method returns a status word. The exact
         // missing-path code is not established; success is zero.
         if (!store_guest_or_stop(f, req + request::kStatus,
@@ -741,8 +768,9 @@ void register_fileio(HleRegistry& registry) {
         dump_request(f, req);
 
         Vfs& vfs = f.emulator.vfs();
-        const auto vfs_mode = mode == 0 ? Vfs::Mode::kRead : Vfs::Mode::kUpdate;
-        const u32 handle = vfs.open(path, vfs_mode);
+        const auto name_space = file_namespace(mode);
+        if (!name_space) { f.ret(0); return; }
+        const u32 handle = vfs.open(path, open_mode(*name_space), true, *name_space);
         if (handle == 0) {
             if (!store_guest_or_stop(f, req + request::kHandle, kFailure) ||
                 !store_guest_or_stop(f, req + request::kStatus, 0x17u)) return;
@@ -821,8 +849,9 @@ void register_fileio(HleRegistry& registry) {
         const std::string& path = *path_value;
 
         Vfs& vfs = f.emulator.vfs();
-        const std::filesystem::path& root =
-            mode == 0 ? vfs.root() : vfs.save_root();
+        const auto name_space = file_namespace(mode);
+        if (!name_space) { f.ret(0); return; }
+        const std::filesystem::path& root = vfs.root_for(*name_space);
         const std::filesystem::path host_path = vfs.resolve_under(root, path);
         std::error_code error;
         if (host_path.empty() ||
@@ -977,7 +1006,8 @@ void register_fileio(HleRegistry& registry) {
         for (u32 i = 0; i < stores.size(); ++i) {
             if (stores[i].references == 0) {
                 std::vector<u8> data;
-                const u32 file = f.emulator.vfs().open(path, Vfs::Mode::kRead);
+                const u32 file = f.emulator.vfs().open(
+                    path, Vfs::Mode::kRead, false, Vfs::Namespace::kData);
                 if (file != 0) {
                     const i64 file_size = f.emulator.vfs().size(file);
                     if (file_size < 0 || file_size > 0x19000u) {
@@ -1126,7 +1156,8 @@ void register_fileio(HleRegistry& registry) {
             return;
         }
         const std::string path = state.stores[slot].path;
-        const u32 host_handle = f.emulator.vfs().open(path, Vfs::Mode::kWrite);
+        const u32 host_handle = f.emulator.vfs().open(
+            path, Vfs::Mode::kWrite, true, Vfs::Namespace::kData);
         if (host_handle == 0) {
             f.ret(0x17);
             return;
@@ -1221,23 +1252,17 @@ void register_fileio(HleRegistry& registry) {
             f.cpu.request_stop();
             return;
         }
-        // The first argument selects the firmware path namespace: 0 is
-        // games_RO, 1 is gamedata_RW, and 2 is gamestats_WO. The third
+        // The first argument selects the firmware path namespace. The third
         // argument is a separate file-object access flag; the inner writer
         // returns 0x13 whenever it is nonzero.
-        Vfs::Mode vfs_mode = Vfs::Mode::kRead;
-        const char* namespace_name = "unknown";
-        if (namespace_id == 0) {
-            namespace_name = "games_RO";
-        } else if (namespace_id == 1) {
-            namespace_name = "gamedata_RW";
-            vfs_mode = Vfs::Mode::kUpdate;
-        } else if (namespace_id == 2) {
-            namespace_name = "gamestats_WO";
-            vfs_mode = Vfs::Mode::kWrite;
-        }
-        const bool allow_write = namespace_id != 0 && access_flag == 0;
-        const u32 handle = f.emulator.vfs().open(path, vfs_mode, allow_write);
+        const auto name_space = file_namespace(namespace_id);
+        if (!name_space) { f.ret(kFsOpenFailed); return; }
+        const auto vfs_mode = access_flag == 0
+            ? open_mode(*name_space) : Vfs::Mode::kRead;
+        const bool allow_write = *name_space != Vfs::Namespace::kGame &&
+                                 access_flag == 0;
+        const u32 handle = f.emulator.vfs().open(
+            path, vfs_mode, allow_write, *name_space);
         if (handle == 0) {
             CLICKHLE_INFO(kCategory)
                 << "fs_open(\"" << path << "\") -> MISSING";
@@ -1251,7 +1276,7 @@ void register_fileio(HleRegistry& registry) {
             f.cpu.request_stop();
             return;
         }
-        CLICKHLE_INFO(kCategory) << "fs_open[" << namespace_name << "](\""
+        CLICKHLE_INFO(kCategory) << "fs_open[" << namespace_id << "](\""
                                  << path << "\", access=" << access_flag
                                  << ") -> ok";
         f.ret(0);

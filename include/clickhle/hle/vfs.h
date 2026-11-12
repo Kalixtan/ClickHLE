@@ -39,17 +39,12 @@ public:
     /// Mounts an explicit root, for tests and for `--content-root`.
     void mount(std::filesystem::path root);
 
-    /// Where writes go.
-    ///
-    /// Separate from the game root on purpose. A title's directory is the
-    /// user's copy of the game, and running an emulator should not modify it --
-    /// the device kept saves elsewhere, and writing `savefile.dat` in among the
-    /// assets means a corpus that quietly diverges from the one that was
-    /// dumped.
-    ///
-    /// Reads check the save area first, so a saved file shadows a shipped file;
-    /// writes only ever land here.
+    /// GameData_RW/<game-id>, or a standalone executable's save directory.
     void set_save_root(std::filesystem::path root);
+    void set_stats_root(std::filesystem::path root);
+    void set_shared_root(std::filesystem::path root);
+
+    enum class Namespace { kGame, kData, kStats, kShared };
 
     [[nodiscard]] const std::filesystem::path& save_root() const noexcept {
         return save_root_;
@@ -65,7 +60,10 @@ public:
     /// Case-insensitive on the host, deliberately: the iPod's filesystem is
     /// FAT and the games were built against it, so a title asking for
     /// `"RSERVER.BIN"` must find `rserver.bin`. A Linux host would not.
-    [[nodiscard]] std::filesystem::path resolve(std::string guest_path) const;
+    [[nodiscard]] std::filesystem::path resolve(
+        std::string guest_path, Namespace name_space = Namespace::kGame) const;
+
+    [[nodiscard]] const std::filesystem::path& root_for(Namespace name_space) const noexcept;
 
     /// Resolve beneath a specific root, honouring the same confinement and
     /// case rules.
@@ -85,12 +83,14 @@ public:
 
     /// Opens a guest path and returns a handle, or 0 on failure.
     [[nodiscard]] u32 open(const std::string& guest_path, Mode mode,
-                           bool allow_write = true);
+                           bool allow_write = true,
+                           Namespace name_space = Namespace::kGame);
 
     [[nodiscard]] bool close(u32 handle);
 
     /// Remove an existing saved file or empty directory, never a game asset.
-    [[nodiscard]] bool remove_saved(const std::string& guest_path);
+    [[nodiscard]] bool remove_saved(const std::string& guest_path,
+                                    Namespace name_space = Namespace::kData);
 
     /// Bytes read, or -1 if the handle is unknown.
     [[nodiscard]] i64 read(u32 handle, void* buffer, u32 length);
@@ -126,6 +126,8 @@ private:
 
     std::filesystem::path root_;
     std::filesystem::path save_root_;
+    std::filesystem::path stats_root_;
+    std::filesystem::path shared_root_;
     std::map<u32, OpenFile> files_;
     std::vector<std::string> missing_;
     /// Handles start above zero because the guest tests for zero as failure.
