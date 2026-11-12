@@ -17,10 +17,12 @@ class Jit {
     Jit &operator=(const Jit &) = delete;
 
     unsigned try_execute(Core &core, unsigned limit, u16 first_word);
+    unsigned try_execute_cached(Core &core, unsigned limit);
 
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    unsigned continue_vectors(Core &core, unsigned limit, u32 pc, unsigned executed);
 };
 
 } // namespace clickhle::vc2

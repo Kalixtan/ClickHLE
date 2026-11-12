@@ -554,9 +554,16 @@ bool Core::run(u64 budget) {
 #if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
             if (!executed && jit_enabled_ && jit_ && !alignment_exception_steps_ &&
                 r[31] < 0x4000000 && !(r[31] & 1)) {
-                fetched = static_cast<u16>(read(r[31], 2));
                 const auto remaining = 32 - (n & 31);
-                executed = jit_->try_execute(*this, static_cast<unsigned>(remaining), *fetched);
+                // A valid cached block already identifies its instruction bytes.
+                // Restrict the fast path to RAM, since bus reads elsewhere can
+                // have device side effects even when a block is cached.
+                if (r[31] < ram_.size() - 1)
+                    executed = jit_->try_execute_cached(*this, static_cast<unsigned>(remaining));
+                if (!executed) {
+                    fetched = static_cast<u16>(read(r[31], 2));
+                    executed = jit_->try_execute(*this, static_cast<unsigned>(remaining), *fetched);
+                }
                 jit_instructions += executed;
                 jit_executions += executed != 0;
             }

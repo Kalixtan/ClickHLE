@@ -2765,11 +2765,34 @@ struct Jit::Impl {
 
 Jit::Jit() : impl_(std::make_unique<Impl>()) {}
 Jit::~Jit() { impl_->report(); }
+unsigned Jit::try_execute_cached(Core &core, unsigned limit) {
+    const u32 pc = core.r[31];
+    if (!limit || pc >= 0x4000000 || (pc & 1)) return 0;
+    const auto &page = impl_->pages[pc >> 12];
+    if (!page) return 0;
+    const Block *block = page->entries[(pc & 4095) >> 1].block;
+    if (!block || (block->kind == Block::Kind::VectorRegion && block->vector_pcs.size() > limit) ||
+        (block->kind == Block::Kind::Scalar && block->operations.size() > limit)) return 0;
+    const unsigned length = block->kind == Block::Kind::Scalar && !block->length
+        ? static_cast<unsigned>(block->operations.size()) : block->length;
+    if (!Impl::code_unchanged(core, pc, length, block->code_versions)) return 0;
+    const unsigned executed = impl_->execute(core, *block, limit);
+    if (!executed) return 0;
+    if (impl_->profile) {
+        const u16 first = block->kind == Block::Kind::Scalar && !block->length
+            ? block->operations.front().word : block->words[0];
+        impl_->record(pc, first, executed);
+    }
+    return continue_vectors(core, limit, pc, executed);
+}
 unsigned Jit::try_execute(Core &core, unsigned limit, u16 first_word) {
     const u32 pc = core.r[31];
     unsigned executed = impl_->try_execute(core, limit, first_word);
     core.jit_compile_cpu = impl_->compile_cpu;
     impl_->record(pc, first_word, executed);
+    return continue_vectors(core, limit, pc, executed);
+}
+unsigned Jit::continue_vectors(Core &core, unsigned limit, u32 pc, unsigned executed) {
     if (!executed || pc >= 0x4000000) return executed;
     const auto &page = impl_->pages[pc >> 12];
     const Block *block = page->entries[(pc & 4095) >> 1].block;
