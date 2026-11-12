@@ -521,6 +521,8 @@ VectorPlan Core::decode_vector(const std::array<u32, 5> &w, unsigned length) con
     VectorPlan decoded;
     auto &[words, decoded_length, d, a, b, count, pred, sru, sreg, scalar,
            setf, clear, accumulate, x15, bkind, immediate, modes] = decoded;
+    bool dynamic_repeat = length == 5 ? ((w[4] >> 5) & 7) == 7 :
+                          (w[2] & 0x400) && ((w[2] >> 6) & 7) == 7;
     if (length == 5) {
         setf = w[4] & 0x4000;
         pred = (w[4] >> 11) & 7;
@@ -568,6 +570,7 @@ VectorPlan Core::decode_vector(const std::array<u32, 5> &w, unsigned length) con
                  (w[0] == 0x2252 && (w[2] == 0x0482 || w[2] == 0x0504)))) {
                 pred = (w[2] >> 6) & 7;
                 count = 1;
+                dynamic_repeat = false;
             }
             // Original shader clamp: IFNZ first sets the low half to
             // 65535 for nonzero high halves, then IFN clears negative inputs.
@@ -576,20 +579,25 @@ VectorPlan Core::decode_vector(const std::array<u32, 5> &w, unsigned length) con
             if (w[0] == 0x2222 && (w[1] & 255) == 0xe0 && w[2] == 0x0500) {
                 pred = 4;
                 count = 1;
+                dynamic_repeat = false;
             }
             // RGBA5551 expansion pairs IFNZ #255 with IFZ #0. Decoding
             // this as REP4 clears opaque alpha and neighbouring columns.
             if (w[0] == 0x2224 && (w[1] & 255) == 0xe0 && w[2] == 0x0480) {
                 pred = 2;
                 count = 1;
+                dynamic_repeat = false;
             }
-            // An uploaded shader follows a carry-setting right shift with
-            // this IFNC #0 move and an 80-bit IFC #0x8000 move. r0 holds an
-            // address at this site, not a repeat count. The compact
-            // predicate layout beyond this exact encoding is unverified.
-            if (w[0] == 0x2226 && w[1] == 0xa0e0 && w[2] == 0x05c0) {
+            // The same IFNC #0 move follows a carry-setting shift at four
+            // adjacent vector coordinates. The destination bits vary in
+            // both uploaded shader copies; the modifier remains 05c0 and
+            // r0 holds an address, not a repeat count. Other compact
+            // predicate encodings remain unverified.
+            if (w[0] == 0x2226 && (w[1] & 0xf3ffu) == 0xa0e0 &&
+                w[2] == 0x05c0) {
                 pred = 7;
                 count = 1;
+                dynamic_repeat = false;
             }
             bkind = 1;
             immediate = sign_extend(w[2] & 63, 6);
@@ -680,11 +688,15 @@ VectorPlan Core::decode_vector(const std::array<u32, 5> &w, unsigned length) con
                           (length == 5 && w[0] == 0x2030 &&
                            (w[4] == 7 || w[4] == 0x87)));
     // Provisional halfword join in uploaded shaders 36/37: a carry-derived
-    // high bit is combined with the shifted lower halfword. Selector 6 also
-    // unions rejection masks elsewhere; no device result establishes this
-    // x15 form independently, so accept only the archived instruction.
-    halfword_or = length == 5 && w[0] == 0x2036 && w[1] == 0xa1f5 &&
-                   w[2] == 0x0a81 && w[3] == 0x790e && w[4] == 0x8007;
+    // high bit is combined with the shifted lower halfword. The four
+    // adjacent vector coordinates vary together in both the destination and
+    // source words. Selector 6 also unions rejection masks elsewhere; this
+    // x15 form still has no independent device result.
+    const unsigned group = (w[1] >> 10) & 3;
+    halfword_or = length == 5 && w[0] == 0x2036 &&
+                   (w[1] & 0xf3ffu) == 0xa1f5 &&
+                   w[2] == 0x0a81 + 0x2010 * group &&
+                   w[3] == 0x790e && w[4] == 0x8007;
     // Firmware-derived B + sign(A). MPEG-4's vc_H263IQuant8x8 uses
     // B=A for odd quantizers and B=0 for even ones; both reproduce the
     // H.263 inverse-quantization formula, including zero coefficients.
@@ -765,9 +777,8 @@ VectorPlan Core::decode_vector(const std::array<u32, 5> &w, unsigned length) con
             }
         }
     }
-    // REP r0 stays live; compact forms also change destination stepping.
-    const bool dynamic_repeat = length == 5 ? ((w[4] >> 5) & 7) == 7 :
-                                (w[2] & 0x400) && ((w[2] >> 6) & 7) == 7;
+    // Cache only fixed-repeat plans. JIT reads length==0 as REP=r0, so a
+    // compact predicate decoded to one execution must not retain that flag.
     decoded.words = w;
     decoded.length = dynamic_repeat ? 0 : length;
     return decoded;

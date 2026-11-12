@@ -115,6 +115,12 @@ target_link_libraries(clickhle_core PRIVATE clickhle_flags)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_vc2_compact_predicate_test
+        tests/vc2_compact_predicate_test.cpp)
+    target_include_directories(clickhle_vc2_compact_predicate_test PRIVATE
+        include src/video/vc2)
+    target_link_libraries(clickhle_vc2_compact_predicate_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME vc2_compact_predicate COMMAND clickhle_vc2_compact_predicate_test)
     add_executable(clickhle_storage_paths_test
         tests/storage_paths_test.cpp src/core/storage_paths.cpp
         src/hle/vfs.cpp src/common/log.cpp)
