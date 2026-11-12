@@ -2272,8 +2272,12 @@ struct Jit::Impl {
                     // The native wrapper currently resolves D before the call.
                     (decoded->sreg == 7 || decoded->d.reg != static_cast<int>(decoded->sreg)) &&
                     (!decoded->setf || (!decoded->modes.lowcarry && !decoded->modes.lowborrow)) &&
+                    // The interpreter admits this exact byte accumulator
+                    // form provisionally for the bilinear shader. Its JIT
+                    // path must retain that same limited scope.
                     (!decoded->x15 || decoded->d.width == 2 ||
-                     decoded->modes.blend || decoded->modes.nibble) &&
+                     decoded->modes.blend || decoded->modes.nibble ||
+                     decoded->modes.filtered_byte) &&
                     // Immediate SETF shifts include exact shifted-out carry
                     // rules; keep those on the reference path for now.
                     !(decoded->bkind != 0 && decoded->setf && vector_op == 27) &&
