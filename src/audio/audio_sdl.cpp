@@ -35,7 +35,9 @@ public:
         spec.freq = static_cast<int>(sample_rate);
         spec.channels = channels == 0 ? 1 : channels;
         // waveOut only ever offers 8-bit unsigned or 16-bit signed PCM.
-        spec.format = bits_per_sample == 8 ? SDL_AUDIO_U8 : SDL_AUDIO_S16LE;
+        // The mixer accumulates native-endian int16_t samples. Guest PCM is
+        // little-endian and is converted from that format in play().
+        spec.format = bits_per_sample == 8 ? SDL_AUDIO_U8 : SDL_AUDIO_S16;
 
         spec_ = spec;
         stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,

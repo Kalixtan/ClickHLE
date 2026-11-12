@@ -232,7 +232,6 @@ public:
     struct AudioState {
         struct Sound {
             GuestAddr guest_object = 0;
-            std::filesystem::path asset_path;
             u32 buffer = 0;
             u32 repeat = 1;
             u32 state = 0;
@@ -261,7 +260,6 @@ public:
         i32 stream_control = -1;
         u32 stream_repeat_internal_mode = 0;
         bool stream_shuffle = false;
-        std::deque<u32> pending_sfx_assets;
         std::map<u32, Sound> sounds;
     };
 
@@ -520,6 +518,9 @@ public:
     /// something, so a silent title (and every headless test) pays nothing and
     /// never touches an audio device. Null until then.
     [[nodiscard]] AudioDevice* audio() noexcept { return audio_.get(); }
+    [[nodiscard]] const std::string& audio_error() const noexcept {
+        return audio_error_;
+    }
     AudioDevice* open_audio(u32 sample_rate, u16 channels, u16 bits);
 
     /// When set, every presented frame is written here, overwriting. The file
@@ -687,6 +688,7 @@ private:
     std::unique_ptr<VideoCore> videocore_;
     std::unique_ptr<Display> display_ = Display::create();
     std::unique_ptr<AudioDevice> audio_;
+    std::string audio_error_;
     u32 audio_rate_ = 0;
     u16 audio_channels_ = 0;
     u16 audio_bits_ = 0;

@@ -20,7 +20,6 @@
 #include "clickhle/hle/modules.h"
 
 #include <filesystem>
-#include <cctype>
 #include <string>
 #include <cstdio>
 #include <cstdlib>
@@ -244,36 +243,6 @@ void register_fileio(HleRegistry& registry) {
             f.emulator.queue_io_completion(req, path);
             f.ret(1);
             return;
-        }
-
-        // The SFX descriptor is created immediately before its WAV header is
-        // read. Retain the resolved asset on that handle so Audio#2 can play
-        // the actual sample; Audio#7's guest pointer is not a PCM address.
-        std::string extension = std::filesystem::path(path).extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(),
-                       [](unsigned char ch) {
-                           return static_cast<char>(std::tolower(ch));
-                       });
-        auto& audio = f.emulator.audio_state();
-        if ((extension == ".wav" || extension == ".m4a" ||
-             extension == ".mp3" || extension == ".aac" ||
-             extension == ".mp4" || extension == ".m4b" ||
-             extension == ".m4p" || extension == ".flac" ||
-             extension == ".ogg") &&
-            !audio.pending_sfx_assets.empty()) {
-            while (!audio.pending_sfx_assets.empty()) {
-                const u32 pending_handle = audio.pending_sfx_assets.front();
-                audio.pending_sfx_assets.pop_front();
-                const auto sound = audio.sounds.find(pending_handle);
-                if (sound == audio.sounds.end()) {
-                    continue;
-                }
-                sound->second.asset_path = vfs.resolve(path);
-                CLICKHLE_DEBUG(kCategory)
-                    << "bound WAV " << path << " to SFX handle "
-                    << pending_handle;
-                break;
-            }
         }
 
         const i64 size = vfs.size(handle);

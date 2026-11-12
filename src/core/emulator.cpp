@@ -188,6 +188,8 @@ bool Emulator::load(Config config, std::string* error) {
     last_system_clock_us_ = 0;
     metadata_state_ = {};
     audio_state_ = {};
+    audio_.reset();
+    audio_error_.clear();
     input_state_ = {};
     misc_state_ = {};
     filesystem_state_ = {};
@@ -1094,10 +1096,20 @@ AudioDevice* Emulator::open_audio(u32 sample_rate, u16 channels, u16 bits) {
     if (!audio_) {
         auto device = AudioDevice::create();
         if (!device) {
+            audio_error_ = "No host audio backend is available";
+            CLICKHLE_WARN(kCategory) << audio_error_;
             return nullptr;
         }
         if (!device->open(kMixRate, kMixChannels, kMixBits)) {
+            audio_error_ = "Could not open the host audio device (see audio log)";
+            CLICKHLE_WARN(kCategory) << audio_error_;
             return nullptr;
+        }
+        if (device->backend() == "silent") {
+            audio_error_ = "This build has no audio output backend";
+            CLICKHLE_WARN(kCategory) << audio_error_;
+        } else {
+            audio_error_.clear();
         }
         audio_ = std::move(device);
         audio_rate_ = kMixRate;

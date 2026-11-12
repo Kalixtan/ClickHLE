@@ -12,7 +12,10 @@ cmake --build build --parallel
 ```
 
 The command-line program is `build/bin/clickhle`. When Qt 6 Widgets is available, CMake also builds
-`build/bin/clickhle-gui`. Unicorn Engine 2 is required at runtime; SDL3 adds window, input, and audio support. Dependencies, game images, firmware, and reference assets are not bundled. See
+`build/bin/clickhle-gui`. Unicorn Engine 2 is required at runtime; SDL3 adds
+window, input, and audio support. WAV effects use the game's PCM buffers;
+AAC/MP3 music also needs FFmpeg at build time. Dependencies, game images,
+firmware, and reference assets are not bundled. See
 [LICENSING.md](LICENSING.md) for dependency notes.
 
 The GUI lists games from `hdd/iPod_Control/Games_RO` beside its executable.

@@ -119,6 +119,10 @@ if(BUILD_TESTING)
     target_include_directories(clickhle_music_database_test PRIVATE include)
     target_link_libraries(clickhle_music_database_test PRIVATE clickhle_flags)
     add_test(NAME music_database COMMAND clickhle_music_database_test)
+    add_executable(clickhle_audio_sfx_test tests/audio_sfx_test.cpp)
+    target_link_libraries(clickhle_audio_sfx_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME audio_sfx COMMAND clickhle_audio_sfx_test)
+    set_tests_properties(audio_sfx PROPERTIES ENVIRONMENT "SDL_AUDIODRIVER=dummy")
 endif()
 
 # Unicorn is dynamically loaded from the host system at runtime.

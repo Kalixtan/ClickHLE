@@ -6,17 +6,8 @@
 // play it. A *stream* is the music path, registered once and then played,
 // repeated or shuffled.
 //
-// Nothing decodes yet. The assets are .wav and .m4a beside each game, and what
-// the firmware accepts is not established, so every entry here is bookkeeping:
-// objects are created and remembered, properties are stored, and play is
-// recorded. A game gets consistent answers and does not stall; it does not get
-// sound.
-//
-// That distinction is deliberate. Returning plausible handles is not a stub in
-// the sense this project avoids -- the guest's observable contract is "I asked
-// for a sound object and got one back that behaves consistently" -- but the
-// audio itself is honestly absent, and the coverage table should be read that
-// way.
+// SFX playback consumes the PCM buffer the guest configured. Compressed music
+// streams are registered by the game and decoded from its installed assets.
 
 #include "clickhle/hle/modules.h"
 
@@ -28,6 +19,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "clickhle/common/log.h"
 #include "clickhle/audio/audio_device.h"
@@ -176,10 +168,9 @@ void append_wav_dump(const void* pcm, u32 bytes, u32 rate, u16 channels,
 
 }  // namespace
 
-/// Decode and queue the registered WAV when the guest explicitly starts a
-/// sound. Audio#7 stores a firmware buffer descriptor, not a PCM pointer; the
-/// corresponding asset is associated with the SFX handle when its WAV header
-/// is opened through AsyncFileIO.
+/// Play the guest's PCM when it explicitly starts a sound. The audio setters
+/// give us the buffer address, length and format. Tetris's configured length
+/// matches its WAV data chunk exactly, and the bytes at #7's pointer are PCM.
 bool try_start_voice(HleCallFrame& f, u32 handle) {
     auto& sounds = f.emulator.audio_state().sounds;
     const auto it = sounds.find(handle);
@@ -187,36 +178,39 @@ bool try_start_voice(HleCallFrame& f, u32 handle) {
         return false;
     }
     Sound& snd = it->second;
-    if (snd.asset_path.empty()) {
+    const u32 length = snd.fields.at(kFieldLength);
+    const u32 rate = snd.fields.at(kFieldRate);
+    const u32 channels = snd.fields.at(kFieldChannels);
+    const u32 bits = snd.fields.at(kFieldBits);
+    if (snd.buffer == 0 || length == 0 || length > 64u * 1024u * 1024u ||
+        rate == 0 || channels == 0 || channels > 2 ||
+        (bits != 8 && bits != 16) ||
+        length % (channels * (bits / 8u)) != 0) {
+        CLICKHLE_WARN(kCategory) << "sfx handle=" << handle
+                                  << ": invalid guest PCM format or length";
         return false;
     }
-    const auto length = snd.fields.find(kFieldLength);
-    const u32 maximum_bytes = length == snd.fields.end() ? 0 : length->second;
-    auto wav = decode_game_audio(snd.asset_path, maximum_bytes);
-    if (!wav) {
-        CLICKHLE_WARN(kCategory)
-            << "sfx handle=" << handle << ": unsupported or unreadable WAV "
-            << snd.asset_path.string();
+    std::vector<u8> pcm(length);
+    if (!f.memory.read_bytes(snd.buffer, pcm.data(), length)) {
+        CLICKHLE_WARN(kCategory) << "sfx handle=" << handle
+                                  << ": unreadable guest PCM buffer 0x"
+                                  << std::hex << snd.buffer;
         return false;
     }
-    AudioDevice* dev = f.emulator.open_audio(
-        wav->sample_rate, wav->channels, wav->bits_per_sample);
+    AudioDevice* dev = f.emulator.open_audio(rate, static_cast<u16>(channels),
+                                              static_cast<u16>(bits));
     if (dev == nullptr ||
-        !dev->play(handle, wav->pcm.data(),
-                   static_cast<u32>(wav->pcm.size()), wav->sample_rate,
-                   wav->channels, wav->bits_per_sample, false)) {
+        !dev->play(handle, pcm.data(), length, rate,
+                   static_cast<u16>(channels), static_cast<u16>(bits), false)) {
         return false;
     }
     snd.started = true;
     set_sound_state(f, sounds, handle, 1);
-    if (f.emulator.config().capture_videocore)
-        append_wav_dump(wav->pcm.data(), static_cast<u32>(wav->pcm.size()),
-                        wav->sample_rate, wav->channels, wav->bits_per_sample);
+    append_wav_dump(pcm.data(), length, rate, static_cast<u16>(channels),
+                    static_cast<u16>(bits));
     CLICKHLE_DEBUG(kCategory)
-        << "sfx play handle=" << handle << " " << wav->pcm.size()
-        << " PCM bytes @" << wav->sample_rate << "/"
-        << wav->bits_per_sample << "/" << wav->channels << " from "
-        << snd.asset_path.string();
+        << "sfx play handle=" << handle << " " << length
+        << " guest PCM bytes @" << rate << "/" << bits << "/" << channels;
     return true;
 }
 
@@ -285,7 +279,6 @@ void register_audio(HleRegistry& registry) {
         f.store<u32>(sound.guest_object + 0x44, 0x7fff);
         f.store<u32>(sound.guest_object + 0x48, 0);
         sounds.emplace(handle, sound);
-        f.emulator.audio_state().pending_sfx_assets.push_back(handle);
         CLICKHLE_DEBUG(kCategory) << "sfx_create -> " << handle;
         f.ret(handle);
     });
@@ -301,9 +294,6 @@ void register_audio(HleRegistry& registry) {
             (void)f.emulator.heap().release(it->second.guest_object);
             sounds.erase(it);
         }
-        auto& pending = f.emulator.audio_state().pending_sfx_assets;
-        pending.erase(std::remove(pending.begin(), pending.end(), handle),
-                      pending.end());
         f.ret_void();
     });
 
@@ -316,11 +306,8 @@ void register_audio(HleRegistry& registry) {
         // #2 is the explicit SFX play operation. #17 only changes the state
         // byte and is commonly used while registering a voice.
         const bool started = try_start_voice(f, handle);
-        // Everything the guest configured on this voice before starting it.
-        // Implementing real playback needs a PCM pointer, a LENGTH and a
-        // format, and only the pointer is currently identified -- the length
-        // has to be one of the unnamed field setters (8-15, 18), so print
-        // them all at the moment they matter and let the values say which.
+        // Optional field dump for a guest that configures a format we cannot
+        // play. The ordinary path reads its buffer, length and format directly.
         const auto it = sounds.find(handle);
         if (std::getenv("CLICKHLE_DUMP_SFXPLAY") != nullptr &&
             it != sounds.end()) {
@@ -337,7 +324,7 @@ void register_audio(HleRegistry& registry) {
                 << " repeat=" << it->second.repeat << " fields:" << fields;
         }
         CLICKHLE_DEBUG(kCategory) << "sfx_play " << handle
-                                  << (started ? " (played)" : " (no WAV source)");
+                                  << (started ? " (played)" : " (no readable PCM)");
         f.ret_void();
     });
 
@@ -433,11 +420,8 @@ void register_audio(HleRegistry& registry) {
         if (AudioDevice* device = f.emulator.audio()) {
             device->stop_voice(handle);
         }
-        // Is the "buffer" a guest pointer to PCM, or an opaque id? Everything
-        // about implementing real audio depends on which, so look rather than
-        // assume: print the value and, if it is mapped, the first bytes there.
-        // A RIFF/WAVE header or plausible PCM says pointer; unmapped or tiny
-        // says id.
+        // The caller's pointer normally identifies raw PCM already loaded by
+        // the game. Keep an opt-in prefix dump for titles with other layouts.
         if (std::getenv("CLICKHLE_DUMP_SFXBUF") != nullptr) {
             std::string head;
             std::string ascii;
@@ -486,11 +470,7 @@ void register_audio(HleRegistry& registry) {
                                static_cast<u8>(value));
                else
                    f.store<u32>(f.emulator.audio_state().sounds.at(handle).guest_object + offset, value);
-               // #7's pointer is now known to be raw 16-bit PCM with the RIFF
-               // header stripped, so the remaining unknown for real playback
-               // is the LENGTH -- which has to arrive through one of these
-               // unnamed setters. Logging every one against the known .wav
-               // sizes is what identifies which.
+               // These fields also supply the playback length and PCM format.
                if (std::getenv("CLICKHLE_DUMP_SFXFIELDS") != nullptr) {
                    CLICKHLE_INFO(kCategory)
                        << "sfx_set_field #" << ordinal << " handle=" << handle
@@ -869,7 +849,7 @@ void register_audio(HleRegistry& registry) {
         });
     }
 
-    CLICKHLE_DEBUG(kCategory) << "audio registered (silent)";
+    CLICKHLE_DEBUG(kCategory) << "audio HLE registered";
 }
 
 }  // namespace clickhle

@@ -860,6 +860,7 @@ private:
             return;
         }
         emulator_ = std::move(next);
+        audio_error_reported_ = false;
         emulator_->set_videocore_trace_enabled(videocore_trace_enabled_->isChecked());
         emulator_->set_videocore_pause_on_call(videocore_pause_on_call_->isChecked());
         videocore_last_sequence_ = 0;
@@ -925,6 +926,11 @@ private:
         constexpr u64 kGuiInstructionBudget = 50'000'000;
         const clickhle::RunResult result =
             emulator_->run_game_frame(kGuiInstructionBudget);
+        if (!audio_error_reported_ && !emulator_->audio_error().empty()) {
+            appendLog(tr("Audio unavailable: %1")
+                .arg(QString::fromStdString(emulator_->audio_error())));
+            audio_error_reported_ = true;
+        }
         int width = 0;
         int height = 0;
         std::vector<u8> pixels = emulator_->display().read_rgba(width, height);
@@ -948,11 +954,13 @@ private:
             fps_window_frames_ = 0;
             fps_timer_.restart();
         }
-        statusBar()->showMessage(
+        QString status =
             tr("%1  |  %2 FPS  |  %3 draws  |  %4 HLE calls")
                 .arg(QFileInfo(current_game_).fileName())
                 .arg(fps_, 0, 'f', 1).arg(draws)
-                .arg(emulator_->hle_call_count()));
+                .arg(emulator_->hle_call_count());
+        if (!emulator_->audio_error().empty()) status += tr("  |  Audio unavailable");
+        statusBar()->showMessage(status);
         if (result.status == clickhle::RunStatus::Fault ||
             result.status == clickhle::RunStatus::Unsupported ||
             !emulator_->last_missing_import().empty()) {
@@ -1228,6 +1236,7 @@ private:
     QLabel* library_message_ = nullptr;
     QStringList recent_games_;
     bool paused_ = true;
+    bool audio_error_reported_ = false;
     GameCanvas* canvas_ = nullptr;
     QTimer* frame_timer_ = nullptr;
     QElapsedTimer fps_timer_;
