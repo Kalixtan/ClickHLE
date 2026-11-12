@@ -890,13 +890,17 @@ struct Jit::Impl {
                     plan.modes.carry_operands
                 : op == 35 ? !plan.setf && plan.modes.highborrow &&
                     plan.modes.carry_operands : true;
-            if (plan.length != length || plan.count != 1 || plan.bkind || !supported_carry ||
+            // Selectors 5 and 6 have only form-specific mask/OR evidence in
+            // the interpreter. The plain vertical region kernel would turn
+            // either into a general operation and bypass those guards.
+            if (op == 5 || op == 6 ||
+                plan.length != length || plan.count != 1 || plan.bkind || !supported_carry ||
                 (plan.setf && (!supported_flags || vertical)) ||
                 plan.pred || plan.clear || plan.accumulate || plan.x15 || plan.sreg != 7 ||
                 (vertical && (!plain_mode || op == 34 || op == 35 ||
                     !plain_operand(plan.d) || !plain_operand(plan.a) ||
                     !plain_operand(plan.b) || plans.size() >= 8)) ||
-                (!vertical && ((op == 5 || op == 6 || op == 19 || op == 24) ||
+                (!vertical && ((op == 19 || op == 24) ||
                     !contiguous_operand(plan.d) ||
                     !contiguous_operand(plan.a) || !contiguous_operand(plan.b)))) break;
             plan.words = words;
@@ -1076,7 +1080,11 @@ struct Jit::Impl {
             case 24: result = build.CreateNeg(b); break;
             case 26: result = build.CreateSExt(build.CreateTrunc(b, build.getInt8Ty()), i32); break;
             case 27: result = build.CreateSExt(build.CreateTrunc(b, build.getInt16Ty()), i32); break;
-            case 29: result = build.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, b); break;
+            case 29:
+                // Match Core::alu's candidate count semantics; full-width
+                // result and status flags still lack a device measurement.
+                result = build.CreateUnaryIntrinsic(llvm::Intrinsic::ctpop, b);
+                break;
             case 30: result = build.CreateSelect(build.CreateICmpSLT(
                 b, llvm::ConstantInt::get(i32, 0)), build.CreateNeg(b), b); break;
             case 31: result = build.CreateNot(b); break;
