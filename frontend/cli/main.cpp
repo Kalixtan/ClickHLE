@@ -50,6 +50,8 @@ struct Options {
     unsigned long scale = 0;
     std::vector<unsigned long> watches;
     std::vector<unsigned long> read_watches;
+    std::vector<unsigned long> heap_lookups;
+    std::vector<unsigned long> memory_dumps;
     bool watch_breaks = false;
     std::vector<std::array<unsigned long, 3>> breakpoints;
     std::filesystem::path save_state;
@@ -97,6 +99,43 @@ void report_instruments(const Options& options, clickhle::Emulator& emulator) {
                   << emulator.cpu()->tracepoint_hits(
                          static_cast<clickhle::u32>(address))
                   << " time(s)\n";
+    }
+    if (!options.heap_lookups.empty()) {
+        const auto blocks = emulator.heap().snapshot();
+        for (const unsigned long address : options.heap_lookups) {
+            const auto it = std::find_if(blocks.begin(), blocks.end(),
+                [address](const auto& block) {
+                    return address >= block.first &&
+                           address - block.first < block.second.first;
+                });
+            std::cout << "  heap 0x" << std::hex << address;
+            if (it == blocks.end()) {
+                std::cout << " outside arena\n";
+            } else {
+                std::cout << " in block 0x" << it->first << " + 0x"
+                          << it->second.first << " (offset 0x"
+                          << address - it->first << ", "
+                          << (it->second.second ? "used" : "free") << ")\n";
+            }
+            std::cout << std::dec;
+        }
+    }
+    for (const unsigned long address : options.memory_dumps) {
+        std::array<clickhle::u8, 64> bytes{};
+        if (!emulator.memory().read_bytes(static_cast<clickhle::u32>(address),
+                                           bytes.data(), bytes.size())) {
+            std::cout << "  memory 0x" << std::hex << address
+                      << " unreadable" << std::dec << '\n';
+            continue;
+        }
+        for (std::size_t offset = 0; offset < bytes.size(); offset += 16) {
+            std::cout << "  memory 0x" << std::hex << address + offset << ':';
+            for (std::size_t i = 0; i < 16; ++i) {
+                std::cout << ' ' << std::setw(2) << std::setfill('0')
+                          << static_cast<unsigned>(bytes[offset + i]);
+            }
+            std::cout << std::setfill(' ') << std::dec << '\n';
+        }
     }
     if (options.profile_period == 0) {
         return;
@@ -171,6 +210,9 @@ Options:
                         breakpoint on data, which is what you need when the
                         interesting write is one of thousands and cannot be
                         picked out by a register value
+  --heap-lookup <addr>  Report the allocation containing this guest address
+                        when the run ends. Repeatable
+  --dump-memory <addr>  Print 64 guest bytes at this address when the run ends
   --videocore           Accepted for compatibility; VC2 is always enabled
   --headless            Render without showing a window (works with no display
                         server at all); screenshots still work
@@ -398,6 +440,14 @@ bool parse_options(int argc, char** argv, Options& options) {
             options.read_watches.push_back(std::stoul(value, nullptr, 0));
         } else if (arg == "--watch-break") {
             options.watch_breaks = true;
+        } else if (arg == "--heap-lookup") {
+            const std::string value = value_for("--heap-lookup");
+            if (value.empty()) return false;
+            options.heap_lookups.push_back(std::stoul(value, nullptr, 0));
+        } else if (arg == "--dump-memory") {
+            const std::string value = value_for("--dump-memory");
+            if (value.empty()) return false;
+            options.memory_dumps.push_back(std::stoul(value, nullptr, 0));
         } else if (arg == "--fullscreen") {
             options.fullscreen = true;
         } else if (arg == "--videocore") {

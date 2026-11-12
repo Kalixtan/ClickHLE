@@ -54,6 +54,7 @@ enum uc_hook_type : uint64_t {
     kHookIntr = 1ull << 0,
     kHookCode = 1ull << 2,
     kHookMemRead = 1ull << 10,
+    kHookMemWrite = 1ull << 11,
     // UC_HOOK_MEM_UNMAPPED, from unicorn.h's own macro expansion:
     // UC_HOOK_MEM_READ_UNMAPPED(1<<4) + UC_HOOK_MEM_WRITE_UNMAPPED(1<<5) +
     // UC_HOOK_MEM_FETCH_UNMAPPED(1<<6) -- verified against the real macro

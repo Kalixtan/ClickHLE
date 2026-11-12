@@ -66,6 +66,10 @@ public:
             lib_.hook_add(uc_, &read_hook_, us::kHookMemRead,
                           reinterpret_cast<void*>(&UnicornCpu::onReadThunk), this, 1, 0);
         }
+        if (memory_.watching()) {
+            lib_.hook_add(uc_, &write_hook_, us::kHookMemWrite,
+                          reinterpret_cast<void*>(&UnicornCpu::onWriteThunk), this, 1, 0);
+        }
     }
 
     ~UnicornCpu() override {
@@ -306,6 +310,18 @@ private:
         static_cast<UnicornCpu*>(user_data)->onRead(static_cast<u32>(address), size);
     }
 
+    static void onWriteThunk(us::uc_engine*, us::uc_mem_type, u64 address,
+                             int size, i64 value, void* user_data) {
+        static_cast<UnicornCpu*>(user_data)->onWrite(
+            static_cast<u32>(address), size, static_cast<u64>(value));
+    }
+
+    void onWrite(u32 address, int size, u64 value) {
+        if (size > 0) {
+            memory_.note_write(address, static_cast<u32>(size), value);
+        }
+    }
+
     void onRead(u32 address, int size) {
         if (size <= 0 || !memory_.watched_read_overlaps(address, static_cast<u32>(size))) {
             return;
@@ -336,6 +352,11 @@ private:
                 message << "breakpoint at 0x" << std::hex << address;
                 fault_ = message.str();
                 CLICKHLE_INFO(kCategory) << fault_;
+                std::ostringstream registers;
+                for (unsigned i = 0; i < reg::kCount; ++i) {
+                    registers << " r" << i << "=0x" << std::hex << reg(i);
+                }
+                CLICKHLE_INFO(kCategory) << "regs:" << registers.str();
                 stop_requested_ = true;
                 lib_.emu_stop(uc_);
                 return;
@@ -435,6 +456,7 @@ private:
     us::uc_hook code_hook_{};
     us::uc_hook mem_hook_{};
     us::uc_hook read_hook_{};
+    us::uc_hook write_hook_{};
 
     u64 instructions_ = 0;
     u32 real_pc_ = 0;

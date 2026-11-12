@@ -120,12 +120,12 @@ void register_misc(HleRegistry& registry) {
         // size because "10 allocations total" (Sudoku) versus "3335"
         // (Mahjong) is the clearest signal found so far that a title never
         // enters its construction phase.
+        const GuestAddr block = f.emulator.heap().allocate(size);
         if (std::getenv("CLICKHLE_DUMP_ALLOC_LR") != nullptr) {
             CLICKHLE_INFO(kCategory)
-                << "alloc(" << std::dec << size << ") from lr=0x" << std::hex
-                << f.cpu.lr() << std::dec;
+                << "alloc(" << std::dec << size << ") -> 0x" << std::hex
+                << block << " from lr=0x" << f.cpu.lr() << std::dec;
         }
-        const GuestAddr block = f.emulator.heap().allocate(size);
         if (block == kNullGuest) {
             CLICKHLE_WARN(kCategory)
                 << "alloc(" << size << ") failed; heap holds "
