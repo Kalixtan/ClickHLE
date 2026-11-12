@@ -412,11 +412,15 @@ void Core::vector(const std::array<u32, 5> &w, unsigned length) {
             count = 64;
         }
         bool inc = true;
-        // Provisional 2203: the observed REP16 H16 loads fit the ordinary
-        // aligned-load data path in both firmware copy and flip routines.
-        // This does not establish what distinguishes it from 2202 (for
-        // example flags, masking or timing). Reject untested repeat forms.
-        const bool provisional_load = length == 3 && op9 == 3 && count == 16;
+        // Provisional 2203: only these three encodings occur in the audited
+        // firmware copy and flip routines. Their memory contents fit the
+        // ordinary aligned-load path, but the x bit's other effects are unknown.
+        // Keep other operands guarded until a device result or another
+        // firmware contract establishes their behavior.
+        const bool provisional_load = length == 3 && w[0] == 0x2203 &&
+            ((w[1] == 0x2000 && w[2] == 0x0902) ||
+             (w[1] == 0x6000 && w[2] == 0x090b) ||
+             (w[1] == 0x0000 && w[2] == 0x010a));
         if (((op9 & 1) && !provisional_load) || select == 3) {
             std::ostringstream message;
             message << "Unsupported vector memory opcode [" << std::hex << std::setfill('0');
