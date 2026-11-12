@@ -1,6 +1,7 @@
 #pragma once
 
 #include "clickhle/common/types.h"
+#include <cstddef>
 #include <memory>
 
 namespace clickhle::vc2 {
@@ -18,6 +19,7 @@ class Jit {
 
     unsigned try_execute(Core &core, unsigned limit, u16 first_word);
     unsigned try_execute_cached(Core &core, unsigned limit);
+    std::size_t loaded_object_count() const;
 
   private:
     struct Impl;

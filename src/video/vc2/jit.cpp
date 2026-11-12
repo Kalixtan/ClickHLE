@@ -364,6 +364,7 @@ struct Jit::Impl {
         }
     };
     u64 cache_hits = 0;
+    u64 shared_object_hits = 0;
     std::unordered_map<u64, u64> fallback_counts;
     std::unordered_map<u64, u64> native_counts;
     std::unordered_map<u64, u64> native_edges;
@@ -422,7 +423,8 @@ struct Jit::Impl {
             return a.second > b.second;
         });
         std::cerr << "VC2 JIT blocks: " << blocks.size()
-                  << ", object cache hits: " << cache_hits << "\n"
+                  << ", object cache hits: " << cache_hits
+                  << ", shared native object hits: " << shared_object_hits << "\n"
                   << "VC2 JIT fallback profile: " << ranked.size() << " sites\n";
         for (unsigned i = 0; i < std::min<std::size_t>(ranked.size(), 40); ++i) {
             const u64 key = ranked[i].first;
@@ -604,6 +606,7 @@ struct Jit::Impl {
         // once per JIT instance and retain it independently of decoded blocks.
         // Invalidating one guest block must not unload another block's code.
         if (const auto found = loaded_objects.find(key); found != loaded_objects.end()) {
+            ++shared_object_hits;
             resources.reset();
             return found->second.address;
         }
@@ -952,6 +955,9 @@ struct Jit::Impl {
             values[index] = value;
             changed[index] = true;
         };
+        // Keep the entry address as an input so address-independent blocks
+        // can share native code even when uploaded at different guest PCs.
+        auto *entry_pc = build.CreateLoad(i32, reg_ptr(31));
         auto condition = [&](unsigned code, llvm::Value *status = nullptr) -> llvm::Value * {
             auto flag = [&](unsigned bit) -> llvm::Value * {
                 return build.CreateICmpNE(build.CreateAnd(status ? status : load(30), 1u << bit),
@@ -980,7 +986,8 @@ struct Jit::Impl {
         };
         llvm::Value *branch_pc = nullptr;
         for (const Operation &op : block.operations) {
-            values[31] = build.getInt32(op.guest_pc ? op.guest_pc : block.pc);
+            values[31] = build.CreateAdd(entry_pc,
+                build.getInt32(op.guest_pc ? op.guest_pc - block.pc : 0));
             if (op.nop) continue;
             if (op.memory_load) {
                 auto *offset_pointer = build.CreateInBoundsGEP(i32, function->getArg(2),
@@ -1110,8 +1117,8 @@ struct Jit::Impl {
             }
             store(op.destination, result);
         }
-        store(31, branch_pc ? branch_pc : static_cast<llvm::Value *>(llvm::ConstantInt::get(
-            i32, block.pc + static_cast<u32>(2 * (block.length ? block.length : block.operations.size())))));
+        store(31, branch_pc ? branch_pc : build.CreateAdd(entry_pc, build.getInt32(
+            static_cast<u32>(2 * (block.length ? block.length : block.operations.size())))));
         for (unsigned i = 0; i < changed.size(); ++i)
             if (changed[i]) build.CreateStore(values[i], reg_ptr(i));
         build.CreateRetVoid();
@@ -1119,7 +1126,7 @@ struct Jit::Impl {
             throw std::runtime_error("VC2 JIT generated invalid IR");
         block.resources = engine->getMainJITDylib().createResourceTracker();
         return materialize(std::move(context), std::move(module), function,
-                           block.resources, "block:" + std::to_string(block.pc))
+                           block.resources, "block")
             .toPtr<NativeBlock>();
     }
 
@@ -2765,6 +2772,7 @@ struct Jit::Impl {
 
 Jit::Jit() : impl_(std::make_unique<Impl>()) {}
 Jit::~Jit() { impl_->report(); }
+std::size_t Jit::loaded_object_count() const { return impl_->loaded_objects.size(); }
 unsigned Jit::try_execute_cached(Core &core, unsigned limit) {
     const u32 pc = core.r[31];
     if (!limit || pc >= 0x4000000 || (pc & 1)) return 0;
