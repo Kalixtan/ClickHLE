@@ -99,9 +99,14 @@ struct VideoCore::Impl {
         return 0ull;
     }();
     u32 current_ordinal = 0;
+    u64 trace_count = [] {
+        if (const char *value = std::getenv("CLICKHLE_VC2_TRACE_COUNT"))
+            return std::strtoull(value, nullptr, 0);
+        return 200ull;
+    }();
 
     bool tracing() const {
-        return trace_from && sequence >= trace_from && sequence < trace_from + 200;
+        return trace_from && sequence >= trace_from && sequence - trace_from < trace_count;
     }
 
     explicit Impl(VideoCore &instance) : owner(instance), api(
@@ -331,9 +336,10 @@ struct VideoCore::Impl {
         ++sequence;
         current_ordinal = ordinal;
         if (tracing()) {
-            std::cerr << "VC2 call seq=" << sequence << " ordinal=" << ordinal;
+            std::cerr << "VC2 call seq=" << sequence << " ordinal=" << ordinal
+                      << " lr=0x" << std::hex << frame.cpu.lr() << std::dec;
             ArgReader snapshot(frame.cpu, frame.memory);
-            for (unsigned i = 0; i < 4; ++i) {
+            for (unsigned i = 0; i < 8; ++i) {
                 const auto value = snapshot.next_u32();
                 if (!snapshot.ok()) break;
                 std::cerr << " arg" << i << "=0x" << std::hex << value << std::dec;
