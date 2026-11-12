@@ -50,7 +50,7 @@ display the raw framebuffer, with no shader replacement or Python runtime. Place
 RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRMWARE`
 can override that path; games may also supply their own image.
 The optional `--vc2-engine g5` mode (Options → VideoCore Engine → G5 in the GUI)
-uses independent high-level replacements for matrix API calls 165, 169 and 175.
+uses independent high-level replacements for matrix API calls 165–166, 169–172 and 175–176.
 Other graphics calls follow the normal packet and VC2 JIT path. New replacements
 belong in `src/video/g5/` and should be added only with evidence and matching
 return values and guest-memory effects. G5 is an experimental path toward a

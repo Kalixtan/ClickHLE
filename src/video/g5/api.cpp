@@ -29,21 +29,38 @@ u32 as_bits(float value) { return endian::float_to_bits(value); }
 } // namespace
 
 std::optional<u32> g5_graphics_call(u32 ordinal, HleCallFrame &frame) {
-    if (ordinal != 165 && ordinal != 169 && ordinal != 175) return std::nullopt;
+    if (ordinal != 165 && ordinal != 166 && (ordinal < 169 || ordinal > 172) && ordinal != 175 && ordinal != 176) return std::nullopt;
     const u32 destination = frame.cpu.reg(0);
     Matrix result{};
-    if (ordinal == 165) {
-        for (unsigned i = 0; i < result.size(); i += 5) result[i] = 0x3f800000;
-    } else if (ordinal == 169) {
+    const bool fixed = ordinal == 166 || ordinal == 170 || ordinal == 172 || ordinal == 176;
+    const auto multiply_fixed = [](u32 a, u32 b) {
+        return static_cast<u32>((i64(static_cast<i32>(a)) * static_cast<i32>(b)) >> 16);
+    };
+    if (ordinal == 165 || ordinal == 166) {
+        for (unsigned i = 0; i < result.size(); i += 5) result[i] = fixed ? 0x10000 : 0x3f800000;
+    } else if (ordinal >= 169 && ordinal <= 172) {
         result = read_matrix(frame, destination);
-        const float x = as_float(frame.cpu.reg(1));
-        const float y = as_float(frame.cpu.reg(2));
-        const float z = as_float(frame.cpu.reg(3));
-        for (unsigned row = 0; row < 4; ++row) {
-            float value = as_float(result[row]) * x;
-            value = value + as_float(result[row + 4]) * y;
-            value = value + as_float(result[row + 8]) * z;
-            result[row + 12] = as_bits(value + as_float(result[row + 12]));
+        const std::array<u32, 3> scale{frame.cpu.reg(1), frame.cpu.reg(2), frame.cpu.reg(3)};
+        if (ordinal == 169 || ordinal == 170) {
+            for (unsigned row = 0; row < 4; ++row) {
+                if (fixed) {
+                    result[row + 12] += multiply_fixed(result[row], scale[0]) +
+                        multiply_fixed(result[row + 4], scale[1]) +
+                        multiply_fixed(result[row + 8], scale[2]);
+                } else {
+                    float value = as_float(result[row]) * as_float(scale[0]);
+                    value = value + as_float(result[row + 4]) * as_float(scale[1]);
+                    value = value + as_float(result[row + 8]) * as_float(scale[2]);
+                    result[row + 12] = as_bits(value + as_float(result[row + 12]));
+                }
+            }
+        } else {
+            for (unsigned column = 0; column < 3; ++column)
+                for (unsigned row = 0; row < 4; ++row) {
+                    const auto i = column * 4 + row;
+                    result[i] = fixed ? multiply_fixed(result[i], scale[column]) :
+                        as_bits(as_float(result[i]) * as_float(scale[column]));
+                }
         }
     } else {
         // Read both operands before writing: guest matrices may overlap.
@@ -51,6 +68,13 @@ std::optional<u32> g5_graphics_call(u32 ordinal, HleCallFrame &frame) {
         const Matrix right = read_matrix(frame, frame.cpu.reg(2));
         for (unsigned column = 0; column < 4; ++column)
             for (unsigned row = 0; row < 4; ++row) {
+                if (fixed) {
+                    u32 sum = 0;
+                    for (unsigned k = 0; k < 4; ++k)
+                        sum += multiply_fixed(left[k * 4 + row], right[column * 4 + k]);
+                    result[column * 4 + row] = sum;
+                    continue;
+                }
                 float sum = as_float(left[row]) * as_float(right[column * 4]);
                 for (unsigned k = 1; k < 4; ++k)
                     sum = sum + as_float(left[k * 4 + row]) * as_float(right[column * 4 + k]);
@@ -58,6 +82,6 @@ std::optional<u32> g5_graphics_call(u32 ordinal, HleCallFrame &frame) {
             }
     }
     write_matrix(frame, destination, result);
-    return ordinal == 175 ? result[15] : destination;
+    return ordinal >= 175 ? result[15] : destination;
 }
 } // namespace clickhle
