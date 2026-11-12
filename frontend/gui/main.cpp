@@ -319,8 +319,13 @@ public:
         device_settings_.time_format_24 = settings.value(QStringLiteral("device/timeFormat24"), false).toBool();
         device_settings_.hold_switch = settings.value(QStringLiteral("device/holdSwitch"), false).toBool();
         restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
-        if (settings.value(QStringLiteral("video/engine")).toString() == QStringLiteral("interpreter"))
-            interpreter_action_->setChecked(true);
+        // Older builds saved G5 as "interpreter". That value is ambiguous;
+        // start with the default once, then preserve explicit engine choices.
+        if (settings.value(QStringLiteral("video/engineVersion"), 0).toInt() == 1) {
+            const auto engine = settings.value(QStringLiteral("video/engine")).toString();
+            if (engine == QStringLiteral("interpreter")) interpreter_action_->setChecked(true);
+            else if (engine == QStringLiteral("jit") && jit_action_->isEnabled()) jit_action_->setChecked(true);
+        }
         recent_games_ = settings.value(QStringLiteral("games/recent")).toStringList();
         rebuildRecentMenu();
         updateActions();
@@ -385,8 +390,10 @@ protected:
         settings.setValue(QStringLiteral("window/geometry"), saveGeometry());
         settings.setValue(QStringLiteral("games/recent"), recent_games_);
         settings.setValue(QStringLiteral("video/engine"),
-                          jit_action_->isChecked() ? QStringLiteral("jit")
+                          g5_action_->isChecked() ? QStringLiteral("g5")
+                          : jit_action_->isChecked() ? QStringLiteral("jit")
                                                    : QStringLiteral("interpreter"));
+        settings.setValue(QStringLiteral("video/engineVersion"), 1);
         QMainWindow::closeEvent(event);
     }
 
