@@ -626,17 +626,23 @@ private:
         engine_actions->setExclusive(true);
         interpreter_action_ = new QAction(tr("Interpreter"), engine_actions);
         jit_action_ = new QAction(tr("JIT"), engine_actions);
+        g5_action_ = new QAction(tr("G5 (API replacements + JIT)"), engine_actions);
         interpreter_action_->setCheckable(true);
         jit_action_->setCheckable(true);
+        g5_action_->setCheckable(true);
         const bool jit_available = clickhle::videocore_jit_available();
         interpreter_action_->setChecked(!jit_available);
         jit_action_->setChecked(jit_available);
         jit_action_->setEnabled(jit_available);
+        g5_action_->setEnabled(jit_available);
         connect(interpreter_action_, &QAction::triggered, this, [this] {
             if (emulator_) emulator_->set_videocore_engine(clickhle::VideoCoreEngine::Interpreter);
         });
         connect(jit_action_, &QAction::triggered, this, [this] {
             if (emulator_) emulator_->set_videocore_engine(clickhle::VideoCoreEngine::Jit);
+        });
+        connect(g5_action_, &QAction::triggered, this, [this] {
+            if (emulator_) emulator_->set_videocore_engine(clickhle::VideoCoreEngine::G5);
         });
 
         about_action_ = new QAction(tr("About ClickHLE"), this);
@@ -671,6 +677,7 @@ private:
         QMenu* video_engine = options->addMenu(tr("VideoCore Engine"));
         video_engine->addAction(interpreter_action_);
         video_engine->addAction(jit_action_);
+        video_engine->addAction(g5_action_);
 
         QMenu* emulation = bar->addMenu(tr("Emulation"));
         emulation->addAction(pause_action_);
@@ -866,8 +873,10 @@ private:
             path_bytes, static_cast<std::size_t>(encoded_path.size())));
         config.hdd_root = hdd_root_;
         config.platform_id = platform_id;
-        config.videocore_engine = jit_action_->isChecked()
-            ? clickhle::VideoCoreEngine::Jit : clickhle::VideoCoreEngine::Interpreter;
+        config.videocore_engine = g5_action_->isChecked()
+            ? clickhle::VideoCoreEngine::G5
+            : jit_action_->isChecked() ? clickhle::VideoCoreEngine::Jit
+                                        : clickhle::VideoCoreEngine::Interpreter;
         std::string error;
         if (!next->load(std::move(config), &error)) {
             const QString reason = QString::fromStdString(error);
@@ -1280,6 +1289,7 @@ private:
     QAction* device_settings_action_ = nullptr;
     QAction* interpreter_action_ = nullptr;
     QAction* jit_action_ = nullptr;
+    QAction* g5_action_ = nullptr;
     QAction* about_action_ = nullptr;
     QPlainTextEdit* cpu_view_ = nullptr;
     QPlainTextEdit* memory_view_ = nullptr;

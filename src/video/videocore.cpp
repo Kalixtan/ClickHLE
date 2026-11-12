@@ -4,6 +4,7 @@
 #include "vc2/core.h"
 #include "vc2/png.h"
 #include "graphics_api.h"
+#include "g5/api.h"
 #include <algorithm>
 #include <ctime>
 #include <cstdlib>
@@ -170,7 +171,7 @@ struct VideoCore::Impl {
         // Upload bytes to VC SRAM and execute the firmware entry. Host-port
         // cache/clock setup is abstracted by HLE, not replayed as ARM code.
         chip.load(firmware);
-        chip.set_jit_enabled(owner.engine_ == VideoCoreEngine::Jit);
+        chip.set_jit_enabled(owner.engine_ != VideoCoreEngine::Interpreter);
         // The game-image loader clears readiness after uploading the image.
         // Only executing the new firmware may publish a ready state.
         chip.write(0x1f8, 0);
@@ -347,6 +348,9 @@ struct VideoCore::Impl {
             std::cerr << '\n';
         }
         chip.descriptors.clear();
+        if (owner.engine_ == VideoCoreEngine::G5)
+            if (const auto result = g5_graphics_call(ordinal, frame))
+                return *result;
         switch (ordinal) {
         case 164: {
             if (started) throw std::runtime_error("Stop VC2 before replacing its firmware");
@@ -470,7 +474,7 @@ VideoCore::VideoCore(bool capture, VideoCoreEngine engine)
 VideoCore::~VideoCore() = default;
 void VideoCore::set_engine(VideoCoreEngine engine) {
     engine_ = engine;
-    if (impl_) impl_->chip.set_jit_enabled(engine == VideoCoreEngine::Jit);
+    if (impl_) impl_->chip.set_jit_enabled(engine != VideoCoreEngine::Interpreter);
 }
 bool VideoCore::initialize() {
     if (!error_.empty())

@@ -169,7 +169,7 @@ Options:
   --plan                Group every import by subsystem and show what is left
   --cpu <backend>       CPU backend to use (default: build default)
   --platform <id>       Select a package platform ID (default: manifest order)
-  --vc2-engine <name>   VideoCore engine: interpreter or jit
+  --vc2-engine <name>   VideoCore engine: interpreter, jit or g5
   --names <file>        Ordinal->name file, used to make reports about
                         unimplemented ordinals readable.
   --clock-hz <n>        Emulated clock rate (default 20000000). Guest time
@@ -390,10 +390,12 @@ bool parse_options(int argc, char** argv, Options& options) {
             const std::string value = value_for("--vc2-engine");
             if (value == "jit") {
                 options.videocore_engine = clickhle::VideoCoreEngine::Jit;
+            } else if (value == "g5") {
+                options.videocore_engine = clickhle::VideoCoreEngine::G5;
             } else if (value == "interpreter") {
                 options.videocore_engine = clickhle::VideoCoreEngine::Interpreter;
             } else {
-                std::cerr << "--vc2-engine must be jit or interpreter\n";
+                std::cerr << "--vc2-engine must be interpreter, jit or g5\n";
                 return false;
             }
         } else if (arg == "--scale") {
@@ -893,7 +895,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     config.capture_videocore = options.capture_videocore;
-    if (options.videocore_engine == clickhle::VideoCoreEngine::Jit &&
+    if (options.videocore_engine != clickhle::VideoCoreEngine::Interpreter &&
         !clickhle::videocore_jit_available()) {
         std::cerr << "VC2 JIT is unavailable in this build\n";
         return 2;

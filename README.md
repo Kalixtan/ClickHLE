@@ -49,6 +49,12 @@ its command packets; games do not execute RetailOS ARM code or require `osos.bin
 display the raw framebuffer, with no shader replacement or Python runtime. Place the game
 RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRMWARE`
 can override that path; games may also supply their own image.
+The optional `--vc2-engine g5` mode (Options → VideoCore Engine → G5 in the GUI)
+uses independent high-level replacements for matrix API calls 165, 169 and 175.
+Other graphics calls follow the normal packet and VC2 JIT path. New replacements
+belong in `src/video/g5/` and should be added only with evidence and matching
+return values and guest-memory effects. G5 is an experimental path toward a
+larger software renderer; it currently uses VC2 for drawing.
 The GUI's Options → iPod Settings window controls the game-facing language
 index, time format, and hold switch. Language index 0 is English; available
 translations depend on the game.

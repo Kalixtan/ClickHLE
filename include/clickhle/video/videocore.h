@@ -9,7 +9,7 @@
 
 namespace clickhle {
 struct HleCallFrame;
-enum class VideoCoreEngine { Interpreter, Jit };
+enum class VideoCoreEngine { Interpreter, Jit, G5 };
 
 [[nodiscard]] bool videocore_jit_available() noexcept;
 
