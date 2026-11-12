@@ -2,6 +2,8 @@
 
 #include "clickhle/common/log.h"
 
+#include <limits>
+
 namespace clickhle {
 namespace {
 
@@ -33,7 +35,10 @@ GuestAddr GuestHeap::allocate(u32 size) {
         // unconditionally then works either way.
         size = 1;
     }
-    const u32 wanted = round_up(size, kAlignment);
+    if (size > std::numeric_limits<u32>::max() - 2 * kAlignment) {
+        return kNullGuest;
+    }
+    const u32 wanted = round_up(size, kAlignment) + kHeaderBytes;
 
     for (auto it = blocks_.begin(); it != blocks_.end(); ++it) {
         Block& block = it->second;
@@ -50,7 +55,7 @@ GuestAddr GuestHeap::allocate(u32 size) {
         }
         block.used = true;
         in_use_ += block.size;
-        return address;
+        return address + kHeaderBytes;
     }
 
     CLICKHLE_WARN(kCategory) << "out of memory allocating " << size << " bytes ("
@@ -62,7 +67,11 @@ bool GuestHeap::release(GuestAddr address) {
     if (address == kNullGuest) {
         return true;
     }
-    const auto it = blocks_.find(address);
+    if (address < base_ + kHeaderBytes) {
+        return false;
+    }
+    const GuestAddr block_address = address - kHeaderBytes;
+    const auto it = blocks_.find(block_address);
     if (it == blocks_.end() || !it->second.used) {
         CLICKHLE_WARN(kCategory)
             << "free of a pointer that is not a live allocation: 0x" << std::hex
@@ -71,7 +80,7 @@ bool GuestHeap::release(GuestAddr address) {
     }
     it->second.used = false;
     in_use_ -= it->second.size;
-    coalesce_from(address);
+    coalesce_from(block_address);
     return true;
 }
 
@@ -100,11 +109,14 @@ void GuestHeap::coalesce_from(GuestAddr address) {
 }
 
 std::optional<u32> GuestHeap::size_of(GuestAddr address) const {
-    const auto it = blocks_.find(address);
+    if (address < base_ + kHeaderBytes) {
+        return std::nullopt;
+    }
+    const auto it = blocks_.find(address - kHeaderBytes);
     if (it == blocks_.end() || !it->second.used) {
         return std::nullopt;
     }
-    return it->second.size;
+    return it->second.size - kHeaderBytes;
 }
 
 std::size_t GuestHeap::live_allocations() const {

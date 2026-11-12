@@ -26,6 +26,11 @@ public:
     /// expects of malloc, which matters because guest code will happily store a
     /// double at offset zero.
     static constexpr u32 kAlignment = 8;
+    // RetailOS keeps a four-byte size/flags word immediately before each
+    // returned pointer. With eight-byte payload alignment, reserve one full
+    // aligned slot so separate allocations cannot appear contiguous to a
+    // guest allocator that coalesces touching free ranges.
+    static constexpr u32 kHeaderBytes = kAlignment;
 
     void initialise(GuestAddr base, u32 size);
 

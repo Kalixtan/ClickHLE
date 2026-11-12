@@ -876,7 +876,7 @@ namespace {
 /// attempt at forward compatibility -- a version bump refuses to load rather
 /// than guessing at a layout it does not know.
 constexpr u32 kStateMagic = 0x594B5453;  // "STKY"
-constexpr u32 kStateVersion = 1;
+constexpr u32 kStateVersion = 2;
 
 template <typename T>
 void put(std::vector<std::byte>& out, T value) {

@@ -115,6 +115,10 @@ target_link_libraries(clickhle_core PRIVATE clickhle_flags)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_guest_heap_test tests/guest_heap_test.cpp)
+    target_include_directories(clickhle_guest_heap_test PRIVATE include)
+    target_link_libraries(clickhle_guest_heap_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME guest_heap COMMAND clickhle_guest_heap_test)
     add_executable(clickhle_vc2_compact_predicate_test
         tests/vc2_compact_predicate_test.cpp)
     target_include_directories(clickhle_vc2_compact_predicate_test PRIVATE
