@@ -9,7 +9,6 @@
 #include <limits>
 #include <map>
 #include <memory>
-#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -87,31 +86,6 @@ std::string sha256(const std::vector<u8> &bytes) {
     return result;
 }
 
-std::array<u8, 32> find_key(const fs::path &keys, const std::vector<u8> &encrypted) {
-    const std::string prefix = sha256(encrypted) + "_";
-    std::optional<std::array<u8, 32>> found;
-    if (!fs::is_directory(keys))
-        throw std::runtime_error("keys folder is missing");
-    for (const auto &entry : fs::directory_iterator(keys)) {
-        const auto name = lower(entry.path().filename().string());
-        if (!entry.is_regular_file() || name.rfind(prefix, 0) != 0 ||
-            entry.path().extension() != ".ikey")
-            continue;
-        const auto bytes = read_file(entry.path());
-        if (bytes.size() != 32)
-            throw std::runtime_error("matching .ikey must contain exactly 32 raw bytes");
-        std::array<u8, 32> key{};
-        std::copy(bytes.begin(), bytes.end(), key.begin());
-        if (found && *found != key)
-            throw std::runtime_error("conflicting .ikey files for encrypted executable");
-        found = key;
-    }
-    if (!found)
-        throw std::runtime_error("no matching .ikey for encrypted executable " +
-                                 prefix.substr(0, 64));
-    return *found;
-}
-
 std::vector<u8> decrypt(const std::vector<u8> &encrypted, const std::array<u8, 32> &key) {
     const std::size_t whole = encrypted.size() & ~std::size_t{15};
     if (whole > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -134,6 +108,59 @@ std::vector<u8> decrypt(const std::vector<u8> &encrypted, const std::array<u8, 3
     std::copy(encrypted.begin() + static_cast<std::ptrdiff_t>(whole), encrypted.end(),
               plain.begin() + static_cast<std::ptrdiff_t>(whole));
     return plain;
+}
+
+bool has_eapp_magic(const std::vector<u8> &bytes) {
+    return bytes.size() >= 4 && bytes[0] == 'e' && bytes[1] == 'a' &&
+           bytes[2] == 'p' && bytes[3] == 'p';
+}
+
+bool valid_eapp(const std::vector<u8> &bytes, std::string *error = nullptr) {
+    if (!has_eapp_magic(bytes))
+        return false;
+    const auto image = std::span<const std::byte>(
+        reinterpret_cast<const std::byte *>(bytes.data()), bytes.size());
+    return clickhle::EappImage::parse(image, error).has_value();
+}
+
+std::vector<u8> executable_image(const std::vector<u8> &source, const fs::path &path,
+                                 const fs::path &keys) {
+    if (has_eapp_magic(source)) {
+        std::string error;
+        if (!valid_eapp(source, &error))
+            throw std::runtime_error("invalid plaintext eapp " + path.filename().string() +
+                                     ": " + error);
+        return source;
+    }
+
+    // The hash in a key filename is a useful hint, but a valid image is the
+    // final authority. Other .ikey names work too.
+    std::vector<fs::path> candidates;
+    if (fs::is_directory(keys)) {
+        for (const auto &entry : fs::directory_iterator(keys)) {
+            if (entry.is_regular_file() && lower(entry.path().extension().string()) == ".ikey")
+                candidates.push_back(entry.path());
+        }
+    }
+    const auto prefix = sha256(source) + "_";
+    std::sort(candidates.begin(), candidates.end(), [&](const auto &a, const auto &b) {
+        const bool a_matches = lower(a.filename().string()).rfind(prefix, 0) == 0;
+        const bool b_matches = lower(b.filename().string()).rfind(prefix, 0) == 0;
+        return a_matches != b_matches ? a_matches : a < b;
+    });
+    for (const auto &candidate : candidates) {
+        const auto bytes = read_file(candidate);
+        if (bytes.size() != 32)
+            continue;
+        std::array<u8, 32> key{};
+        std::copy(bytes.begin(), bytes.end(), key.begin());
+        auto plain = decrypt(source, key);
+        if (valid_eapp(plain))
+            return plain;
+    }
+    throw std::runtime_error("encrypted executable " + path.filename().string() +
+                             " has no valid key. Put a valid 32-byte .ikey file in the keys "
+                             "folder beside ClickHLE.");
 }
 
 fs::path safe_zip_path(const std::string &name) {
@@ -301,19 +328,31 @@ void install(const fs::path &package, const fs::path &hdd, const fs::path &keys)
     if (fs::exists(destination))
         throw std::runtime_error("game is already installed");
 
+    if (game->files.empty())
+        throw std::runtime_error("package manifest has no file list");
+    std::set<std::string> listed_files;
+    for (const auto &item : game->files) {
+        const auto relative = safe_zip_path(item.path.generic_string());
+        if (!listed_files.insert(lower(relative.generic_string())).second)
+            throw std::runtime_error("duplicate file in package manifest");
+        const auto path = stage.path / relative;
+        if (!fs::is_regular_file(path) || fs::file_size(path) != item.size)
+            throw std::runtime_error("missing or wrong-sized package file: " +
+                                     relative.generic_string());
+    }
+
     std::set<fs::path> executables;
-    for (const auto &variant : game->variants)
+    for (const auto &variant : game->variants) {
+        const auto relative = variant.executable.lexically_relative(stage.path);
+        if (!listed_files.count(lower(relative.generic_string())))
+            throw std::runtime_error("executable is absent from package file list");
         executables.insert(variant.executable);
+    }
     for (const auto &executable : executables) {
-        const auto encrypted = read_file(executable);
-        const auto key = find_key(keys, encrypted);
-        const auto plain = decrypt(encrypted, key);
-        std::string parse_error;
-        const auto bytes = std::span<const std::byte>(
-            reinterpret_cast<const std::byte *>(plain.data()), plain.size());
-        if (!clickhle::EappImage::parse(bytes, &parse_error))
-            throw std::runtime_error("invalid key or executable: " + parse_error);
-        write_file(executable, plain);
+        const auto source = read_file(executable);
+        auto image = executable_image(source, executable, keys);
+        if (image != source)
+            write_file(executable, image);
     }
 
     fs::create_directories(destination.parent_path());

@@ -59,7 +59,8 @@ std::string decode_xml(std::string_view source) {
     return out;
 }
 
-bool number(std::string_view text, u32 &result) {
+template <typename T>
+bool number(std::string_view text, T &result) {
     if (text.empty())
         return false;
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
@@ -99,6 +100,30 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
     game.guid = decode_xml(value(view, "GUID", "string"));
     game.name = decode_xml(value(view, "Name", "string"));
     game.directory = directory;
+    const auto files_key = view.find("<key>Files</key>");
+    if (files_key != std::string_view::npos) {
+        const auto files_begin = view.find("<array>", files_key);
+        const auto files_end = files_begin == std::string_view::npos
+                                   ? std::string_view::npos : view.find("</array>", files_begin);
+        if (files_end == std::string_view::npos)
+            return std::nullopt;
+        const auto entries = view.substr(files_begin + 7, files_end - files_begin - 7);
+        for (std::size_t at = 0; at < entries.size();) {
+            const auto start = entries.find("<dict>", at);
+            if (start == std::string_view::npos)
+                break;
+            const auto stop = entries.find("</dict>", start);
+            if (stop == std::string_view::npos)
+                return std::nullopt;
+            const auto dict = entries.substr(start + 6, stop - start - 6);
+            at = stop + 7;
+            ManifestFile item;
+            item.path = decode_xml(value(dict, "Path", "string"));
+            if (item.path.empty() || !number(value(dict, "Size", "integer"), item.size))
+                return std::nullopt;
+            game.files.push_back(std::move(item));
+        }
+    }
     view = view.substr(begin + 7, end - begin - 7);
     for (std::size_t at = 0; at < view.size();) {
         const auto start = view.find("<dict>", at);
@@ -114,15 +139,16 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
         const std::string relative = decode_xml(value(dict, "ExecutablePath", "string"));
         const std::filesystem::path path(relative);
         if (relative.empty() || path.is_absolute())
-            continue;
+            return std::nullopt;
         if (std::find(path.begin(), path.end(), std::filesystem::path("..")) != path.end())
-            continue;
+            return std::nullopt;
         if (!number(value(dict, "PlatformID", "integer"), variant.platform_id) ||
             !number(value(dict, "PlatformVersion", "integer"), variant.platform_version))
-            continue;
+            return std::nullopt;
         variant.executable = directory / path;
-        if (std::filesystem::is_regular_file(variant.executable))
-            game.variants.push_back(std::move(variant));
+        if (!std::filesystem::is_regular_file(variant.executable))
+            return std::nullopt;
+        game.variants.push_back(std::move(variant));
     }
     if (game.name.empty() || game.variants.empty())
         return std::nullopt;

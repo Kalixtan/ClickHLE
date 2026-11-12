@@ -17,10 +17,10 @@ The command-line program is `build/bin/clickhle`. When Qt 6 Widgets is available
 
 The GUI lists games from `hdd/iPod_Control/Games_RO` beside its executable.
 Select a platform at the top of the list; the package manifest chooses its
-executable. File → Install Game Package installs `.ipg` files into that drive
-using matching 32-byte `.ikey` files in a `keys` folder beside the executable.
-The native `clickhle-install` companion needs libzip and OpenSSL and refuses
-a missing or invalid key. It can also be run directly as
+executable. File → Install Game Package installs `.ipg` or `.zip` packages into that drive.
+Plaintext eapps need no key. Encrypted eapps require a valid 32-byte `.ikey` file
+in a `keys` folder beside the executable. The native `clickhle-install` companion
+uses libzip and OpenSSL and can also be run directly as
 `build/bin/clickhle-install game.ipg build/bin/hdd build/bin/keys`. The CLI
 accepts `--platform 1` through `4` when a binary is shared by platforms.
 Alternate-platform eapps parse and map, but APIs with different ABI hashes

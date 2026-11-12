@@ -506,12 +506,6 @@ private:
                 tr("The native clickhle-install program is missing beside ClickHLE."));
             return;
         }
-        if (!std::filesystem::is_directory(keys)) {
-            QMessageBox::critical(this, tr("Keys Missing"),
-                tr("Place matching .ikey files in the keys folder beside ClickHLE."));
-            return;
-        }
-
         install_process_ = new QProcess(this);
         install_process_->setProgram(QString::fromStdString(installer.string()));
         install_process_->setArguments({package,

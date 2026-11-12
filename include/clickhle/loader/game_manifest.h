@@ -15,14 +15,20 @@ struct GameVariant {
     std::filesystem::path executable;
 };
 
+struct ManifestFile {
+    std::filesystem::path path;
+    u64 size = 0;
+};
+
 struct InstalledGame {
     std::string guid;
     std::string name;
     std::filesystem::path directory;
     std::vector<GameVariant> variants;
+    std::vector<ManifestFile> files;
 };
 
-// Reads the small, XML-based Platforms section shipped with installed games.
+// Reads the XML manifest shipped with installed games.
 // A missing or malformed manifest returns no game.
 [[nodiscard]] std::optional<InstalledGame>
 read_game_manifest(const std::filesystem::path &directory);
