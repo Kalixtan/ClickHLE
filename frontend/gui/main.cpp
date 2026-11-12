@@ -632,7 +632,7 @@ private:
         g5_action_->setCheckable(true);
         const bool jit_available = clickhle::videocore_jit_available();
         interpreter_action_->setChecked(!jit_available);
-        jit_action_->setChecked(jit_available);
+        g5_action_->setChecked(jit_available);
         jit_action_->setEnabled(jit_available);
         g5_action_->setEnabled(jit_available);
         connect(interpreter_action_, &QAction::triggered, this, [this] {

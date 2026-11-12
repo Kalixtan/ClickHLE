@@ -70,7 +70,8 @@ public:
 
         // Opt-in disk capture for headless reverse-engineering runs.
         bool capture_videocore = false;
-        VideoCoreEngine videocore_engine = VideoCoreEngine::Interpreter;
+        VideoCoreEngine videocore_engine = videocore_jit_available()
+            ? VideoCoreEngine::G5 : VideoCoreEngine::Interpreter;
 
         /// Empty means the backend chosen at configure time.
         std::string cpu_backend;

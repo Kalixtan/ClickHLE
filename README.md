@@ -41,15 +41,15 @@ paths in that database resolve under `hdd/iPod_Control/Music`. The database
 reader supports tracks and playlists, but most RetailOS Metadata calls still
 need their ABI contracts traced before games can browse a populated library.
 
-Graphics use a native C++ VideoCore II core running original firmware. The LLVM JIT is the
-default when available; the interpreter can be selected with `--vc2-engine interpreter` or under
+Graphics use a native C++ VideoCore II core running original firmware. G5 with LLVM JIT fallback is the
+default when LLVM is available; the interpreter can be selected with `--vc2-engine interpreter` or under
 Options → VideoCore Engine in the GUI when LLVM is available at build time. Instructions the
 JIT cannot yet compile run in the interpreter. Native HLE builds
 its command packets; games do not execute RetailOS ARM code or require `osos.bin`. Both frontends
 display the raw framebuffer, with no shader replacement or Python runtime. Place the game
 RenderServer firmware beside the executable as `rserver.bin`. `CLICKHLE_VC2_FIRMWARE`
 can override that path; games may also supply their own image.
-The optional `--vc2-engine g5` mode (Options → VideoCore Engine → G5 in the GUI)
+The default `--vc2-engine g5` mode (Options → VideoCore Engine → G5 in the GUI)
 uses independent high-level replacements for matrix API calls 165–166, 169–172 and 175–176.
 Other graphics calls follow the normal packet and VC2 JIT path. New replacements
 belong in `src/video/g5/` and should be added only with evidence and matching

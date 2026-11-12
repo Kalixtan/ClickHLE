@@ -18,7 +18,8 @@ enum class VideoCoreEngine { Interpreter, Jit, G5 };
 class VideoCore {
   public:
     explicit VideoCore(bool capture = false,
-                       VideoCoreEngine engine = VideoCoreEngine::Interpreter);
+                       VideoCoreEngine engine = videocore_jit_available()
+                           ? VideoCoreEngine::G5 : VideoCoreEngine::Interpreter);
     ~VideoCore();
     VideoCore(const VideoCore &) = delete;
     VideoCore &operator=(const VideoCore &) = delete;

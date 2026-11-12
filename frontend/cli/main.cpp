@@ -63,7 +63,7 @@ struct Options {
     bool headless = false;
     bool capture_videocore = false;
     clickhle::VideoCoreEngine videocore_engine =
-        clickhle::videocore_jit_available() ? clickhle::VideoCoreEngine::Jit
+        clickhle::videocore_jit_available() ? clickhle::VideoCoreEngine::G5
                                            : clickhle::VideoCoreEngine::Interpreter;
     bool show_calls = false;
     std::vector<unsigned long> tracepoints;
