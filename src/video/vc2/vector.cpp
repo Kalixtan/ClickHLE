@@ -1006,6 +1006,13 @@ void Core::execute_vector(const std::array<u32, 5> &w, unsigned length,
                     vz[i] = (values[i] & mask) == 0;
                     vn[i] = values[i] < 0;
                     vc[i] = values[i] < 0 || values[i] > mask;
+                    // The high-half ADC uses unsigned operands for carry-out,
+                    // but its stored sign feeds the firmware's IFN colour clamp.
+                    // Testing the widened unsigned sum makes every negative
+                    // interpolant look positive. This rule is established by
+                    // the shader chain; other SETF forms remain unchanged.
+                    if (highcarry)
+                        vn[i] = (static_cast<u32>(values[i]) & 0x8000u) != 0;
                     // The matching context restore shifts the packed flag word
                     // right by one: its low bit restores C. Other shift forms
                     // still need independent carry/zero-shift evidence.

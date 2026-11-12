@@ -1602,6 +1602,11 @@ struct Jit::Impl {
                                                llvm::ConstantInt::get(i64, 0));
                 auto *carry = (modifiers & 8192) ? shifted_carry[lane] : build.CreateOr(negative, build.CreateICmpSGT(value,
                                                     llvm::ConstantInt::get(i64, mask)));
+                // High-half ADC carries unsigned, while IFN consumes the
+                // resulting halfword's sign in the firmware colour clamp.
+                if (opcode == 34 && (modifiers & 64))
+                    negative = build.CreateICmpNE(build.CreateAnd(value, 0x8000),
+                                                  llvm::ConstantInt::get(i64, 0));
                 const std::array<llvm::Value *, 3> flags{zero, negative, carry};
                 for (unsigned flag = 0; flag < flags.size(); ++flag) {
                     auto *target = build.CreateInBoundsGEP(i8, function->getArg(7 + flag),
