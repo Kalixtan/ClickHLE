@@ -192,13 +192,17 @@ void Core::step(std::optional<u16> prefetched) {
         if (op != 0 && op != 1 && op != 16)
             set(d, v);
     };
-    auto memory = [&](unsigned op, unsigned d, u32 address) {
+    auto memory = [&](unsigned op, unsigned d, u32 address, unsigned alignment_delay = 0) {
         const unsigned widths[] = {4, 4, 2, 2, 1, 1, 2, 1};
         const unsigned width = widths[op];
-        // Matches the testbed's data result for aligned accesses. Exception
-        // timing for misalignment remains unsupported and must not be hidden.
-        if (address & (width - 1))
-            throw std::runtime_error("Misaligned VC2 scalar access");
+        const bool misaligned = (address & (width - 1)) != 0;
+        if (misaligned) {
+            if (!alignment_delay || alignment_exception_steps_)
+                throw std::runtime_error("Unverified VC2 scalar alignment form");
+            // Device ALGN records: the access lands at the rounded-down
+            // address, and vector 1 arrives after later instructions run.
+            address &= ~(width - 1);
+        }
         if (op == 1 || op == 3 || op == 5)
             write(address, r[d], width);
         else {
@@ -207,6 +211,8 @@ void Core::step(std::optional<u16> prefetched) {
                 value = static_cast<u32>(sign_extend(value, width * 8));
             set(d, value);
         }
+        if (misaligned)
+            alignment_exception_steps_ = alignment_delay + 1;
     };
     if (h == 0x4430)
         next = r[26];
@@ -237,6 +243,8 @@ void Core::step(std::optional<u16> prefetched) {
         next = read(sp + 4);
         r[25] = sp + 8;
     } else if (h == 0x4330) {
+        if (alignment_exception_steps_)
+            throw std::runtime_error("Unverified VC2 alignment exception across sleep");
         u32 delta = ~0u;
         for (unsigned i = 0; i < 4; ++i)
             if (armed_[i])
@@ -285,7 +293,9 @@ void Core::step(std::optional<u16> prefetched) {
         const unsigned widths[] = {4, 4, 2, 2, 1, 1, 2, 1};
         const bool pre = (h & 0xf800) == 0x7000;
         u32 a = r[s] - (pre ? widths[op] : 0);
-        memory(op, h & 15, a);
+        const unsigned delay = pre ? (op == 0 ? 2u : 0u)
+                                   : (op == 0 || op == 1 || op == 2 ? 4u : 0u);
+        memory(op, h & 15, a, delay);
         r[s] = pre ? a : r[s] + widths[op];
     } else if ((h & 0xf000) == 0x6000) {
         unsigned op = 2 * ((h >> 9) & 15);
@@ -296,7 +306,10 @@ void Core::step(std::optional<u16> prefetched) {
     } else if ((h & 0xc000) == 0x8000) {
         unsigned op = (h >> 8) & 7, x = (h >> 11) & 7;
         const unsigned widths[] = {4, 4, 2, 2, 1, 1, 2, 1};
-        memory(op, h & 15, r[(h >> 4) & 15] + (x == 7 ? 0 : r[x] * widths[op]));
+        const unsigned delay = (x == 7 || op == 0) &&
+                               (op == 0 || op == 1 || op == 2 || op == 3 || op == 6)
+                                   ? 4u : 0u;
+        memory(op, h & 15, r[(h >> 4) & 15] + (x == 7 ? 0 : r[x] * widths[op]), delay);
     } else if ((h & 0xff00) == 0xe000 || (h & 0xff00) == 0xf000) {
         const unsigned base = std::array<unsigned, 4>{0, 6, 16, 24}[(h >> 5) & 3], m = h & 31;
         const unsigned count = (base == 24 && m == 15) ? 0 : m + 1, total = count + ((h >> 7) & 1);
@@ -357,7 +370,8 @@ void Core::step(std::optional<u16> prefetched) {
             off &= ~1u;
         } else
             op = op == 2 ? 4 : 5;
-        memory(op, h & 15, r[(h >> 4) & 15] + off);
+        const unsigned delay = op == 0 || op == 1 || op == 2 || op == 3 ? 4u : 0u;
+        memory(op, h & 15, r[(h >> 4) & 15] + off, delay);
         next = pc + 4;
     } else if ((h & 0xff00) == 0x2c00) {
         r[h & 15] = r[(h >> 4) & 15] + static_cast<u32>(sign_extend(word(1), 16));
@@ -453,7 +467,8 @@ void Core::step(std::optional<u16> prefetched) {
             unsigned op = ((h >> 7) & 1) * 4 + (w1 & 3);
             if (d == 31 && op != 1 && op != 3 && op != 5)
                 throw std::runtime_error("Unverified VC2 memory destination pc");
-            memory(op, d, (base == 31 ? pc & ~3u : r[base]) + off);
+            memory(op, d, (base == 31 ? pc & ~3u : r[base]) + off,
+                   op == 0 ? 4u : 0u);
         }
     } else {
         std::ostringstream out;
@@ -461,6 +476,15 @@ void Core::step(std::optional<u16> prefetched) {
         throw std::runtime_error(out.str());
     }
     r[31] = next;
+    if (alignment_exception_steps_ && --alignment_exception_steps_ == 0) {
+        // Synchronous faults enter regardless of the ordinary interrupt mask.
+        const u32 sp = r[25] - 8;
+        write(sp, r[30]);
+        write(sp + 4, r[31]);
+        r[25] = sp;
+        r[30] &= ~(1u << 30);
+        r[31] = read(4);
+    }
 }
 bool Core::run(u64 budget) {
     sleeping = false;
@@ -476,7 +500,8 @@ bool Core::run(u64 budget) {
             unsigned executed = 0;
             std::optional<u16> fetched;
 #if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
-            if (jit_enabled_ && jit_ && r[31] < 0x4000000 && !(r[31] & 1)) {
+            if (jit_enabled_ && jit_ && !alignment_exception_steps_ &&
+                r[31] < 0x4000000 && !(r[31] & 1)) {
                 fetched = static_cast<u16>(read(r[31], 2));
                 const auto remaining = 32 - (n & 31);
                 executed = jit_->try_execute(*this, static_cast<unsigned>(remaining), *fetched);
@@ -506,7 +531,11 @@ bool Core::run(u64 budget) {
                     advance(time_fraction_ / 100);
                     time_fraction_ %= 100;
                 }
-                interrupt(r[31]);
+                if (alignment_exception_steps_) {
+                    if ((r[30] & (1u << 30)) && pending_source() != 32)
+                        throw std::runtime_error("Unverified VC2 interrupt during alignment exception");
+                } else
+                    interrupt(r[31]);
             }
             if (budget_return)
                 throw std::runtime_error("VC2 instruction budget exhausted at function return");

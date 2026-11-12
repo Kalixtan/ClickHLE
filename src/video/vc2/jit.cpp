@@ -2585,11 +2585,11 @@ struct Jit::Impl {
             return 1;
         }
         if (block.kind == Block::Kind::Memory) {
-            core.recent_pcs[core.recent_pc_count++ % core.recent_pcs.size()] = block.pc;
             const u32 address = block.native_address(core.r.data());
             const unsigned width = block.memory_width;
             if (address & (width - 1))
-                throw std::runtime_error("Misaligned VC2 scalar access");
+                return 0; // The interpreter handles measured delayed faults.
+            core.recent_pcs[core.recent_pc_count++ % core.recent_pcs.size()] = block.pc;
             const unsigned op = block.memory_op, d = block.memory_register;
             if (op == 1 || op == 3 || op == 5)
                 core.write(address, core.r[d], width);

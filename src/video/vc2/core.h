@@ -75,6 +75,9 @@ class Core {
     std::vector<u64> code_page_generation_ = std::vector<u64>(0x4000000 / 4096);
     std::vector<u8> code_page_watched_ = std::vector<u8>(0x4000000 / 4096);
     std::map<u32, u32> registers_, reads_;
+    // Measured misaligned scalar accesses finish, then enter vector 1 after
+    // the instruction window. Counts include the faulting instruction.
+    unsigned alignment_exception_steps_ = 0;
     std::array<u32, 4> compare_{};
     std::array<bool, 4> armed_{};
     u32 timer_status_ = 0, level_ = 0, dma_time_ = 0, time_fraction_ = 0;
