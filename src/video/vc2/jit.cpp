@@ -209,6 +209,10 @@ std::optional<Operation> decode_extended(u16 word, u16 second, u32 pc) {
             .destination = static_cast<unsigned>(word & 15),
             .left = static_cast<unsigned>((word & 16) ? 25 : 24),
             .immediate = second, .immediate_source = true};
+    if ((word & 0xfff0) == 0x2de0 && !(second & 0x8000))
+        return Operation{.word = word, .opcode = 14,
+            .destination = static_cast<unsigned>(word & 15),
+            .immediate = pc + second, .immediate_source = true};
     if ((word & 0xffc0) == 0x2e80) {
         const unsigned opcode = (second >> 10) & 31;
         const bool ordinary = word & 32;

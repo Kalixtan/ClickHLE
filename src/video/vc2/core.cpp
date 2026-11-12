@@ -367,7 +367,14 @@ void Core::step(std::optional<u16> prefetched) {
         next = pc + 4;
         if (group == 12 || group == 13)
             r[h & 15] = r[base] + off;
-        else if (group < 8) {
+        else if (group == 14) {
+            // VMCS uses this to address a nearby halfword table and to select
+            // between two matching code routines. Both targets are pc+off.
+            // No negative-offset instance has been identified yet.
+            if (off & 0x8000)
+                throw std::runtime_error("Unverified VC2 PC-relative negative offset");
+            r[h & 15] = pc + off;
+        } else if (group < 8) {
             unsigned op = group & 3;
             if (op < 2 && (off & 1)) {
                 op = op == 0 ? 2 : 6;
