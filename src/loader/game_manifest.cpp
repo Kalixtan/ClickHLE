@@ -10,7 +10,8 @@
 namespace clickhle {
 namespace {
 
-std::string_view value(std::string_view dict, std::string_view key, std::string_view type) {
+std::string_view value(std::string_view dict, std::string_view key,
+                       std::string_view type) {
     const std::string marker = "<key>" + std::string(key) + "</key>";
     const auto key_at = dict.find(marker);
     if (key_at == std::string_view::npos)
@@ -86,7 +87,8 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
     std::ifstream file(directory / "Manifest.plist", std::ios::binary);
     if (!file)
         return std::nullopt;
-    const std::string xml((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const std::string xml((std::istreambuf_iterator<char>(file)),
+                          std::istreambuf_iterator<char>());
     std::string_view view(xml);
     const auto key = view.find("<key>Platforms</key>");
     if (key == std::string_view::npos)
@@ -111,7 +113,7 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
     if (files_key != std::string_view::npos) {
         const auto files_begin = view.find("<array>", files_key);
         const auto files_end = files_begin == std::string_view::npos
-                                   ? std::string_view::npos : view.find("</array>", files_begin);
+            ? std::string_view::npos : view.find("</array>", files_begin);
         if (files_end == std::string_view::npos)
             return std::nullopt;
         const auto entries = view.substr(files_begin + 7, files_end - files_begin - 7);
@@ -138,7 +140,7 @@ std::optional<InstalledGame> read_game_manifest(const std::filesystem::path &dir
             break;
         const auto stop = view.find("</dict>", start);
         if (stop == std::string_view::npos)
-            break;
+            return std::nullopt;
         const auto dict = view.substr(start + 6, stop - start - 6);
         at = stop + 7;
 

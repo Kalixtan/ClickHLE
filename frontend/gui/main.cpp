@@ -418,8 +418,9 @@ private:
         library_table_->setHorizontalHeaderLabels(
             {tr("Game"), tr("Version"), tr("Game ID"), tr("Build ID"),
              tr("EXE size"), tr("Platform version")});
-        library_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-        library_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        auto* header = library_table_->horizontalHeader();
+        header->setSectionResizeMode(QHeaderView::ResizeToContents);
+        header->setSectionResizeMode(0, QHeaderView::Stretch);
         library_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
         library_table_->setSelectionMode(QAbstractItemView::SingleSelection);
         library_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -465,10 +466,11 @@ private:
         library_rows_.clear();
         const u32 platform = platform_selector_->currentData().toUInt();
         for (const auto& game : installed_games_) {
-            if (!QString::fromStdString(game.name).contains(library_search_->text(),
-                                                          Qt::CaseInsensitive) &&
-                !QString::fromStdString(game.guid).contains(library_search_->text(),
-                                                          Qt::CaseInsensitive))
+            const QString name = QString::fromStdString(game.name);
+            const QString id = QString::fromStdString(game.guid);
+            const QString query = library_search_->text();
+            if (!name.contains(query, Qt::CaseInsensitive) &&
+                !id.contains(query, Qt::CaseInsensitive))
                 continue;
             const auto variant = std::find_if(game.variants.begin(), game.variants.end(),
                 [platform](const auto& item) { return item.platform_id == platform; });
@@ -480,9 +482,9 @@ private:
                      QString::fromStdString(
                          variant->executable.lexically_relative(game.directory).generic_string()));
             const QStringList columns{
-                QString::fromStdString(game.name),
+                name,
                 QString::fromStdString(game.version),
-                QString::fromStdString(game.guid),
+                id,
                 variant->build_id ? QString::number(variant->build_id) : QStringLiteral("—"),
                 variant->size ? QLocale().formattedDataSize(static_cast<qint64>(variant->size))
                               : QStringLiteral("—"),

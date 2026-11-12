@@ -11,9 +11,11 @@ StoragePaths storage_paths_for_game(const std::filesystem::path& executable,
     const auto control_root = games_root.parent_path();
     const bool installed = games_root.filename() == "Games_RO" &&
                            control_root.filename() == "iPod_Control";
-    const auto device_root = !hdd_root.empty() ? hdd_root :
-        installed ? control_root.parent_path() :
-        std::filesystem::current_path() / "hdd";
+    std::filesystem::path device_root = hdd_root;
+    if (device_root.empty()) {
+        device_root = installed ? control_root.parent_path()
+                                : std::filesystem::current_path() / "hdd";
+    }
     const auto title_id = installed ? game_root.filename() : executable.stem();
     const auto control = device_root / "iPod_Control";
     return {

@@ -37,8 +37,13 @@ int main(int argc, char** argv) {
         game->variants.size() == 2 && game->variants[0].build_id == 123 &&
         game->variants[0].size == 4096 && game->variants[1].build_id == 0 &&
         platforms == std::vector<clickhle::u32>{2, 3};
+    {
+        std::ofstream malformed(directory / "Manifest.plist", std::ios::trunc);
+        malformed << "<key>Platforms</key><array><dict></array>";
+    }
+    const bool rejects_truncated = !clickhle::read_game_manifest(directory);
     fs::remove_all(directory);
-    if (!valid) {
+    if (!valid || !rejects_truncated) {
         std::cerr << "manifest metadata or shared platform path failed\n";
         return 1;
     }

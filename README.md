@@ -21,7 +21,8 @@ firmware, and reference assets are not bundled. See
 The GUI lists games from `hdd/iPod_Control/Games_RO` beside its executable.
 Select a platform at the top of the list; the package manifest chooses its
 executable. The list shows each game's version, ID, build, executable size,
-and platform version. File → Install Game Package installs `.ipg` or `.zip` packages into that drive.
+and platform version. File → Install Game Package installs `.ipg` or `.zip`
+packages into that drive.
 Plaintext eapps need no key. Encrypted eapps require a valid 32-byte `.ikey` file
 in a `keys` folder beside the executable. Package installation is built into
 the GUI and CLI using libzip and OpenSSL. The CLI command is
