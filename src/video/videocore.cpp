@@ -87,6 +87,8 @@ struct VideoCore::Impl {
     u32 next_display_sync = 0;
     std::filesystem::path output;
     bool timing = std::getenv("CLICKHLE_VC2_TIMING") != nullptr;
+    bool verify_g5 = owner.capture_ && std::getenv("CLICKHLE_G5_VERIFY") != nullptr;
+    u64 verified_runs = 0;
     double boot_cpu = 0, send_cpu = 0, run_cpu = 0, pixels_cpu = 0;
     double run_compile_cpu = 0;
     u64 send_count = 0;
@@ -130,6 +132,7 @@ struct VideoCore::Impl {
             throw std::runtime_error("Cannot create VC2 packet capture");
     }
     ~Impl() {
+        if (verify_g5) std::cerr << "G5 verified runs: " << verified_runs << '\n';
         if (!timing) return;
         std::cerr << "VC2 CPU seconds: boot=" << boot_cpu
                   << " send=" << send_cpu << " run=" << run_cpu
@@ -137,6 +140,7 @@ struct VideoCore::Impl {
                   << " compilation=" << run_compile_cpu
                   << " pixels=" << pixels_cpu << ", submissions=" << send_count
                   << ", instructions=" << chip.instructions
+                  << ", G5 instructions=" << chip.replacement_instructions
                   << ", JIT instructions=" << chip.jit_instructions
                   << ", JIT executions=" << chip.jit_executions
                   << ", DMA words=" << chip.dma_words
@@ -155,9 +159,20 @@ struct VideoCore::Impl {
     }
     bool run_chip(u64 budget = 2'000'000) {
         CpuTimer timer(timing ? &run_cpu : nullptr);
+        auto reference = verify_g5 && owner.engine_ == VideoCoreEngine::G5
+            ? chip.fork_reference() : nullptr;
         const double compile_before = chip.jit_compile_cpu;
         const bool result = chip.run(budget);
         run_compile_cpu += chip.jit_compile_cpu - compile_before;
+        if (reference) {
+            const bool expected = reference->run(budget);
+            const auto difference = chip.state_difference(*reference);
+            if (result != expected || !difference.empty() || chip.instructions != reference->instructions)
+                throw std::runtime_error("G5 reference mismatch at API #" +
+                    std::to_string(current_ordinal) + ": " +
+                    (difference.empty() ? "execution count/result" : difference));
+            ++verified_runs;
+        }
         return result;
     }
     void boot() {
@@ -172,6 +187,7 @@ struct VideoCore::Impl {
         // cache/clock setup is abstracted by HLE, not replayed as ARM code.
         chip.load(firmware);
         chip.set_jit_enabled(owner.engine_ != VideoCoreEngine::Interpreter);
+        chip.set_g5_enabled(owner.engine_ == VideoCoreEngine::G5);
         // The game-image loader clears readiness after uploading the image.
         // Only executing the new firmware may publish a ready state.
         chip.write(0x1f8, 0);
@@ -474,7 +490,10 @@ VideoCore::VideoCore(bool capture, VideoCoreEngine engine)
 VideoCore::~VideoCore() = default;
 void VideoCore::set_engine(VideoCoreEngine engine) {
     engine_ = engine;
-    if (impl_) impl_->chip.set_jit_enabled(engine != VideoCoreEngine::Interpreter);
+    if (impl_) {
+        impl_->chip.set_jit_enabled(engine != VideoCoreEngine::Interpreter);
+        impl_->chip.set_g5_enabled(engine == VideoCoreEngine::G5);
+    }
 }
 bool VideoCore::initialize() {
     if (!error_.empty())

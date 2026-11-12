@@ -11,6 +11,54 @@
 #include <stdexcept>
 
 namespace clickhle::vc2 {
+std::unique_ptr<Core> Core::fork_reference() const {
+    auto copy = std::make_unique<Core>(*this);
+    copy->jit_.reset();
+    copy->jit_enabled_ = false;
+    copy->g5_enabled_ = false;
+    return copy;
+}
+
+std::string Core::state_difference(const Core &other) const {
+    // Compare state that can affect future execution. Compilation caches and
+    // profiling/history counters are deliberately not architectural state.
+    if (r != other.r) return "r";
+    if (vrf != other.vrf) return "vrf";
+    if (acc != other.acc) return "acc";
+    if (acclo != other.acclo) return "acclo";
+    if (vz != other.vz) return "vz";
+    if (vn != other.vn) return "vn";
+    if (vc != other.vc) return "vc";
+    if (sleeping != other.sleeping) return "sleeping";
+    if (error != other.error) return "error";
+    if (timer != other.timer) return "timer";
+    if (registers_ != other.registers_) return "registers_";
+    if (reads_ != other.reads_) return "reads_";
+    if (alignment_exception_steps_ != other.alignment_exception_steps_) return "alignment_exception_steps_";
+    if (compare_ != other.compare_) return "compare_";
+    if (armed_ != other.armed_) return "armed_";
+    if (timer_status_ != other.timer_status_) return "timer_status_";
+    if (level_ != other.level_) return "level_";
+    if (dma_time_ != other.dma_time_) return "dma_time_";
+    if (time_fraction_ != other.time_fraction_) return "time_fraction_";
+    if (priorities_ != other.priorities_) return "priorities_";
+    if (dma_config_ != other.dma_config_) return "dma_config_";
+    if (dma_status_ != other.dma_status_) return "dma_status_";
+    if (dma_finished_ != other.dma_finished_) return "dma_finished_";
+    if (dma_ != other.dma_) return "dma_";
+    if (progressing_ != other.progressing_) return "progressing_";
+    if (descriptors != other.descriptors) return "descriptors";
+    if (ram_.size() != other.ram_.size()) return "RAM size";
+    if (std::memcmp(ram_.data(), other.ram_.data(), ram_.size()) == 0) return {};
+    const auto mismatch = std::mismatch(ram_.begin(), ram_.end(), other.ram_.begin());
+    if (mismatch.first != ram_.end()) {
+        std::ostringstream message;
+        message << "RAM at 0x" << std::hex << (mismatch.first - ram_.begin());
+        return message.str();
+    }
+    return {};
+}
+
 i32 sign_extend(u32 value, unsigned bits) {
     const u32 mask = bits == 32 ? ~0u : (1u << bits) - 1;
     value &= mask;
@@ -499,8 +547,12 @@ bool Core::run(u64 budget) {
         for (u64 n = 0;;) {
             unsigned executed = 0;
             std::optional<u16> fetched;
+            if (g5_enabled_ && !alignment_exception_steps_) {
+                executed = run_replacement(static_cast<unsigned>(32 - (n & 31)));
+                replacement_instructions += executed;
+            }
 #if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
-            if (jit_enabled_ && jit_ && !alignment_exception_steps_ &&
+            if (!executed && jit_enabled_ && jit_ && !alignment_exception_steps_ &&
                 r[31] < 0x4000000 && !(r[31] & 1)) {
                 fetched = static_cast<u16>(read(r[31], 2));
                 const auto remaining = 32 - (n & 31);

@@ -94,6 +94,7 @@ add_library(clickhle_core
     src/video/videocore.cpp
     src/video/graphics_api.cpp
     src/video/g5/api.cpp
+    src/video/g5/firmware.cpp
     src/video/graphics_state.cpp
     src/video/graphics_buffers.cpp
     src/video/graphics_readback.cpp
@@ -116,6 +117,14 @@ target_link_libraries(clickhle_core PRIVATE clickhle_flags)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_g5_firmware_test tests/g5_firmware_test.cpp)
+    target_include_directories(clickhle_g5_firmware_test PRIVATE include src/video/vc2)
+    target_link_libraries(clickhle_g5_firmware_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME g5_firmware COMMAND clickhle_g5_firmware_test)
+    add_executable(clickhle_vc2_state_test tests/vc2_state_test.cpp)
+    target_include_directories(clickhle_vc2_state_test PRIVATE include src/video/vc2)
+    target_link_libraries(clickhle_vc2_state_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME vc2_state COMMAND clickhle_vc2_state_test)
     add_executable(clickhle_g5_api_test tests/g5_api_test.cpp)
     target_include_directories(clickhle_g5_api_test PRIVATE include src/video)
     target_link_libraries(clickhle_g5_api_test PRIVATE clickhle_core clickhle_flags)

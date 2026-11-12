@@ -17,21 +17,28 @@ struct DmaTransfer {
     u32 rows = 0, columns = 0, row = 0, column = 0, line = 0;
     i32 source_skip = 0, destination_skip = 0;
     bool paced = false, increment = false, active = false;
+    bool operator==(const DmaTransfer &) const = default;
 };
 struct DmaDescriptor {
     std::array<u32, 6> words;
+    bool operator==(const DmaDescriptor &) const = default;
 };
 class Jit;
 
 class Core {
   public:
     Core();
+    // Offline replacement validation; copies device state without sharing JIT code.
+    std::unique_ptr<Core> fork_reference() const;
+    std::string state_difference(const Core &other) const;
     void load(std::span<const u8> image);
     // The instruction budget is a soft limit checked at function returns.
     // Sleep and unsupported instructions stop immediately; hardware service
     // points remain independent of the budget.
     bool run(u64 budget = 2'000'000);
     void set_jit_enabled(bool enabled) noexcept { jit_enabled_ = enabled; }
+    void set_g5_enabled(bool enabled) noexcept { g5_enabled_ = enabled; }
+    unsigned run_replacement(unsigned budget);
     void step(std::optional<u16> prefetched = std::nullopt);
     void advance(u32 microseconds);
     void set_gpio_input(unsigned pin, bool high);
@@ -55,6 +62,7 @@ class Core {
     bool sleeping = false;
     std::string error;
     u64 instructions = 0, dma_words = 0;
+    u64 replacement_instructions = 0;
     u64 jit_instructions = 0;
     u64 jit_executions = 0;
     u64 jit_compilations = 0, jit_compile_us = 0;
@@ -69,6 +77,9 @@ class Core {
     std::vector<VectorPlan> vector_cache_ = std::vector<VectorPlan>(vector_cache_size);
     std::shared_ptr<Jit> jit_;
     bool jit_enabled_ = false;
+    bool g5_enabled_ = false;
+    u32 memcpy_entry_ = ~0u;
+    u64 memcpy_first_generation_ = 0, memcpy_last_generation_ = 0;
     std::vector<u8> ram_;
     // A compiled instruction is valid until a write touches one of its pages.
     // Unwatched data pages do not pay for generation updates.
