@@ -159,10 +159,10 @@ u32 Core::alu(unsigned op, u32 a, u32 b) {
         return out;
     }
     case 29:
-        // Experimental: population count is a candidate, not a verified VC2 opcode.
-        // Firmware uses this on a free-record mask and only tests zero/nonzero;
-        // the patent names COUNT but does not establish this encoding. Revisit
-        // the result and flag semantics when numeric-result or hardware evidence exists.
+        // The Minigolf m1a RenderServer checks this numeric result against its
+        // free-record count and occupied-record tally. That distinguishes
+        // population count from identity/Boolean results for observed masks.
+        // Full-width results and status flags still lack a device measurement.
         return static_cast<u32>(std::popcount(b));
     case 30:
         return b >> 31 ? 0u - b : b;
