@@ -32,7 +32,8 @@ remain unbound and stop when called.
 
 Installed games read assets from `hdd/iPod_Control/Games_RO/<id>` and write
 saves to `GameData_RW/<id>` and statistics to `GameStats_WO/<id>` under the
-same `iPod_Control` folder. Shared game data uses `GameData_ShareRW`.
+same `iPod_Control` folder on the frontend's HDD, even if the executable was
+opened from another drive. Shared game data uses `GameData_ShareRW`.
 Loose executables also put their saves under this HDD, using their filename as
 the directory name. Metadata reads `hdd/iPod_Control/iTunes/iTunesDB`; music
 paths in that database resolve under `hdd/iPod_Control/Music`. The database

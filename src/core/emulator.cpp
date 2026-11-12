@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "clickhle/common/log.h"
+#include "clickhle/core/storage_paths.h"
 #include "clickhle/hle/modules.h"
 
 namespace clickhle {
@@ -308,16 +309,10 @@ bool Emulator::load(Config config, std::string* error) {
     } else {
         vfs_.mount(config_.content_root);
     }
-    // Guest-owned files live on the emulated iPod volume, even when loading a
-    // loose executable from outside Games_RO.
-    const auto game_root = vfs_.root();
-    const auto control = game_root.parent_path().parent_path();
-    const bool installed = game_root.parent_path().filename() == "Games_RO" &&
-                           control.filename() == "iPod_Control";
-    const auto device_root = installed ? control.parent_path() :
-        (config_.hdd_root.empty() ? std::filesystem::current_path() / "hdd"
-                                  : config_.hdd_root);
-    vfs_.set_device_root(device_root);
+    // Keep the installed title ID even if --content-root changes where assets
+    // are read. Save data always belongs on the selected emulated HDD.
+    const auto storage = storage_paths_for_game(config_.executable, config_.hdd_root);
+    vfs_.set_device_root(storage.device_root);
     if (!vfs_.device_root().empty()) {
         const auto database = vfs_.resolve(
             "iPod_Control/iTunes/iTunesDB", Vfs::Namespace::kDevice);
@@ -332,14 +327,13 @@ bool Emulator::load(Config config, std::string* error) {
             CLICKHLE_WARN(kCategory) << "music library: " << database_error;
         }
     }
-    const auto title_id = installed ? game_root.filename() : config_.executable.stem();
     if (config_.save_root.empty()) {
-        vfs_.set_save_root(device_root / "iPod_Control" / "GameData_RW" / title_id);
+        vfs_.set_save_root(storage.game_data);
     } else {
         vfs_.set_save_root(config_.save_root);
     }
-    vfs_.set_stats_root(device_root / "iPod_Control" / "GameStats_WO" / title_id);
-    vfs_.set_shared_root(device_root / "iPod_Control" / "GameData_ShareRW");
+    vfs_.set_stats_root(storage.game_stats);
+    vfs_.set_shared_root(storage.shared_data);
 
     heap_.initialise(config_.heap_base, config_.heap_size);
     scheduler_.initialise(config_.thread_stack_base, config_.thread_stack_arena,

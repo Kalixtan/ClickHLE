@@ -179,6 +179,7 @@ std::filesystem::path Vfs::resolve_under(const std::filesystem::path& root,
 u32 Vfs::open(const std::string& guest_path, Mode mode, bool allow_write,
               Namespace name_space) {
     // Games_RO is immutable. Each writable namespace has its own root.
+    if (mode != Mode::kRead && !allow_write) return 0;
     if ((name_space == Namespace::kGame || name_space == Namespace::kDevice) &&
         mode != Mode::kRead) return 0;
     const auto& base = root_for(name_space);

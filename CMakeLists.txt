@@ -70,6 +70,7 @@ add_library(clickhle_core
     src/core/cpu.cpp
     src/core/cpu_unicorn.cpp
     src/core/emulator.cpp
+    src/core/storage_paths.cpp
     src/loader/eapp_image.cpp
     src/loader/framework_abi.cpp
     src/loader/game_manifest.cpp
@@ -114,6 +115,12 @@ target_link_libraries(clickhle_core PRIVATE clickhle_flags)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_storage_paths_test
+        tests/storage_paths_test.cpp src/core/storage_paths.cpp
+        src/hle/vfs.cpp src/common/log.cpp)
+    target_include_directories(clickhle_storage_paths_test PRIVATE include)
+    target_link_libraries(clickhle_storage_paths_test PRIVATE clickhle_flags)
+    add_test(NAME storage_paths COMMAND clickhle_storage_paths_test)
     add_executable(clickhle_game_manifest_test
         tests/game_manifest_test.cpp src/loader/game_manifest.cpp)
     target_include_directories(clickhle_game_manifest_test PRIVATE include)
