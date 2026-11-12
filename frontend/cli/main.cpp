@@ -11,6 +11,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,7 @@ struct Options {
     std::filesystem::path ordinal_names;
     std::filesystem::path screenshot;
     std::string cpu_backend;
+    clickhle::u32 platform_id = 0;
     unsigned long clock_hz = 0;
     bool deterministic_system_clock = false;
     unsigned long scale = 0;
@@ -124,6 +126,7 @@ Options:
   --run                 Execute the image after loading it
   --plan                Group every import by subsystem and show what is left
   --cpu <backend>       CPU backend to use (default: build default)
+  --platform <id>       Select a package platform ID (default: manifest order)
   --vc2-engine <name>   VideoCore engine: interpreter or jit
   --names <file>        Ordinal->name file, used to make reports about
                         unimplemented ordinals readable.
@@ -325,6 +328,19 @@ bool parse_options(int argc, char** argv, Options& options) {
         } else if (arg == "--cpu") {
             options.cpu_backend = value_for("--cpu");
             if (options.cpu_backend.empty()) return false;
+        } else if (arg == "--platform") {
+            const std::string value = value_for("--platform");
+            if (value.empty()) return false;
+            try {
+                std::size_t used = 0;
+                const auto selected = std::stoul(value, &used, 0);
+                if (used != value.size() || selected == 0 || selected > 4)
+                    throw std::out_of_range("platform ID");
+                options.platform_id = static_cast<clickhle::u32>(selected);
+            } catch (const std::exception&) {
+                std::cerr << "--platform expects an ID from 1 to 4\n";
+                return false;
+            }
         } else if (arg == "--vc2-engine") {
             const std::string value = value_for("--vc2-engine");
             if (value == "jit") {
@@ -695,6 +711,9 @@ void print_plan(clickhle::Emulator& emulator, const clickhle::EappImage& image,
 void print_image_report(const clickhle::EappImage& image) {
     std::cout << "  format        : eapp, " << image.vector_count()
               << " entry vectors\n";
+    std::cout << "  platform      : " << image.platform_id();
+    if (image.platform_id() == 0) std::cout << " (unknown)";
+    std::cout << "\n";
     std::cout << "  image base    : 0x" << std::hex << image.image_base()
               << "\n";
     std::cout << "  size          : " << std::dec << image.size_of_image()
@@ -712,6 +731,7 @@ void print_image_report(const clickhle::EappImage& image) {
         std::cout << "      " << std::left << std::setw(32) << block.name
                   << std::right << std::setw(4) << block.count
                   << "  table 0x" << std::hex << block.import_table << std::dec
+                  << (block.count && !block.compatible_abi ? "  (ABI unbound)" : "")
                   << "\n";
     }
 }
@@ -787,6 +807,7 @@ int main(int argc, char** argv) {
 
     clickhle::Emulator::Config config;
     config.executable = options.executable;
+    config.platform_id = options.platform_id;
     if (options.capture_videocore && !options.headless) {
         std::cerr << "--capture-videocore requires --headless\n";
         return 2;

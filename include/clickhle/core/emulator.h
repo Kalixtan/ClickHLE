@@ -62,6 +62,8 @@ public:
 
     struct Config {
         std::filesystem::path executable;
+        /// Zero selects the first matching entry in the package manifest.
+        u32 platform_id = 0;
 
         // Opt-in disk capture for headless reverse-engineering runs.
         bool capture_videocore = false;
@@ -543,6 +545,9 @@ public:
     [[nodiscard]] const Config& config() const noexcept { return config_; }
     [[nodiscard]] const EappImage* image() const noexcept {
         return image_.has_value() ? &*image_ : nullptr;
+    }
+    [[nodiscard]] u32 platform_id() const noexcept {
+        return image_ ? image_->platform_id() : 0;
     }
 
     /// Milliseconds since load, from whichever clock source is configured.

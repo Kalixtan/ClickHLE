@@ -19,12 +19,14 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDockWidget>
 #include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFont>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -42,8 +44,10 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QProcess>
 #include <QScrollBar>
 #include <QSettings>
+#include <QStackedWidget>
 #include <QSpinBox>
 #include <QStatusBar>
 #include <QStringList>
@@ -55,6 +59,7 @@
 #include "clickhle/common/log.h"
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/modules.h"
+#include "clickhle/loader/game_manifest.h"
 
 namespace {
 
@@ -258,9 +263,21 @@ public:
         setWindowTitle(tr("ClickHLE"));
         resize(920, 700);
         canvas_ = new GameCanvas(this);
-        setCentralWidget(canvas_);
+        central_stack_ = new QStackedWidget(this);
+        createGameLibrary();
+        central_stack_->addWidget(canvas_);
+        setCentralWidget(central_stack_);
         createActions();
         createMenus();
+        auto* toolbar = addToolBar(tr("Main"));
+        toolbar->setMovable(false);
+        toolbar->addAction(library_action_);
+        toolbar->addAction(install_action_);
+        toolbar->addAction(open_action_);
+        toolbar->addSeparator();
+        toolbar->addAction(pause_action_);
+        toolbar->addAction(resume_action_);
+        toolbar->addAction(restart_action_);
         createTools();
         auto* wheel_dock = new QDockWidget(tr("Click Wheel"), this);
         wheel_dock->setObjectName(QStringLiteral("clickWheelDock"));
@@ -286,7 +303,7 @@ public:
         addDockWidget(Qt::RightDockWidgetArea, wheel_dock);
         tools_menu_->addAction(wheel_dock->toggleViewAction());
         refreshTools();
-        statusBar()->showMessage(tr("Ready — open a game executable"));
+        statusBar()->showMessage(tr("Select an installed game"));
 
         frame_timer_ = new QTimer(this);
         frame_timer_->setInterval(16);
@@ -355,6 +372,11 @@ protected:
     }
 
     void closeEvent(QCloseEvent* event) override {
+        if (install_process_) {
+            event->ignore();
+            statusBar()->showMessage(tr("Wait for installation to finish"), 8000);
+            return;
+        }
         QSettings settings;
         settings.setValue(QStringLiteral("window/geometry"), saveGeometry());
         settings.setValue(QStringLiteral("games/recent"), recent_games_);
@@ -365,6 +387,172 @@ protected:
     }
 
 private:
+    void createGameLibrary() {
+        auto* page = new QWidget(this);
+        auto* layout = new QVBoxLayout(page);
+        auto* heading = new QLabel(tr("Installed Games"), page);
+        QFont font = heading->font();
+        font.setPointSize(font.pointSize() + 5);
+        font.setBold(true);
+        heading->setFont(font);
+        layout->addWidget(heading);
+
+        auto* controls = new QHBoxLayout;
+        controls->addWidget(new QLabel(tr("iPod platform:"), page));
+        platform_selector_ = new QComboBox(page);
+        controls->addWidget(platform_selector_);
+        controls->addStretch();
+        library_search_ = new QLineEdit(page);
+        library_search_->setPlaceholderText(tr("Search games"));
+        controls->addWidget(library_search_);
+        auto* refresh = new QPushButton(tr("Refresh"), page);
+        controls->addWidget(refresh);
+        layout->addLayout(controls);
+
+        library_table_ = new QTableWidget(page);
+        library_table_->setColumnCount(2);
+        library_table_->setHorizontalHeaderLabels({tr("Game"), tr("Version")});
+        library_table_->horizontalHeader()->setStretchLastSection(true);
+        library_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+        library_table_->setSelectionMode(QAbstractItemView::SingleSelection);
+        library_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        layout->addWidget(library_table_);
+        library_message_ = new QLabel(page);
+        layout->addWidget(library_message_);
+        central_stack_->addWidget(page);
+
+        connect(refresh, &QPushButton::clicked, this, [this] { refreshGameLibrary(); });
+        connect(platform_selector_, &QComboBox::currentIndexChanged, this,
+                [this] { populateGameLibrary(); });
+        connect(library_search_, &QLineEdit::textChanged, this,
+                [this] { populateGameLibrary(); });
+        connect(library_table_, &QTableWidget::cellDoubleClicked, this,
+                [this](int row, int) { launchInstalledGame(row); });
+        refreshGameLibrary();
+    }
+
+    void refreshGameLibrary() {
+        const auto app = std::filesystem::path(
+            QCoreApplication::applicationDirPath().toStdString());
+        hdd_root_ = app / "hdd";
+        installed_games_ = clickhle::scan_installed_games(hdd_root_);
+        const u32 previous = platform_selector_->currentData().toUInt();
+        platform_selector_->blockSignals(true);
+        platform_selector_->clear();
+        std::vector<u32> ids;
+        for (const auto& game : installed_games_)
+            for (const auto& variant : game.variants)
+                if (std::find(ids.begin(), ids.end(), variant.platform_id) == ids.end())
+                    ids.push_back(variant.platform_id);
+        std::sort(ids.begin(), ids.end());
+        for (u32 id : ids)
+            platform_selector_->addItem(tr("Platform %1").arg(id), id);
+        const int selected = platform_selector_->findData(previous ? previous : 1);
+        if (selected >= 0) platform_selector_->setCurrentIndex(selected);
+        platform_selector_->blockSignals(false);
+        populateGameLibrary();
+    }
+
+    void populateGameLibrary() {
+        library_table_->setRowCount(0);
+        library_rows_.clear();
+        const u32 platform = platform_selector_->currentData().toUInt();
+        for (const auto& game : installed_games_) {
+            if (!QString::fromStdString(game.name).contains(library_search_->text(),
+                                                          Qt::CaseInsensitive))
+                continue;
+            const auto variant = std::find_if(game.variants.begin(), game.variants.end(),
+                [platform](const auto& item) { return item.platform_id == platform; });
+            if (variant == game.variants.end()) continue;
+            const int row = library_table_->rowCount();
+            library_table_->insertRow(row);
+            library_table_->setItem(row, 0, new QTableWidgetItem(QString::fromStdString(game.name)));
+            library_table_->setItem(row, 1, new QTableWidgetItem(
+                QString::number(variant->platform_version)));
+            library_rows_.push_back(variant->executable);
+        }
+        library_message_->setText(library_rows_.empty()
+            ? tr("No installed games found in the hdd folder.")
+            : tr("%1 games available. Double-click a game to start it.")
+                  .arg(static_cast<int>(library_rows_.size())));
+    }
+
+    void launchInstalledGame(int row) {
+        if (row < 0 || static_cast<std::size_t>(row) >= library_rows_.size()) return;
+        loadGame(QString::fromStdString(library_rows_[static_cast<std::size_t>(row)].string()),
+                 platform_selector_->currentData().toUInt());
+    }
+
+    void showGameLibrary() {
+        central_stack_->setCurrentIndex(0);
+        statusBar()->showMessage(tr("Select an installed game"));
+    }
+
+    void installGame() {
+        if (install_process_) return;
+        const QString package = QFileDialog::getOpenFileName(
+            this, tr("Install iPod Game"), {}, tr("iPod Games (*.ipg *.zip);;All Files (*)"));
+        if (package.isEmpty()) return;
+
+        const auto app = std::filesystem::path(
+            QCoreApplication::applicationDirPath().toStdString());
+        auto installer = app / "clickhle-install";
+#if defined(_WIN32)
+        installer += ".exe";
+#endif
+        const auto keys = app / "keys";
+        if (!std::filesystem::is_regular_file(installer)) {
+            QMessageBox::critical(this, tr("Installer Unavailable"),
+                tr("The native clickhle-install program is missing beside ClickHLE."));
+            return;
+        }
+        if (!std::filesystem::is_directory(keys)) {
+            QMessageBox::critical(this, tr("Keys Missing"),
+                tr("Place matching .ikey files in the keys folder beside ClickHLE."));
+            return;
+        }
+
+        install_process_ = new QProcess(this);
+        install_process_->setProgram(QString::fromStdString(installer.string()));
+        install_process_->setArguments({package,
+            QString::fromStdString(hdd_root_.string()),
+            QString::fromStdString(keys.string())});
+        connect(install_process_, &QProcess::finished, this,
+                [this](int code, QProcess::ExitStatus status) {
+            if (!install_process_) return;
+            const QString output = QString::fromUtf8(install_process_->readAllStandardOutput());
+            const QString errors = QString::fromUtf8(install_process_->readAllStandardError()).trimmed();
+            install_process_->deleteLater();
+            install_process_ = nullptr;
+            install_action_->setEnabled(true);
+            if (status == QProcess::NormalExit && code == 0) {
+                refreshGameLibrary();
+                showGameLibrary();
+                statusBar()->showMessage(tr("Game installed"), 8000);
+                appendLog(tr("Installed %1").arg(package_name_));
+                QMessageBox::information(this, tr("Game Installed"),
+                                         tr("The game is ready in Installed Games."));
+            } else {
+                const QString reason = errors.isEmpty() ? output.trimmed() : errors;
+                statusBar()->showMessage(tr("Installation failed"), 10000);
+                QMessageBox::critical(this, tr("Could Not Install Game"), reason);
+            }
+        });
+        connect(install_process_, &QProcess::errorOccurred, this,
+                [this](QProcess::ProcessError error) {
+            if (error != QProcess::FailedToStart || !install_process_) return;
+            install_process_->deleteLater();
+            install_process_ = nullptr;
+            install_action_->setEnabled(true);
+            QMessageBox::critical(this, tr("Installer Unavailable"),
+                                  tr("The native installer could not be started."));
+        });
+        package_name_ = QFileInfo(package).fileName();
+        install_action_->setEnabled(false);
+        statusBar()->showMessage(tr("Installing %1…").arg(package_name_));
+        install_process_->start();
+    }
+
     static std::optional<u8> keyHardwareBit(int key) {
         switch (key) {
             case Qt::Key_Left: return 2;
@@ -378,6 +566,12 @@ private:
     }
 
     void createActions() {
+        library_action_ = new QAction(tr("Installed Games"), this);
+        connect(library_action_, &QAction::triggered, this,
+                [this] { showGameLibrary(); });
+        install_action_ = new QAction(tr("Install Game Package…"), this);
+        connect(install_action_, &QAction::triggered, this,
+                [this] { installGame(); });
         open_action_ = new QAction(tr("Load Game…"), this);
         open_action_->setShortcut(QKeySequence::Open);
         connect(open_action_, &QAction::triggered, this, [this] { openGame(); });
@@ -448,6 +642,8 @@ private:
         bar->setVisible(true);
 
         QMenu* file = bar->addMenu(tr("File"));
+        file->addAction(library_action_);
+        file->addAction(install_action_);
         file->addAction(open_action_);
         recent_menu_ = file->addMenu(tr("Recent Games"));
         file->addAction(close_action_);
@@ -640,7 +836,7 @@ private:
         if (!path.isEmpty()) loadGame(path);
     }
 
-    void loadGame(const QString& path) {
+    void loadGame(const QString& path, u32 platform_id = 0) {
         frame_timer_->stop();
         emulator_.reset();
         current_game_.clear();
@@ -656,6 +852,7 @@ private:
             reinterpret_cast<const char8_t*>(encoded_path.constData());
         config.executable = std::filesystem::path(std::u8string(
             path_bytes, static_cast<std::size_t>(encoded_path.size())));
+        config.platform_id = platform_id;
         config.videocore_engine = jit_action_->isChecked()
             ? clickhle::VideoCoreEngine::Jit : clickhle::VideoCoreEngine::Interpreter;
         std::string error;
@@ -678,6 +875,8 @@ private:
         videocore_table_->setRowCount(0);
         videocore_detail_->clear();
         current_game_ = path;
+        current_platform_id_ = emulator_->platform_id();
+        central_stack_->setCurrentWidget(canvas_);
         addRecent(path);
         canvas_->setFrame({});
         canvas_->setMessage(tr("Game loaded. Waiting for the first frame…"));
@@ -691,6 +890,8 @@ private:
         frame_timer_->stop();
         emulator_.reset();
         current_game_.clear();
+        current_platform_id_ = 0;
+        showGameLibrary();
         canvas_->setFrame({});
         canvas_->setMessage({});
         statusBar()->showMessage(tr("Game closed"));
@@ -701,7 +902,7 @@ private:
     }
 
     void restartGame() {
-        if (!current_game_.isEmpty()) loadGame(current_game_);
+        if (!current_game_.isEmpty()) loadGame(current_game_, current_platform_id_);
     }
 
     void pauseGame() {
@@ -1023,6 +1224,17 @@ private:
     std::unique_ptr<Emulator> emulator_;
     Emulator::DeviceSettings device_settings_;
     QString current_game_;
+    QString package_name_;
+    u32 current_platform_id_ = 0;
+    std::filesystem::path hdd_root_;
+    QProcess* install_process_ = nullptr;
+    std::vector<clickhle::InstalledGame> installed_games_;
+    std::vector<std::filesystem::path> library_rows_;
+    QStackedWidget* central_stack_ = nullptr;
+    QTableWidget* library_table_ = nullptr;
+    QComboBox* platform_selector_ = nullptr;
+    QLineEdit* library_search_ = nullptr;
+    QLabel* library_message_ = nullptr;
     QStringList recent_games_;
     bool paused_ = true;
     GameCanvas* canvas_ = nullptr;
@@ -1034,6 +1246,8 @@ private:
     QMenu* tools_menu_ = nullptr;
     QMenu* debug_menu_ = nullptr;
     QAction* open_action_ = nullptr;
+    QAction* library_action_ = nullptr;
+    QAction* install_action_ = nullptr;
     QAction* close_action_ = nullptr;
     QAction* screenshot_action_ = nullptr;
     QAction* quit_action_ = nullptr;

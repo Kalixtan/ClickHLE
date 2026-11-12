@@ -15,6 +15,17 @@ The command-line program is `build/bin/clickhle`. When Qt 6 Widgets is available
 `build/bin/clickhle-gui`. Unicorn Engine 2 is required at runtime; SDL3 adds window, input, and audio support. Dependencies, game images, firmware, and reference assets are not bundled. See
 [LICENSING.md](LICENSING.md) for dependency notes.
 
+The GUI lists games from `hdd/iPod_Control/Games_RO` beside its executable.
+Select a platform at the top of the list; the package manifest chooses its
+executable. File → Install Game Package installs `.ipg` files into that drive
+using matching 32-byte `.ikey` files in a `keys` folder beside the executable.
+The native `clickhle-install` companion needs libzip and OpenSSL and refuses
+a missing or invalid key. It can also be run directly as
+`build/bin/clickhle-install game.ipg build/bin/hdd build/bin/keys`. The CLI
+accepts `--platform 1` through `4` when a binary is shared by platforms.
+Alternate-platform eapps parse and map, but APIs with different ABI hashes
+remain unbound and stop when called.
+
 Graphics use a native C++ VideoCore II core running original firmware. The LLVM JIT is the
 default when available; the interpreter can be selected with `--vc2-engine interpreter` or under
 Options → VideoCore Engine in the GUI when LLVM is available at build time. Instructions the

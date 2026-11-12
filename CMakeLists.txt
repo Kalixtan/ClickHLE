@@ -23,6 +23,9 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" AND
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+file(MAKE_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/hdd"
+                    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/keys")
+
 
 # --- Options -----------------------------------------------------------------
 
@@ -68,6 +71,7 @@ add_library(clickhle_core
     src/core/cpu_unicorn.cpp
     src/core/emulator.cpp
     src/loader/eapp_image.cpp
+    src/loader/game_manifest.cpp
     src/hle/call_frame.cpp
     src/hle/format.cpp
     src/hle/guest_heap.cpp
@@ -169,6 +173,18 @@ endif()
 
 add_executable(clickhle frontend/cli/main.cpp frontend/cli/boot.cpp)
 target_link_libraries(clickhle PRIVATE clickhle_core clickhle_flags)
+
+# Native package installer. The GUI can still build without these libraries;
+# its Install action reports that the companion executable is unavailable.
+find_package(OpenSSL QUIET COMPONENTS Crypto)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBZIP QUIET IMPORTED_TARGET libzip)
+endif()
+if(OpenSSL_FOUND AND LIBZIP_FOUND)
+    add_executable(clickhle-install frontend/installer/main.cpp)
+    target_link_libraries(clickhle-install PRIVATE
+        clickhle_core clickhle_flags PkgConfig::LIBZIP OpenSSL::Crypto)
+endif()
 
 # Optional Qt desktop interface.
 

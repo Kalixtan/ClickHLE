@@ -15,13 +15,13 @@ class AddressSpace;
 
 /// Layout constants for the iPod click-wheel game executable format.
 ///
-/// The format is undocumented; everything here was derived from the 16 game
-/// images and cross-checked against the 5G and 5.5G firmware export tables.
+/// The format is undocumented; these fields are checked against the installed
+/// game corpus and the 5G/5.5G firmware export tables.
 ///
 /// An image is a **chain of import descriptors** followed by game code. The
 /// first descriptor is the file header and carries extra fields; every later
 /// one repeats the same shape behind its own magic. Games import from six to
-/// eight libraries.
+/// more libraries on later iPod platforms.
 ///
 ///     first descriptor (magic 'eapp'):
 ///       0x00  "eapp"                     magic
@@ -46,12 +46,10 @@ class AddressSpace;
 ///       +0x38  count x `LDR PC,[PC,#imm]`   the stubs
 ///       +      count x u32                  pointer table, ZERO ON DISK
 ///
-/// The hash identifies the *interface version*, not the title. It is identical
-/// across all 20 titles in the corpus for a given framework -- OpenGLES is
-/// always 041f4da520603c37d8ef9b879efbf280 -- because they all target one
-/// release of RetailOS. The LLE track read the same values from the other side,
-/// out of the table RetailOS publishes in its `osos` image, and they match; so
-/// the ABI is confirmed from both directions at once.
+/// The hash identifies the *interface version*, not the title. Platform 1's
+/// OpenGLES hash is 041f4da520603c37d8ef9b879efbf280; later platforms use
+/// another interface. The Platform 1 values match the table RetailOS publishes
+/// in its `osos` image.
 ///
 /// This also settles the 16 unexplained bytes at file offset 0x4c that the
 /// corpus analysis had listed as an unidentified constant. They are the
@@ -66,9 +64,8 @@ class AddressSpace;
 /// joke. It carries no imports and exists only as a terminator.
 namespace eapp {
 
-/// Every image observed loads here, and every pointer in every header is
-/// 0x18xxxxxx. There is no relocation information in the format, so the base is
-/// not negotiable.
+/// All four platform variants in the installed corpus use this base. There
+/// is no relocation information in the format.
 inline constexpr GuestAddr kImageBase = 0x18000000u;
 
 inline constexpr u32 kMagic = 0x70706165u;  ///< 'eapp' read as a LE word.
@@ -102,11 +99,9 @@ inline constexpr u32 kLibraryNameMax = 0x20;
 
 inline constexpr u32 kGuardInstruction = 0xEAFFFFFEu;  ///< ARM `b .`
 
-/// `LDR PC, [PC, #imm]` with any 12-bit immediate. Every stub in every image
-/// in hand is this instruction; the immediate is what makes each stub read a
-/// different word of its block's pointer table.
-inline constexpr u32 kStubMask    = 0xFFFFF000u;
-inline constexpr u32 kStubPattern = 0xE59FF000u;
+/// `LDR PC, [PC, #+/-imm]`. One-import later-platform descriptors use -4.
+inline constexpr u32 kStubMask    = 0xFF7FF000u;
+inline constexpr u32 kStubPattern = 0xE51FF000u;
 
 /// Sanity bound per block. The largest firmware library exports 179.
 inline constexpr u32 kMaxImportsPerBlock = 4096;
@@ -130,6 +125,7 @@ struct GuestImport {
     std::string name;           ///< Empty when imported by ordinal alone.
     u32 ordinal = 0;
     bool by_ordinal = true;
+    bool compatible_abi = false; ///< Safe to bind against the current HLE registry.
     GuestAddr slot_address = 0; ///< Pointer-table word this import resolves to.
 
     /// "OpenGLES#42" -- a stable key for registry lookups and coverage
@@ -153,6 +149,7 @@ public:
         u32 count = 0;
         /// The framework's ABI hash, as 32 lowercase hex characters.
         std::string hash;
+        bool compatible_abi = false;
         GuestAddr stub_table = 0;
         GuestAddr import_table = 0;
     };
@@ -161,7 +158,8 @@ public:
         std::span<const std::byte> data, std::string* error = nullptr);
 
     [[nodiscard]] static std::optional<EappImage> load_file(
-        const std::filesystem::path& path, std::string* error = nullptr);
+        const std::filesystem::path& path, std::string* error = nullptr,
+        u32 preferred_platform = 0);
 
     /// Maps the image at kImageBase and copies the whole file in.
     ///
@@ -177,13 +175,18 @@ public:
     /// allows fewer -- the firmware accepts 0 to 5.
     [[nodiscard]] u32 vector_count() const noexcept { return vector_count_; }
     [[nodiscard]] u32 flags() const noexcept { return flags_; }
+    /// Zero means the executable could not be associated with a manifest.
+    [[nodiscard]] u32 platform_id() const noexcept { return platform_id_; }
+    [[nodiscard]] const std::vector<u32>& available_platform_ids() const noexcept {
+        return available_platform_ids_;
+    }
 
     /// Every import descriptor, in chain order.
     [[nodiscard]] const std::vector<Block>& blocks() const noexcept {
         return blocks_;
     }
 
-    /// The first block's library, which is "OpenGLES" in every image seen.
+    /// The first block's library (OpenGLES on Platform 1, AsyncFileIO later).
     [[nodiscard]] const std::string& library() const noexcept {
         return library_;
     }
@@ -246,6 +249,8 @@ public:
     }
 
 private:
+    u32 platform_id_ = 0;
+    std::vector<u32> available_platform_ids_;
     u32 flags_ = 0;
     u32 vector_count_ = 0;
     std::string library_;

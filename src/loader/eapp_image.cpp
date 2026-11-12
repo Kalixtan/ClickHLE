@@ -1,6 +1,7 @@
 #include "clickhle/loader/eapp_image.h"
 
 #include <string>
+#include <string_view>
 
 #include <cstdio>
 
@@ -12,6 +13,7 @@
 #include "clickhle/common/endian.h"
 #include "clickhle/common/log.h"
 #include "clickhle/core/address_space.h"
+#include "clickhle/loader/game_manifest.h"
 
 namespace clickhle {
 namespace {
@@ -197,37 +199,13 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
             return std::nullopt;
         }
 
-        // A framework we know, carrying an interface we do not, is refused.
-        // Running it would bind our ordinals to somebody else's interface.
-        //
-        // The firmware's own resolver requires **both** the hash and the count
-        // to match before it will bind a record. We had only been checking the
-        // hash, which is the stronger of the two but not the whole test.
-        if (count != 0) {
-            const auto known = known_abi_hashes().find(block.name);
-            if (known != known_abi_hashes().end() &&
-                block.hash != known->second) {
-                std::string message = "unsupported '" + block.name +
-                    "' ABI: hash " + block.hash + " (" +
-                    std::to_string(count) + " imports); ClickHLE supports " +
-                    known->second;
-                const auto size = known_framework_sizes().find(block.name);
-                if (size != known_framework_sizes().end())
-                    message += " (" + std::to_string(size->second) + " imports)";
-                message += ". This executable may target another iPod platform";
-                fail(error, std::move(message));
-                return std::nullopt;
-            }
-            const auto size = known_framework_sizes().find(block.name);
-            if (size != known_framework_sizes().end() &&
-                count != size->second) {
-                fail(error, "'" + block.name + "' declares " +
-                                std::to_string(count) + " functions, not the " +
-                                std::to_string(size->second) +
-                                " RetailOS publishes");
-                return std::nullopt;
-            }
-        }
+        // Parse every platform's descriptors. Only an exact hash AND count
+        // match is safe to bind to the existing Platform 1 HLE ordinals.
+        const auto hash = known_abi_hashes().find(block.name);
+        const auto size = known_framework_sizes().find(block.name);
+        block.compatible_abi = count != 0 && hash != known_abi_hashes().end() &&
+            size != known_framework_sizes().end() && block.hash == hash->second &&
+            count == size->second;
 
         block.count = count;
         block.stub_table = eapp::kImageBase + stubs;
@@ -257,7 +235,9 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
             // table of *identical* instructions works at all, and checking it
             // is what stops a plausible-looking file from binding imports into
             // the middle of the code.
-            if (stubs + 8u + (first & 0x0FFFu) != table) {
+            const auto displacement = static_cast<i32>(first & 0x0FFFu) *
+                                      ((first & 0x00800000u) ? 1 : -1);
+            if (static_cast<i64>(stubs) + 8 + displacement != table) {
                 fail(error, "stub table of '" + block.name +
                                 "' does not address the pointer table that "
                                 "follows it");
@@ -296,6 +276,7 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
             import.module = block.name;
             import.ordinal = i;
             import.by_ordinal = true;
+            import.compatible_abi = block.compatible_abi;
             import.slot_address = block.import_table + 4u * i;
             image.imports_.push_back(std::move(import));
         }
@@ -348,7 +329,8 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
 
 
 std::optional<EappImage> EappImage::load_file(const std::filesystem::path& path,
-                                              std::string* error) {
+                                              std::string* error,
+                                              u32 preferred_platform) {
     std::ifstream file(path, std::ios::binary);
     if (!file) {
         fail(error, "cannot open '" + path.string() + "'");
@@ -369,7 +351,25 @@ std::optional<EappImage> EappImage::load_file(const std::filesystem::path& path,
         fail(error, "failed to read '" + path.string() + "'");
         return std::nullopt;
     }
-    return parse(data, error);
+    auto image = parse(data, error);
+    if (!image) return std::nullopt;
+    image->available_platform_ids_ = platforms_for_executable(path);
+    if (preferred_platform != 0 && !image->available_platform_ids_.empty() &&
+        std::find(image->available_platform_ids_.begin(),
+                  image->available_platform_ids_.end(), preferred_platform) ==
+            image->available_platform_ids_.end()) {
+        fail(error, "platform " + std::to_string(preferred_platform) +
+                    " does not select this executable in Manifest.plist");
+        return std::nullopt;
+    }
+    if (preferred_platform != 0)
+        image->platform_id_ = preferred_platform;
+    else if (!image->available_platform_ids_.empty())
+        image->platform_id_ = image->available_platform_ids_.front();
+    else if (!image->blocks_.empty() && image->blocks_.front().name == "OpenGLES" &&
+             image->blocks_.front().compatible_abi)
+        image->platform_id_ = 1; // A standalone Platform 1 image without a manifest.
+    return image;
 }
 
 bool EappImage::map_into(AddressSpace& memory, GuestAddr arena_end,

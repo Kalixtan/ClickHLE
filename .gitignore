@@ -12,6 +12,9 @@
 # Local runtime data
 /run-logs/
 /saves/
+/hdd/
+/keys/
+*.ikey
 /.cache/
 
 # Local notes and reverse-engineering material

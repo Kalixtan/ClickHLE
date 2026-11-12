@@ -210,7 +210,7 @@ bool Emulator::load(Config config, std::string* error) {
         }
     }
 
-    image_ = EappImage::load_file(config_.executable, error);
+    image_ = EappImage::load_file(config_.executable, error, config_.platform_id);
     if (!image_.has_value()) {
         return false;
     }
@@ -567,7 +567,11 @@ bool Emulator::install_probe(const std::string& module, u32 ordinal, u8 arity,
 
 bool Emulator::bind_imports(std::string* error) {
     for (const auto& import : image_->imports()) {
-        const HleFunction* function = registry_.resolve(import);
+        // Ordinals from another framework version cannot be dispatched to
+        // the Platform 1 registry. Keep the thunk so the image loads, but
+        // stop on its first call until that ABI has been established.
+        const HleFunction* function = import.compatible_abi
+            ? registry_.resolve(import) : nullptr;
         const auto thunk = thunks_.bind(import.key(), function, memory_);
         if (!thunk.has_value()) {
             fail(error, "failed to bind thunk for " + import.key());
@@ -1700,7 +1704,7 @@ Emulator::Coverage Emulator::coverage() const {
         if (!seen.insert(key).second) {
             continue;
         }
-        if (registry_.resolve(import) != nullptr) {
+        if (import.compatible_abi && registry_.resolve(import) != nullptr) {
             ++result.implemented;
         } else {
             missing.insert(key);
