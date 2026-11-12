@@ -21,6 +21,9 @@
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/modules.h"
 #include "clickhle/hle/registry.h"
+#if CLICKHLE_HAVE_INSTALLER
+#include "clickhle/installer/package.h"
+#endif
 
 namespace {
 
@@ -739,6 +742,28 @@ void print_image_report(const clickhle::EappImage& image) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "--install") {
+#if CLICKHLE_HAVE_INSTALLER
+        if (argc < 3 || argc > 5) {
+            std::cerr << "Usage: clickhle --install <game.ipg|game.zip> [hdd] [keys]\n";
+            return 2;
+        }
+        const auto beside_exe = std::filesystem::weakly_canonical(argv[0]).parent_path();
+        const auto hdd = argc >= 4 ? std::filesystem::path(argv[3]) : beside_exe / "hdd";
+        const auto keys = argc >= 5 ? std::filesystem::path(argv[4]) : beside_exe / "keys";
+        try {
+            clickhle::install_game_package(argv[2], hdd, keys);
+            std::cout << "Game installed in " << hdd << '\n';
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "Installation failed: " << error.what() << '\n';
+            return 1;
+        }
+#else
+        std::cerr << "Package installation requires libzip and OpenSSL at build time\n";
+        return 1;
+#endif
+    }
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) != "--list-implemented") {
             continue;

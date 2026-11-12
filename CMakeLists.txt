@@ -174,16 +174,19 @@ endif()
 add_executable(clickhle frontend/cli/main.cpp frontend/cli/boot.cpp)
 target_link_libraries(clickhle PRIVATE clickhle_core clickhle_flags)
 
-# Native package installer. The GUI can still build without these libraries;
-# its Install action reports that the companion executable is unavailable.
+# Package installation is linked into ClickHLE, not launched as a helper.
 find_package(OpenSSL QUIET COMPONENTS Crypto)
 if(PkgConfig_FOUND)
     pkg_check_modules(LIBZIP QUIET IMPORTED_TARGET libzip)
 endif()
 if(OpenSSL_FOUND AND LIBZIP_FOUND)
-    add_executable(clickhle-install frontend/installer/main.cpp)
-    target_link_libraries(clickhle-install PRIVATE
+    add_library(clickhle_installer STATIC src/installer/package.cpp)
+    target_link_libraries(clickhle_installer PUBLIC
         clickhle_core clickhle_flags PkgConfig::LIBZIP OpenSSL::Crypto)
+    target_link_libraries(clickhle PRIVATE clickhle_installer)
+    target_compile_definitions(clickhle PRIVATE CLICKHLE_HAVE_INSTALLER=1)
+else()
+    target_compile_definitions(clickhle PRIVATE CLICKHLE_HAVE_INSTALLER=0)
 endif()
 
 # Optional Qt desktop interface.
@@ -195,6 +198,13 @@ if(CLICKHLE_BUILD_GUI)
         add_executable(clickhle-gui frontend/gui/main.cpp)
         target_link_libraries(clickhle-gui PRIVATE
             clickhle_core clickhle_flags Qt6::Widgets)
+        if(TARGET clickhle_installer)
+            target_link_libraries(clickhle-gui PRIVATE clickhle_installer)
+            target_compile_definitions(clickhle-gui PRIVATE CLICKHLE_HAVE_INSTALLER=1)
+        else()
+            message(WARNING "libzip or OpenSSL Crypto not found; GUI package installation disabled")
+            target_compile_definitions(clickhle-gui PRIVATE CLICKHLE_HAVE_INSTALLER=0)
+        endif()
     else()
         message(WARNING "Qt 6 Widgets was not found; clickhle-gui will not be built")
     endif()

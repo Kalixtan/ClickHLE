@@ -19,12 +19,18 @@ The GUI lists games from `hdd/iPod_Control/Games_RO` beside its executable.
 Select a platform at the top of the list; the package manifest chooses its
 executable. File → Install Game Package installs `.ipg` or `.zip` packages into that drive.
 Plaintext eapps need no key. Encrypted eapps require a valid 32-byte `.ikey` file
-in a `keys` folder beside the executable. The native `clickhle-install` companion
-uses libzip and OpenSSL and can also be run directly as
-`build/bin/clickhle-install game.ipg build/bin/hdd build/bin/keys`. The CLI
+in a `keys` folder beside the executable. Package installation is built into
+the GUI and CLI using libzip and OpenSSL. The CLI command is
+`build/bin/clickhle --install game.ipg [hdd-folder] [keys-folder]`. The CLI
 accepts `--platform 1` through `4` when a binary is shared by platforms.
 Alternate-platform eapps parse and map, but APIs with different ABI hashes
 remain unbound and stop when called.
+
+Installed games read assets from `hdd/iPod_Control/Games_RO/<id>` and write
+saves to `GameData_RW/<id>` and statistics to `GameStats_WO/<id>` under the
+same `iPod_Control` folder. Shared game data uses `GameData_ShareRW`.
+Music-library calls are separate from game file access and currently report an
+empty library.
 
 Graphics use a native C++ VideoCore II core running original firmware. The LLVM JIT is the
 default when available; the interpreter can be selected with `--vc2-engine interpreter` or under

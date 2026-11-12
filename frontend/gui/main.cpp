@@ -44,7 +44,7 @@
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
-#include <QProcess>
+#include <QThread>
 #include <QScrollBar>
 #include <QSettings>
 #include <QStackedWidget>
@@ -60,6 +60,9 @@
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/modules.h"
 #include "clickhle/loader/game_manifest.h"
+#if CLICKHLE_HAVE_INSTALLER
+#include "clickhle/installer/package.h"
+#endif
 
 namespace {
 
@@ -372,7 +375,7 @@ protected:
     }
 
     void closeEvent(QCloseEvent* event) override {
-        if (install_process_) {
+        if (install_thread_) {
             event->ignore();
             statusBar()->showMessage(tr("Wait for installation to finish"), 8000);
             return;
@@ -489,37 +492,38 @@ private:
     }
 
     void installGame() {
-        if (install_process_) return;
+        if (install_thread_) return;
+#if !CLICKHLE_HAVE_INSTALLER
+        QMessageBox::critical(this, tr("Installer Unavailable"),
+            tr("Rebuild ClickHLE with libzip and OpenSSL to install packages."));
+        return;
+#else
         const QString package = QFileDialog::getOpenFileName(
             this, tr("Install iPod Game"), {}, tr("iPod Games (*.ipg *.zip);;All Files (*)"));
         if (package.isEmpty()) return;
 
         const auto app = std::filesystem::path(
             QCoreApplication::applicationDirPath().toStdString());
-        auto installer = app / "clickhle-install";
-#if defined(_WIN32)
-        installer += ".exe";
-#endif
         const auto keys = app / "keys";
-        if (!std::filesystem::is_regular_file(installer)) {
-            QMessageBox::critical(this, tr("Installer Unavailable"),
-                tr("The native clickhle-install program is missing beside ClickHLE."));
-            return;
-        }
-        install_process_ = new QProcess(this);
-        install_process_->setProgram(QString::fromStdString(installer.string()));
-        install_process_->setArguments({package,
-            QString::fromStdString(hdd_root_.string()),
-            QString::fromStdString(keys.string())});
-        connect(install_process_, &QProcess::finished, this,
-                [this](int code, QProcess::ExitStatus status) {
-            if (!install_process_) return;
-            const QString output = QString::fromUtf8(install_process_->readAllStandardOutput());
-            const QString errors = QString::fromUtf8(install_process_->readAllStandardError()).trimmed();
-            install_process_->deleteLater();
-            install_process_ = nullptr;
+        const QByteArray encoded_path = package.toUtf8();
+        const auto* path_bytes =
+            reinterpret_cast<const char8_t*>(encoded_path.constData());
+        const auto package_path = std::filesystem::path(std::u8string(
+            path_bytes, static_cast<std::size_t>(encoded_path.size())));
+        const auto hdd = hdd_root_;
+        auto error = std::make_shared<std::string>();
+        install_thread_ = QThread::create([package_path, hdd, keys, error] {
+            try {
+                clickhle::install_game_package(package_path, hdd, keys);
+            } catch (const std::exception& failure) {
+                *error = failure.what();
+            }
+        });
+        connect(install_thread_, &QThread::finished, this, [this, error] {
+            install_thread_->deleteLater();
+            install_thread_ = nullptr;
             install_action_->setEnabled(true);
-            if (status == QProcess::NormalExit && code == 0) {
+            if (error->empty()) {
                 refreshGameLibrary();
                 showGameLibrary();
                 statusBar()->showMessage(tr("Game installed"), 8000);
@@ -527,24 +531,16 @@ private:
                 QMessageBox::information(this, tr("Game Installed"),
                                          tr("The game is ready in Installed Games."));
             } else {
-                const QString reason = errors.isEmpty() ? output.trimmed() : errors;
                 statusBar()->showMessage(tr("Installation failed"), 10000);
-                QMessageBox::critical(this, tr("Could Not Install Game"), reason);
+                QMessageBox::critical(this, tr("Could Not Install Game"),
+                                      QString::fromStdString(*error));
             }
-        });
-        connect(install_process_, &QProcess::errorOccurred, this,
-                [this](QProcess::ProcessError error) {
-            if (error != QProcess::FailedToStart || !install_process_) return;
-            install_process_->deleteLater();
-            install_process_ = nullptr;
-            install_action_->setEnabled(true);
-            QMessageBox::critical(this, tr("Installer Unavailable"),
-                                  tr("The native installer could not be started."));
         });
         package_name_ = QFileInfo(package).fileName();
         install_action_->setEnabled(false);
         statusBar()->showMessage(tr("Installing %1…").arg(package_name_));
-        install_process_->start();
+        install_thread_->start();
+#endif
     }
 
     static std::optional<u8> keyHardwareBit(int key) {
@@ -1221,7 +1217,7 @@ private:
     QString package_name_;
     u32 current_platform_id_ = 0;
     std::filesystem::path hdd_root_;
-    QProcess* install_process_ = nullptr;
+    QThread* install_thread_ = nullptr;
     std::vector<clickhle::InstalledGame> installed_games_;
     std::vector<std::filesystem::path> library_rows_;
     QStackedWidget* central_stack_ = nullptr;

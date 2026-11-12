@@ -5,7 +5,6 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -21,6 +20,7 @@
 
 #include "clickhle/loader/eapp_image.h"
 #include "clickhle/loader/game_manifest.h"
+#include "clickhle/installer/package.h"
 
 namespace {
 namespace fs = std::filesystem;
@@ -358,25 +358,20 @@ void install(const fs::path &package, const fs::path &hdd, const fs::path &keys)
     fs::create_directories(destination.parent_path());
     fs::create_directories(hdd / "iPod_Control" / "GameData_RW");
     fs::create_directories(hdd / "iPod_Control" / "GameStats_WO");
+    fs::create_directories(hdd / "iPod_Control" / "GameData_ShareRW");
     if (fs::exists(destination))
         throw std::runtime_error("game appeared during installation");
     fs::rename(stage.path, destination);
     stage.path.clear();
-    std::cout << "Installed " << game->name << " at " << destination << '\n';
 }
 
 } // namespace
 
-int main(int argc, char **argv) {
-    if (argc != 4) {
-        std::cerr << "Usage: clickhle-install <game.ipg> <hdd-folder> <keys-folder>\n";
-        return 2;
-    }
-    try {
-        install(argv[1], argv[2], argv[3]);
-        return 0;
-    } catch (const std::exception &error) {
-        std::cerr << "Installation failed: " << error.what() << '\n';
-        return 1;
-    }
+namespace clickhle {
+
+void install_game_package(const fs::path& package, const fs::path& hdd,
+                          const fs::path& keys) {
+    install(package, hdd, keys);
 }
+
+} // namespace clickhle
