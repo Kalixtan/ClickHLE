@@ -104,6 +104,7 @@ add_library(clickhle_core
     src/video/graphics_draw.cpp
     src/video/graphics_programs.cpp
     src/video/vc2/core.cpp
+    src/video/vc2/worker.cpp
     src/video/vc2/bus.cpp
     src/video/vc2/vector.cpp
     src/video/vc2/png.cpp
@@ -114,9 +115,19 @@ target_include_directories(clickhle_core PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
 
 target_link_libraries(clickhle_core PRIVATE clickhle_flags)
+find_package(Threads REQUIRED)
+target_link_libraries(clickhle_core PRIVATE Threads::Threads)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_graphics_queue_test tests/graphics_queue_test.cpp)
+    target_include_directories(clickhle_graphics_queue_test PRIVATE include src/video)
+    target_link_libraries(clickhle_graphics_queue_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME graphics_queue COMMAND clickhle_graphics_queue_test)
+    add_executable(clickhle_vc2_worker_test tests/vc2_worker_test.cpp)
+    target_include_directories(clickhle_vc2_worker_test PRIVATE src/video/vc2)
+    target_link_libraries(clickhle_vc2_worker_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME vc2_worker COMMAND clickhle_vc2_worker_test)
     add_executable(clickhle_g5_firmware_test tests/g5_firmware_test.cpp)
     target_include_directories(clickhle_g5_firmware_test PRIVATE include src/video/vc2)
     target_link_libraries(clickhle_g5_firmware_test PRIVATE clickhle_core clickhle_flags)

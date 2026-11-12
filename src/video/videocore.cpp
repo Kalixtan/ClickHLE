@@ -2,10 +2,12 @@
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/call_frame.h"
 #include "vc2/core.h"
+#include "vc2/worker.h"
 #include "vc2/png.h"
 #include "graphics_api.h"
 #include "g5/api.h"
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +17,7 @@
 #include <iterator>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -74,6 +77,12 @@ std::filesystem::path default_firmware_path() {
 struct VideoCore::Impl {
     VideoCore &owner;
     vc2::Core chip;
+    std::unique_ptr<vc2::Worker> worker;
+    std::vector<std::future<void>> pending_work;
+    std::exception_ptr worker_failure;
+    bool worker_stats = std::getenv("CLICKHLE_VC2_WORKER_STATS") != nullptr;
+    u64 worker_submissions = 0, worker_overlaps = 0, worker_waits = 0;
+    std::size_t worker_max_pending = 0;
     std::vector<u8> firmware;
     GraphicsApi api;
     bool started = false;
@@ -115,12 +124,16 @@ struct VideoCore::Impl {
     explicit Impl(VideoCore &instance) : owner(instance), api(
         [this](std::span<const u8> bytes) { send(bytes); },
         {[this](u32 size) {
+            wait_pending();
             return chip.copy_out(chip.read(0xc000000c), size);
-        }, [this] { boot(); return chip.read(device); }, [this](u32 marker) {
+        }, [this] { wait_pending(); boot(); return chip.read(device); }, [this](u32 marker) {
+            wait_pending();
             boot();
             if (chip.read(device) < marker)
                 throw std::runtime_error("VC2 completion is pending");
         }}) {
+        if (std::getenv("CLICKHLE_VC2_WORKER"))
+            worker = std::make_unique<vc2::Worker>();
         if (!owner.capture_) return;
         const char *path = std::getenv("CLICKHLE_VC2_OUTPUT");
         output = path ? path : "work/vc2";
@@ -132,6 +145,12 @@ struct VideoCore::Impl {
             throw std::runtime_error("Cannot create VC2 packet capture");
     }
     ~Impl() {
+        if (worker_stats)
+            std::cerr << "VC2 worker: submissions=" << worker_submissions
+                      << ", queued while busy=" << worker_overlaps
+                      << ", waits=" << worker_waits
+                      << ", max pending=" << worker_max_pending
+                      << ", JIT compile wall us=" << chip.jit_compile_us << '\n';
         if (verify_g5) std::cerr << "G5 verified runs: " << verified_runs << '\n';
         if (!timing) return;
         std::cerr << "VC2 CPU seconds: boot=" << boot_cpu
@@ -279,7 +298,49 @@ struct VideoCore::Impl {
         file.write(reinterpret_cast<const char *>(raw.data()),
                    static_cast<std::streamsize>(raw.size()));
     }
+    void wait_pending() {
+        if (worker_stats && !pending_work.empty()) ++worker_waits;
+        std::exception_ptr failure;
+        for (auto &job : pending_work) {
+            try { job.get(); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+        }
+        pending_work.clear();
+        if (!failure) failure = std::exchange(worker_failure, {});
+        else worker_failure = {};
+        if (failure) std::rethrow_exception(failure);
+    }
     void send(std::span<const u8> packets) {
+        if (!worker) {
+            send_now(packets);
+            return;
+        }
+        if (packets.empty()) return;
+        // Own the bytes independently of GraphicsApi's reusable staging buffer.
+        // A bounded queue lets the producer prepare later fragments while the
+        // worker consumes earlier ones. The public API call still waits before
+        // returning to the guest or publishing a framebuffer.
+        if (pending_work.size() >= 4) wait_pending();
+        if (worker_stats) {
+            ++worker_submissions;
+            if (!pending_work.empty() &&
+                pending_work.back().wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                ++worker_overlaps;
+        }
+        std::vector<u8> owned(packets.begin(), packets.end());
+        auto job = worker->submit([this, owned = std::move(owned)] {
+            if (worker_failure) return;
+            try { send_now(owned); }
+            catch (...) { worker_failure = std::current_exception(); }
+        });
+        try { pending_work.push_back(std::move(job)); }
+        catch (...) { if (job.valid()) job.wait(); throw; }
+        if (worker_stats) worker_max_pending = std::max(worker_max_pending, pending_work.size());
+        // std::clock measures the entire process, not just the worker. Retain
+        // synchronous submission when CPU timing diagnostics are requested.
+        if (timing) wait_pending();
+    }
+    void send_now(std::span<const u8> packets) {
         if (packets.empty())
             return;
         CpuTimer timer(timing ? &send_cpu : nullptr);
@@ -506,9 +567,12 @@ bool VideoCore::call(u32 ordinal, HleCallFrame &frame) {
     bool success = false;
     try {
         if (!initialize()) return false;
-        frame.ret(impl_->call(ordinal, frame));
+        const u32 result = impl_->call(ordinal, frame);
+        impl_->wait_pending();
+        frame.ret(result);
         success = true;
     } catch (const std::exception &e) {
+        if (impl_) { try { impl_->wait_pending(); } catch (...) {} }
         error_ = "OpenGLES#" + std::to_string(ordinal) + ": " + e.what();
         if (impl_) impl_->failure(&frame);
     }
@@ -534,8 +598,10 @@ bool VideoCore::submit(std::span<const u8> packets) {
         ++impl_->sequence;
         impl_->chip.descriptors.clear();
         impl_->send(packets);
+        impl_->wait_pending();
         return true;
     } catch (const std::exception &e) {
+        if (impl_) { try { impl_->wait_pending(); } catch (...) {} }
         error_ = e.what();
         if (impl_)
             impl_->failure();

@@ -76,19 +76,28 @@ void GraphicsApi::reset(HleCallFrame &frame) {
 void GraphicsApi::queue(std::array<u32, 4> header, std::span<const u8> payload) {
     const std::size_t size = (16 + payload.size() + 3) & ~std::size_t(3);
     if (size > kPacketCapacity) throw std::runtime_error("Graphics packet exceeds staging capacity");
-    if (pending_.size() + size > kPacketCapacity) flush();
-    const auto encoded = words(header);
-    const auto offset = pending_.size();
-    std::copy(encoded.begin(), encoded.end(), staging_.begin() + offset);
+    // A caller may pass a view returned by pending_packets(). Preserve that
+    // input before a flush or header write can overwrite the staging buffer.
+    const std::less<const u8 *> less;
+    if (!payload.empty() && less(payload.data(), staging_.data() + staging_.size()) &&
+        less(staging_.data(), payload.data() + payload.size())) {
+        const std::vector<u8> copy(payload.begin(), payload.end());
+        queue(header, copy);
+        return;
+    }
+    if (pending_size_ + size > kPacketCapacity) flush();
+    const auto offset = pending_size_;
+    for (unsigned i = 0; i < header.size(); ++i)
+        endian::store_le<u32>(reinterpret_cast<std::byte *>(staging_.data() + offset + 4 * i), header[i]);
     std::copy(payload.begin(), payload.end(), staging_.begin() + offset + 16);
     // RetailOS rounds the cursor up without clearing padding. Preserve the
     // previous staging contents, including across submissions.
-    pending_.insert(pending_.end(), staging_.begin() + offset, staging_.begin() + offset + size);
+    pending_size_ += size;
 }
 void GraphicsApi::flush() {
-    if (pending_.empty()) return;
-    submit_(pending_);
-    pending_.clear();
+    if (!pending_size_) return;
+    submit_(pending_packets());
+    pending_size_ = 0;
 }
 void GraphicsApi::finish() {
     if (!transport_.wait) throw std::runtime_error("Graphics completion requires a VC2 transport");
@@ -113,9 +122,9 @@ void GraphicsApi::fragments(u32 type, u32 object, std::span<const u8> prefix,
         // fragments require at least four payload bytes of staging space.
         // Splitting a prefix into leftover room changes fragment boundaries.
         const auto required = offset < prefix.size() ? prefix.size() + 16 : 20;
-        if (pending_.size() + required > kPacketCapacity) flush();
+        if (pending_size_ + required > kPacketCapacity) flush();
         const auto segment_left = offset < prefix.size() ? prefix.size() - offset : total - offset;
-        const auto size = std::min(segment_left, kPacketCapacity - pending_.size() - 16);
+        const auto size = std::min(segment_left, kPacketCapacity - pending_size_ - 16);
         std::vector<u8> part;
         part.reserve(size);
         for (std::size_t i = offset; i < offset + size; ++i)

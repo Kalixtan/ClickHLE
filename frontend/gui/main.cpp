@@ -319,12 +319,11 @@ public:
         device_settings_.time_format_24 = settings.value(QStringLiteral("device/timeFormat24"), false).toBool();
         device_settings_.hold_switch = settings.value(QStringLiteral("device/holdSwitch"), false).toBool();
         restoreGeometry(settings.value(QStringLiteral("window/geometry")).toByteArray());
-        // Older builds saved G5 as "interpreter". That value is ambiguous;
-        // start with the default once, then preserve explicit engine choices.
+        // Always start with a JIT-backed engine when one is available.
+        // The interpreter remains selectable for the current debugging session.
         if (settings.value(QStringLiteral("video/engineVersion"), 0).toInt() == 1) {
             const auto engine = settings.value(QStringLiteral("video/engine")).toString();
-            if (engine == QStringLiteral("interpreter")) interpreter_action_->setChecked(true);
-            else if (engine == QStringLiteral("jit") && jit_action_->isEnabled()) jit_action_->setChecked(true);
+            if (engine == QStringLiteral("jit") && jit_action_->isEnabled()) jit_action_->setChecked(true);
         }
         recent_games_ = settings.value(QStringLiteral("games/recent")).toStringList();
         rebuildRecentMenu();

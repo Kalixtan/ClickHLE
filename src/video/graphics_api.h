@@ -2,6 +2,7 @@
 
 #include "clickhle/common/types.h"
 #include <array>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <span>
@@ -27,14 +28,16 @@ class GraphicsApi {
     void queue(std::array<u32, 4> header, std::span<const u8> payload = {});
     void flush();
     void finish();
-    [[nodiscard]] std::span<const u8> pending_packets() const { return pending_; }
+    [[nodiscard]] std::span<const u8> pending_packets() const {
+        return std::span(staging_).first(pending_size_);
+    }
 
   private:
     Submit submit_;
     Transport transport_;
     u32 completion_ = 0;
-    std::vector<u8> pending_;
     std::array<u8, 0x2000> staging_{};
+    std::size_t pending_size_ = 0;
     u32 active_texture_ = 0, client_active_texture_ = 0, next_texture_ = 1, error_ = 0;
     u8 depth_write_mask_ = 1;
     std::array<u32, 3> textures_{};
