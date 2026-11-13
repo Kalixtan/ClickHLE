@@ -61,7 +61,7 @@ void register_audio(HleRegistry& registry);
 void register_metadata(HleRegistry& registry);
 
 void register_all_modules(HleRegistry& registry);
-void register_classic_modules(HleRegistry& registry);
+void register_classic_modules(HleRegistry& registry, bool gpu = false);
 
 /// Frames presented and draw calls issued so far. Zero until the renderer is
 /// wired up.

@@ -17,6 +17,8 @@ void register_classic_graphics(HleRegistry& registry) {
         if (target != 0x0de1) { context->invalid_enum(); return; }
         if (!context->bind_texture(name))
             frame.emulator.stop_with_error("7G texture binding exceeds modeled name pool");
+        else if (auto* gpu = frame.emulator.classic_gpu(); gpu && !gpu->bind_texture(target, name))
+            frame.emulator.stop_with_error("Desktop OpenGL texture binding failed");
     });
     registry.add("OpenGLES", 0, "classic_active_texture", 1, [](HleCallFrame& frame) {
         const u32 unit = frame.args.next_u32() - 0x84c0u;
@@ -391,6 +393,207 @@ void register_classic_graphics(HleRegistry& registry) {
         registry.add("OpenGLES", ordinal, "classic_egl_return_zero", 0,
                      [](HleCallFrame& frame) { frame.ret(0); });
     }
+}
+
+void register_classic_gpu_graphics(HleRegistry& registry) {
+    // Platform 3's neighboring client-state and enable exports match the GLES
+    // ordinal sequence, leaving #34/#35 as the array and indexed draw pair.
+    // Keep this assumption local to the 7G registry; older platform tables
+    // assign different functions to these ordinal values.
+    registry.add("OpenGLES", 34, "gpu_draw_arrays", 3, [](HleCallFrame& frame) {
+        const u32 mode = frame.args.next_u32();
+        const i32 first = frame.args.next_i32();
+        const i32 count = frame.args.next_i32();
+        auto* gpu = frame.emulator.classic_gpu();
+        auto* context = frame.emulator.classic_graphics();
+        if (!gpu || !context || !context->vertex_array_enabled() ||
+            !context->vertex_array() || first < 0 || count < 0 || count > 100000) {
+            frame.emulator.stop_with_error("GPU draw needs a valid enabled vertex array"); return;
+        }
+        const auto& array = *context->vertex_array();
+        if (array.size < 2 || (array.type != 0x1406 && array.type != 0x140c && array.type != 0x1402)) {
+            frame.emulator.stop_with_error("GPU draw vertex format is not supported yet"); return;
+        }
+        const u32 component = array.type == 0x1402 ? 2 : 4;
+        const u32 stride = array.stride ? array.stride : array.size * component;
+        std::vector<float> xy(static_cast<std::size_t>(count) * 2);
+        for (i32 i = 0; i < count; ++i) for (u32 c = 0; c < 2; ++c) {
+            const GuestAddr address = array.pointer + static_cast<u32>(first + i) * stride + c * component;
+            if (array.type == 0x1406 || array.type == 0x140c) {
+                const auto word = frame.memory.read<u32>(address);
+                if (!word) { frame.emulator.stop_with_error("GPU vertex read outside guest memory"); return; }
+                xy[static_cast<std::size_t>(i) * 2 + c] = array.type == 0x140c
+                    ? static_cast<float>(std::bit_cast<i32>(*word)) / 65536.0f
+                    : std::bit_cast<float>(*word);
+            } else {
+                const auto word = frame.memory.read<u16>(address);
+                if (!word) { frame.emulator.stop_with_error("GPU vertex read outside guest memory"); return; }
+                xy[static_cast<std::size_t>(i) * 2 + c] = static_cast<float>(std::bit_cast<i16>(*word));
+            }
+        }
+        const auto& surface = context->draw_surface();
+        if (!surface || surface->format != 5 || surface->bounds.width != 320 || surface->bounds.height != 240) {
+            frame.emulator.stop_with_error("GPU draw surface format is unsupported"); return;
+        }
+        auto* pixels = frame.memory.host_ptr(surface->pixels, surface->byte_size);
+        std::array<float, 16> matrix{};
+        for (u32 i = 0; i < matrix.size(); ++i)
+            matrix[i] = static_cast<float>(context->combined_matrix()[i]) / 65536.0f;
+        std::array<float, 4> color{1.0f, 1.0f, 1.0f, 1.0f};
+        if (context->current_color()) {
+            for (u32 i = 0; i < color.size(); ++i)
+                color[i] = static_cast<float>((*context->current_color())[i]) / 65536.0f;
+        }
+        if (!pixels || !gpu->draw_arrays(mode, 0, count, xy, matrix, color,
+              {reinterpret_cast<u8*>(pixels), surface->byte_size}, surface->stride, 320, 240))
+            frame.emulator.stop_with_error("Desktop GPU draw failed");
+        else context->note_draw();
+    });
+    registry.add("OpenGLES", 35, "gpu_draw_elements", 4, [](HleCallFrame& frame) {
+        const u32 mode = frame.args.next_u32();
+        const i32 count = frame.args.next_i32();
+        const u32 index_type = frame.args.next_u32();
+        const GuestAddr indices = frame.args.next_ptr();
+        auto* gpu = frame.emulator.classic_gpu();
+        auto* context = frame.emulator.classic_graphics();
+        if (!gpu || !context || !context->vertex_array_enabled() || !context->vertex_array() ||
+            count < 0 || count > 100000 || (index_type != 0x1401 && index_type != 0x1403)) {
+            frame.emulator.stop_with_error("GPU indexed draw needs a valid enabled vertex array"); return;
+        }
+        const auto& array = *context->vertex_array();
+        if (array.size < 2 || (array.type != 0x1406 && array.type != 0x140c && array.type != 0x1402)) {
+            frame.emulator.stop_with_error("GPU indexed vertex format is unsupported"); return;
+        }
+        const u32 index_bytes = index_type == 0x1401 ? 1 : 2;
+        const u32 component_bytes = array.type == 0x1402 ? 2 : 4;
+        const u32 stride = array.stride ? array.stride : array.size * component_bytes;
+        std::vector<float> xy(static_cast<std::size_t>(count) * 2);
+        for (i32 i = 0; i < count; ++i) {
+            const GuestAddr index_at = indices + static_cast<u32>(i) * index_bytes;
+            u32 index = 0;
+            if (index_type == 0x1401) {
+                const auto value = frame.memory.read<u8>(index_at);
+                if (!value) { frame.emulator.stop_with_error("GPU index read outside guest memory"); return; }
+                index = *value;
+            } else {
+                const auto value = frame.memory.read<u16>(index_at);
+                if (!value) { frame.emulator.stop_with_error("GPU index read outside guest memory"); return; }
+                index = *value;
+            }
+            for (u32 c = 0; c < 2; ++c) {
+                const GuestAddr address = array.pointer + index * stride + c * component_bytes;
+                if (array.type == 0x1402) {
+                    const auto value = frame.memory.read<u16>(address);
+                    if (!value) { frame.emulator.stop_with_error("GPU vertex read outside guest memory"); return; }
+                    xy[static_cast<std::size_t>(i) * 2 + c] = static_cast<float>(std::bit_cast<i16>(*value));
+                } else {
+                    const auto value = frame.memory.read<u32>(address);
+                    if (!value) { frame.emulator.stop_with_error("GPU vertex read outside guest memory"); return; }
+                    xy[static_cast<std::size_t>(i) * 2 + c] = array.type == 0x140c
+                        ? static_cast<float>(std::bit_cast<i32>(*value)) / 65536.0f
+                        : std::bit_cast<float>(*value);
+                }
+            }
+        }
+        const auto& surface = context->draw_surface();
+        if (!surface || surface->format != 5 || surface->bounds.width != 320 || surface->bounds.height != 240) {
+            frame.emulator.stop_with_error("GPU draw surface format is unsupported"); return;
+        }
+        std::array<float, 16> matrix{};
+        for (u32 i = 0; i < matrix.size(); ++i)
+            matrix[i] = static_cast<float>(context->combined_matrix()[i]) / 65536.0f;
+        std::array<float, 4> color{1.0f, 1.0f, 1.0f, 1.0f};
+        if (context->current_color()) {
+            for (u32 i = 0; i < color.size(); ++i)
+                color[i] = static_cast<float>((*context->current_color())[i]) / 65536.0f;
+        }
+        auto* pixels = frame.memory.host_ptr(surface->pixels, surface->byte_size);
+        if (!pixels || !gpu->draw_arrays(mode, 0, count, xy, matrix, color,
+                {reinterpret_cast<u8*>(pixels), surface->byte_size}, surface->stride, 320, 240))
+            frame.emulator.stop_with_error("Desktop GPU indexed draw failed");
+        else context->note_draw();
+    });
+    registry.add("OpenGLES", 129, "gpu_texture_image", 9, [](HleCallFrame& frame) {
+        const u32 target = frame.args.next_u32();
+        const i32 level = frame.args.next_i32();
+        const i32 internal_format = frame.args.next_i32();
+        const i32 width = frame.args.next_i32();
+        const i32 height = frame.args.next_i32();
+        const i32 border = frame.args.next_i32();
+        const u32 format = frame.args.next_u32();
+        const u32 type = frame.args.next_u32();
+        const GuestAddr pixels = frame.args.next_ptr();
+        auto* gpu = frame.emulator.classic_gpu();
+        if (!gpu || !frame.args.ok() || width < 0 || height < 0) {
+            frame.emulator.stop_with_error("Invalid GPU texture upload arguments"); return;
+        }
+        u32 bytes_per_pixel = 0;
+        if (type == 0x1401) {
+            if (format == 0x1907) bytes_per_pixel = 3;
+            else if (format == 0x1908) bytes_per_pixel = 4;
+            else if (format == 0x1906 || format == 0x1909) bytes_per_pixel = 1;
+            else if (format == 0x190a) bytes_per_pixel = 2;
+        } else if (type == 0x8363 || type == 0x8033 || type == 0x8034) {
+            bytes_per_pixel = 2;
+        }
+        if (!bytes_per_pixel) {
+            frame.emulator.stop_with_error("GPU texture upload format is not supported yet"); return;
+        }
+        const u64 row = (u64(static_cast<u32>(width)) * bytes_per_pixel + 3) & ~u64{3};
+        const u64 size = height == 0 ? 0 : row * (static_cast<u32>(height) - 1) +
+                         u64(static_cast<u32>(width)) * bytes_per_pixel;
+        if (size > 0xffffffffu) {
+            frame.emulator.stop_with_error("GPU texture upload is too large"); return;
+        }
+        const void* data = pixels && size ? frame.memory.host_ptr(pixels, static_cast<u32>(size)) : nullptr;
+        if (pixels && size && !data) {
+            frame.emulator.stop_with_error("GPU texture upload reads invalid guest memory"); return;
+        }
+        if (!gpu->texture_image(target, level, internal_format, width, height, border, format, type, data)) {
+            CLICKHLE_ERROR("classic") << "GPU upload: target 0x" << std::hex << target
+                << " internal 0x" << internal_format << " format 0x" << format << " type 0x" << type
+                << std::dec << " level " << level << " size " << width << 'x' << height
+                << " border " << border << " pixels 0x" << std::hex << pixels;
+            frame.emulator.stop_with_error("Desktop OpenGL texture upload failed");
+        }
+    });
+    registry.add("OpenGLES", 130, "gpu_texture_parameter", 3, [](HleCallFrame& frame) {
+        const u32 target = frame.args.next_u32();
+        const u32 parameter = frame.args.next_u32();
+        const i32 value = frame.args.next_i32();
+        auto* gpu = frame.emulator.classic_gpu();
+        if (!gpu || !gpu->texture_parameter(target, parameter, value))
+            frame.emulator.stop_with_error("Desktop OpenGL texture parameter failed");
+    });
+    registry.add("OpenGLES", 133, "gpu_texture_sub_image", 9, [](HleCallFrame& frame) {
+        const u32 target = frame.args.next_u32();
+        const i32 level = frame.args.next_i32();
+        const i32 x = frame.args.next_i32();
+        const i32 y = frame.args.next_i32();
+        const i32 width = frame.args.next_i32();
+        const i32 height = frame.args.next_i32();
+        const u32 format = frame.args.next_u32();
+        const u32 type = frame.args.next_u32();
+        const GuestAddr pixels = frame.args.next_ptr();
+        auto* gpu = frame.emulator.classic_gpu();
+        u32 bpp = 0;
+        if (type == 0x1401 && format == 0x1907) bpp = 3;
+        else if (type == 0x1401 && format == 0x1908) bpp = 4;
+        else if (type == 0x1401 && (format == 0x1906 || format == 0x1909)) bpp = 1;
+        else if (type == 0x1401 && format == 0x190a) bpp = 2;
+        else if (type == 0x8363 || type == 0x8033 || type == 0x8034) bpp = 2;
+        if (!gpu || !frame.args.ok() || x < 0 || y < 0 || width < 0 || height < 0 || !bpp) {
+            frame.emulator.stop_with_error("Unsupported texture subimage arguments"); return;
+        }
+        const u64 row = (u64(static_cast<u32>(width)) * bpp + 3) & ~u64{3};
+        const u64 size = height == 0 ? 0 : row * (static_cast<u32>(height) - 1) +
+                         u64(static_cast<u32>(width)) * bpp;
+        if (size > 0xffffffffu) { frame.emulator.stop_with_error("Texture subimage too large"); return; }
+        const void* data = pixels && size ? frame.memory.host_ptr(pixels, static_cast<u32>(size)) : nullptr;
+        if ((pixels && size && !data) || !gpu->texture_sub_image(target, level, x, y, width,
+                height, format, type, data))
+            frame.emulator.stop_with_error("Desktop OpenGL texture subimage failed");
+    });
 }
 
 } // namespace clickhle

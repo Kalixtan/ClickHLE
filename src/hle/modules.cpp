@@ -21,7 +21,7 @@ void gles_statistics(Emulator& emulator, u64& frames, u64& draws) {
     auto* vc = emulator.videocore();
     const auto* classic = emulator.classic_graphics();
     frames = vc ? vc->frames() : classic ? classic->frames() : 0;
-    draws = vc ? vc->draws() : 0;
+    draws = vc ? vc->draws() : classic ? classic->draws() : 0;
 }
 
 const std::map<u32, u64>& gles_draws_by_texture(Emulator&) {

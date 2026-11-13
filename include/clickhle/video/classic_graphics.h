@@ -67,6 +67,8 @@ public:
     [[nodiscard]] const std::optional<VertexArray>& vertex_array() const noexcept {
         return vertex_array_;
     }
+    [[nodiscard]] bool vertex_array_enabled() const noexcept { return client_arrays_[0].value_or(false); }
+    [[nodiscard]] const std::array<i32, 16>& combined_matrix() const noexcept { return combined_matrix_; }
     void set_alpha_function(u32 function, u32 reference) noexcept {
         if (function < 0x200 || function > 0x207) { invalid_enum(); return; }
         alpha_function_ = static_cast<u8>(function - 0x200);
@@ -108,7 +110,9 @@ public:
         return result;
     }
     void note_present() noexcept { ++frames_; }
+    void note_draw() noexcept { ++draws_; }
     [[nodiscard]] u64 frames() const noexcept { return frames_; }
+    [[nodiscard]] u64 draws() const noexcept { return draws_; }
     void set_surface_handles(GuestAddr draw, GuestAddr read) noexcept {
         draw_handle_ = draw;
         read_handle_ = read;
@@ -166,6 +170,7 @@ private:
     std::array<std::optional<u8>, 2> texture_environment_{u8{4}, u8{4}};
     std::array<std::optional<bool>, 2> texture_enabled_{};
     u64 frames_ = 0;
+    u64 draws_ = 0;
     GuestAddr draw_handle_ = 0;
     GuestAddr read_handle_ = 0;
     std::array<u32, 4> clear_color_{};

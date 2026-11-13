@@ -191,6 +191,7 @@ bool Emulator::load(Config config, std::string* error) {
     classic_heap_.reset();
     classic_compositor_.reset();
     classic_graphics_.reset();
+    classic_gpu_.reset();
     classic_audio_ = {};
     system_clock_start_ = std::chrono::steady_clock::now();
     last_system_clock_us_ = 0;
@@ -231,6 +232,15 @@ bool Emulator::load(Config config, std::string* error) {
     else {
         classic_compositor_ = std::make_unique<classic::Compositor>();
         classic_graphics_ = std::make_unique<classic::GraphicsContext>();
+        if (image_->platform_id() == 3 && config_.classic_gpu) {
+            classic_gpu_ = std::make_unique<classic::GpuRenderer>();
+            std::string gpu_error;
+            if (!classic_gpu_->initialise(gpu_error)) {
+                classic_gpu_.reset();
+                fail(error, gpu_error);
+                return false;
+            }
+        }
     }
 
     if (!image_->map_into(memory_, config_.image_arena_end, error)) {
@@ -364,7 +374,7 @@ bool Emulator::load(Config config, std::string* error) {
     if (image_->platform_id() == 1)
         register_all_modules(registry_);
     else {
-        register_classic_modules(registry_);
+        register_classic_modules(registry_, classic_gpu_ != nullptr);
         // Provisional: the constructor defaults the budget field to zero, but
         // parser overrides and the real page-provider placement are not yet
         // verified. Reserve guest memory through the existing mapped heap so

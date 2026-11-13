@@ -26,6 +26,7 @@
 #include "clickhle/video/display.h"
 #include "clickhle/video/classic_compositor.h"
 #include "clickhle/video/classic_graphics.h"
+#include "clickhle/video/classic_gpu.h"
 #include "clickhle/video/videocore.h"
 
 namespace clickhle {
@@ -80,6 +81,7 @@ public:
         std::filesystem::path hdd_root;
         /// Zero selects the first matching entry in the package manifest.
         u32 platform_id = 0;
+        bool classic_gpu = false;
 
         // Opt-in disk capture for headless reverse-engineering runs.
         bool capture_videocore = false;
@@ -528,6 +530,7 @@ public:
     [[nodiscard]] VideoCore* videocore() noexcept { return videocore_.get(); }
     [[nodiscard]] classic::Compositor* classic_compositor() noexcept { return classic_compositor_.get(); }
     [[nodiscard]] classic::GraphicsContext* classic_graphics() noexcept { return classic_graphics_.get(); }
+    [[nodiscard]] classic::GpuRenderer* classic_gpu() noexcept { return classic_gpu_.get(); }
     [[nodiscard]] classic::AudioService& classic_audio() noexcept { return classic_audio_; }
     void set_videocore_engine(VideoCoreEngine engine);
 
@@ -709,6 +712,7 @@ private:
     std::unique_ptr<VideoCore> videocore_;
     std::unique_ptr<classic::Compositor> classic_compositor_;
     std::unique_ptr<classic::GraphicsContext> classic_graphics_;
+    std::unique_ptr<classic::GpuRenderer> classic_gpu_;
     classic::AudioService classic_audio_;
     std::unique_ptr<Display> display_ = Display::create();
     std::unique_ptr<AudioDevice> audio_;

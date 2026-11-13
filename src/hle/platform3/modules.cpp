@@ -44,12 +44,14 @@ std::optional<bool> user_database_exists(const std::filesystem::path& root) {
 } // namespace
 
 void register_classic_graphics(HleRegistry& registry);
+void register_classic_gpu_graphics(HleRegistry& registry);
 
-void register_classic_modules(HleRegistry& registry) {
+void register_classic_modules(HleRegistry& registry, bool gpu) {
     // Only shared framework hashes are eligible for these implementations.
     register_input(registry);
     register_fileio(registry);
     register_classic_graphics(registry);
+    if (gpu) register_classic_gpu_graphics(registry);
     registry.add("miscTBD", 8, "classic_resource_path", 4, [](HleCallFrame& frame) {
         const u32 mode = frame.args.next_u32();
         const GuestAddr output = frame.args.next_ptr();

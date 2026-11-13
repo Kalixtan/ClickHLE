@@ -64,6 +64,7 @@ struct Options {
     bool headless = false;
     bool capture_videocore = false;
     bool videocore_engine_specified = false;
+    bool classic_gpu = false;
     clickhle::VideoCoreEngine videocore_engine =
         clickhle::videocore_jit_available() ? clickhle::VideoCoreEngine::G5
                                            : clickhle::VideoCoreEngine::Interpreter;
@@ -172,6 +173,7 @@ Options:
   --cpu <backend>       CPU backend to use (default: build default)
   --platform <id>       Select a package platform ID (default: manifest order)
   --vc2-engine <name>   VideoCore engine: interpreter, jit or g5
+  --classic-gpu         Experimental Platform 3 desktop OpenGL renderer
   --names <file>        Ordinal->name file, used to make reports about
                         unimplemented ordinals readable.
   --clock-hz <n>        Emulated clock rate (default 20000000). Guest time
@@ -388,6 +390,8 @@ bool parse_options(int argc, char** argv, Options& options) {
                 std::cerr << "--platform expects an ID from 1 to 4\n";
                 return false;
             }
+        } else if (arg == "--classic-gpu") {
+            options.classic_gpu = true;
         } else if (arg == "--vc2-engine") {
             options.videocore_engine_specified = true;
             const std::string value = value_for("--vc2-engine");
@@ -901,6 +905,7 @@ int main(int argc, char** argv) {
     }
     config.capture_videocore = options.capture_videocore;
     config.videocore_engine = options.videocore_engine;
+    config.classic_gpu = options.classic_gpu;
     config.cpu_backend = options.cpu_backend;
     if (options.clock_hz != 0) {
         config.emulated_hz = options.clock_hz;

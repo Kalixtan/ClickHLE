@@ -325,6 +325,8 @@ public:
             const auto engine = settings.value(QStringLiteral("video/engine")).toString();
             if (engine == QStringLiteral("jit") && jit_action_->isEnabled()) jit_action_->setChecked(true);
         }
+        classic_gpu_action_->setChecked(settings.value(QStringLiteral("video/classicGpu"), false).toBool());
+        classic_software_action_->setChecked(!classic_gpu_action_->isChecked());
         recent_games_ = settings.value(QStringLiteral("games/recent")).toStringList();
         rebuildRecentMenu();
         updateActions();
@@ -393,6 +395,7 @@ protected:
                           : jit_action_->isChecked() ? QStringLiteral("jit")
                                                    : QStringLiteral("interpreter"));
         settings.setValue(QStringLiteral("video/engineVersion"), 1);
+        settings.setValue(QStringLiteral("video/classicGpu"), classic_gpu_action_->isChecked());
         QMainWindow::closeEvent(event);
     }
 
@@ -650,6 +653,18 @@ private:
         connect(g5_action_, &QAction::triggered, this, [this] {
             if (emulator_) emulator_->set_videocore_engine(clickhle::VideoCoreEngine::G5);
         });
+        auto* classic_engines = new QActionGroup(this);
+        classic_engines->setExclusive(true);
+        classic_software_action_ = new QAction(tr("Software (research)"), classic_engines);
+        classic_gpu_action_ = new QAction(tr("Desktop OpenGL (experimental)"), classic_engines);
+        classic_software_action_->setCheckable(true);
+        classic_gpu_action_->setCheckable(true);
+        classic_software_action_->setChecked(true);
+        for (auto* action : {classic_software_action_, classic_gpu_action_}) {
+            connect(action, &QAction::triggered, this, [this] {
+                if (emulator_) statusBar()->showMessage(tr("Restart the game to change Platform 3 renderer"), 8000);
+            });
+        }
 
         about_action_ = new QAction(tr("About ClickHLE"), this);
         connect(about_action_, &QAction::triggered, this, [this] {
@@ -684,6 +699,9 @@ private:
         video_engine->addAction(interpreter_action_);
         video_engine->addAction(jit_action_);
         video_engine->addAction(g5_action_);
+        QMenu* classic_video = options->addMenu(tr("Platform 3 Renderer"));
+        classic_video->addAction(classic_software_action_);
+        classic_video->addAction(classic_gpu_action_);
 
         QMenu* emulation = bar->addMenu(tr("Emulation"));
         emulation->addAction(pause_action_);
@@ -879,6 +897,7 @@ private:
             path_bytes, static_cast<std::size_t>(encoded_path.size())));
         config.hdd_root = hdd_root_;
         config.platform_id = platform_id;
+        config.classic_gpu = classic_gpu_action_->isChecked();
         config.videocore_engine = g5_action_->isChecked()
             ? clickhle::VideoCoreEngine::G5
             : jit_action_->isChecked() ? clickhle::VideoCoreEngine::Jit
@@ -1311,6 +1330,8 @@ private:
     QAction* interpreter_action_ = nullptr;
     QAction* jit_action_ = nullptr;
     QAction* g5_action_ = nullptr;
+    QAction* classic_software_action_ = nullptr;
+    QAction* classic_gpu_action_ = nullptr;
     QAction* about_action_ = nullptr;
     QPlainTextEdit* cpu_view_ = nullptr;
     QPlainTextEdit* memory_view_ = nullptr;

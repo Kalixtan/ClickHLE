@@ -63,6 +63,13 @@ larger software renderer; it currently uses VC2 for drawing.
 The GUI's Options → iPod Settings window controls the game-facing language
 index, time format, and hold switch. Language index 0 is English; available
 translations depend on the game.
+Platform 3 also has an experimental desktop OpenGL renderer, selectable under
+Options → Platform 3 Renderer or with `--classic-gpu`. Restart the game after
+changing it. The experimental backend currently handles texture binding and
+uploads plus basic array and indexed draws through desktop OpenGL. Texture
+sampling, client color arrays, blend/depth state and the rest of OpenGL ES are
+still incomplete; use the software renderer for titles that need those paths.
+It requires desktop OpenGL and EGL; the software renderer remains the default.
 The JIT keeps compiled objects in the user cache (`~/.cache/clickhle/vc2` on Linux).
 Set `CLICKHLE_VC2_CACHE_DIR` to choose another folder, or to an empty string to
 disable disk caching. Deleting the folder clears the cache.

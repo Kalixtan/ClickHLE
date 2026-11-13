@@ -87,6 +87,7 @@ add_library(clickhle_core
     src/hle/platform3/memory_api.cpp
     src/hle/platform3/heap.cpp
     src/hle/platform3/graphics.cpp
+    src/video/platform3/gpu/renderer.cpp
     src/hle/modules/misc.cpp
     src/hle/modules/input.cpp
     src/hle/modules/input_replay.cpp
@@ -121,6 +122,14 @@ add_library(clickhle_core
     src/video/platform1/vc2/png.cpp
     src/video/display.cpp
 )
+
+find_package(OpenGL QUIET COMPONENTS OpenGL EGL)
+if(TARGET OpenGL::OpenGL AND TARGET OpenGL::EGL)
+    target_link_libraries(clickhle_core PUBLIC OpenGL::OpenGL OpenGL::EGL)
+    target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_CLASSIC_GPU=1)
+else()
+    target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_CLASSIC_GPU=0)
+endif()
 
 target_include_directories(clickhle_core PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>")
