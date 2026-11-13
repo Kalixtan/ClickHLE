@@ -153,6 +153,7 @@ std::optional<Operation> decode(u16 word, u32 pc) {
 }
 
 using NativeVectorRegion = void (*)(u8 *, const u32 *, bool *, bool *, bool *);
+using NativeFilteredRegion = void (*)(u8 *, const u32 *, i64 *, u32 *);
 using NativeIndexedH16 = void (*)(u8 *, const u8 *, u32, const std::int64_t *, const u32 *, u32, u32);
 using NativeBlock = void (*)(u32 *, const u8 *, const u32 *);
 using NativeAddress = u32 (*)(u32 *);
@@ -236,6 +237,7 @@ std::optional<Operation> decode_extended(u16 word, u16 second, u32 pc) {
 struct Block {
     enum class Kind { Scalar, Memory, Stack, TableBranch, VectorLoad, RasterStore, MoveH16, Broadcast, BinaryVector, AddSetfH16, FillLoop, VectorRegion, IndexedH16 } kind = Kind::Scalar;
     NativeVectorRegion vector_native = nullptr;
+    NativeFilteredRegion filtered_native = nullptr;
     std::vector<u32> vector_pcs;
     u32 pc = 0;
     std::vector<Operation> operations;
@@ -845,6 +847,91 @@ struct Jit::Impl {
         block.resources = engine->getMainJITDylib().createResourceTracker();
         return materialize(std::move(context), std::move(module), function, block.resources,
                            "vector-region").toPtr<NativeVectorRegion>();
+    }
+
+    // Fuse the exact firmware-derived byte-filter sequence already modeled by
+    // the interpreter. The first instruction clears the accumulator; each of
+    // four byte-by-halfword products contributes at most 254, so the complete
+    // sum cannot overflow or saturate the 32-bit accumulator.
+    bool build_filtered_region(Core &core, Block &block, unsigned limit) {
+        std::vector<VectorPlan> plans;
+        for (unsigned i = 0; i < std::min(limit, 4u); ++i) {
+            const u32 pc = block.pc + 2 * block.length;
+            if (pc + 10 > 0x4000000) break;
+            std::array<u32, 5> words{};
+            for (unsigned j = 0; j < 5; ++j) words[j] = core.read(pc + 2 * j, 2);
+            VectorPlan plan;
+            try { plan = core.decode_vector(words, 5); }
+            catch (const std::runtime_error &) { break; }
+            if (!plan.modes.filtered_byte || plan.count != 1 || plan.pred || plan.setf ||
+                plan.accumulate || !plan.x15 || plan.sreg != 7 || plan.d.discard ||
+                plan.d.packed_columns || plan.a.packed_columns || plan.b.packed_columns ||
+                (plans.empty() ? !plan.clear : plan.clear)) break;
+            block.vector_pcs.push_back(pc);
+            for (u32 word : words) block.words[block.length++] = static_cast<u16>(word);
+            plans.push_back(plan);
+        }
+        if (plans.size() < 2) return false;
+        CompilationTimer compile_timer{compile_cpu};
+        const auto start = std::chrono::steady_clock::now();
+        auto context = std::make_unique<llvm::LLVMContext>();
+        auto module = std::make_unique<llvm::Module>("vc2-filtered-region", *context);
+        module->setDataLayout(engine->getDataLayout());
+        module->setTargetTriple(engine->getTargetTriple().str());
+        auto *i8 = llvm::Type::getInt8Ty(*context);
+        auto *i32 = llvm::Type::getInt32Ty(*context);
+        auto *i64 = llvm::Type::getInt64Ty(*context);
+        auto *type = llvm::FunctionType::get(llvm::Type::getVoidTy(*context),
+            {llvm::PointerType::getUnqual(i8), llvm::PointerType::getUnqual(i32),
+             llvm::PointerType::getUnqual(i64), llvm::PointerType::getUnqual(i32)}, false);
+        auto *function = llvm::Function::Create(type, llvm::Function::ExternalLinkage,
+            "vc2_filtered_region_" + std::to_string(next_symbol++), module.get());
+        for (unsigned arg = 0; arg < 4; ++arg)
+            function->addParamAttr(arg, llvm::Attribute::NoAlias);
+        llvm::IRBuilder<> build(llvm::BasicBlock::Create(*context, "entry", function));
+        auto *vrf = function->getArg(0);
+        auto *status = build.CreateLoad(i32, build.CreateGEP(i32, function->getArg(1), build.getInt32(30)));
+        auto *column_base = build.CreateAnd(status, 48);
+        auto address = [&](const VectorOperand &operand, unsigned lane, unsigned plane) {
+            auto *row = build.getInt32((((operand.base >> 6) + lane) & 63) << 6);
+            auto *column = build.CreateAnd(build.CreateAdd(column_base,
+                build.getInt32((operand.base & 63) + 16 * plane)), 63);
+            return build.CreateGEP(i8, vrf, build.CreateOr(row, column));
+        };
+        std::array<llvm::Value *, 16> sum{};
+        sum.fill(build.getInt32(0));
+        for (const auto &plan : plans) {
+            std::array<llvm::Value *, 16> products{};
+            // Read all lanes first: destination and input columns can overlap.
+            for (unsigned lane = 0; lane < 16; ++lane) {
+                auto *a = build.CreateZExt(build.CreateLoad(i8, address(plan.a, lane, 0)), i32);
+                auto *lo = build.CreateZExt(build.CreateLoad(i8, address(plan.b, lane, 0)), i32);
+                auto *hi = build.CreateZExt(build.CreateLoad(i8, address(plan.b, lane, 1)), i32);
+                auto *b = build.CreateOr(lo, build.CreateShl(hi, 8));
+                products[lane] = build.CreateLShr(build.CreateMul(a, b), 16);
+            }
+            for (unsigned lane = 0; lane < 16; ++lane) {
+                sum[lane] = build.CreateAdd(sum[lane], products[lane]);
+                build.CreateStore(build.CreateTrunc(sum[lane], i8), address(plan.d, lane, 0));
+            }
+        }
+        for (unsigned lane = 0; lane < 16; ++lane) {
+            auto *index = build.getInt32(lane);
+            build.CreateStore(llvm::ConstantInt::get(i64, 0), build.CreateGEP(i64, function->getArg(2), index));
+            build.CreateStore(sum[lane], build.CreateGEP(i32, function->getArg(3), index));
+        }
+        build.CreateRetVoid();
+        if (llvm::verifyFunction(*function, &llvm::errs()))
+            throw std::runtime_error("VC2 JIT generated invalid filtered region");
+        block.kind = Block::Kind::VectorRegion;
+        block.resources = engine->getMainJITDylib().createResourceTracker();
+        block.filtered_native = materialize(std::move(context), std::move(module), function,
+            block.resources, "filtered-region").toPtr<NativeFilteredRegion>();
+        block.code_versions = watch_code(core, block.pc, block.length);
+        core.jit_compile_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        ++core.jit_compilations;
+        return true;
     }
 
     bool build_vector_region(Core &core, Block &block, unsigned limit) {
@@ -1838,7 +1925,15 @@ struct Jit::Impl {
         if ((first_word & 0xfc00) == 0x2000 && limit >= 2) {
             Block region;
             region.pc = pc;
-            if (build_vector_region(core, region, limit)) {
+            const bool filtered_start = first_word == 0x219c && pc + 10 <= 0x4000000 &&
+                core.read(pc + 8, 2) == 0x8407;
+            bool built = filtered_start && build_filtered_region(core, region, limit);
+            if (!built) {
+                region = Block();
+                region.pc = pc;
+                built = build_vector_region(core, region, limit);
+            }
+            if (built) {
                 auto [inserted, fresh] = blocks.emplace(pc, std::move(region));
                 (void)fresh;
                 entry.block = &inserted->second;
@@ -2472,18 +2567,28 @@ struct Jit::Impl {
                 for (unsigned i = 0; i < block.vector_pcs.size(); ++i) core.step();
                 auto expected_regs = regs;
                 expected_regs[31] = block.pc + 2 * block.length;
-                if (core.r != expected_regs || core.acc != acc || core.acclo != acclo)
-                    throw std::runtime_error("VC2 vector region has unexpected side effects");
+                if (core.r != expected_regs)
+                    throw std::runtime_error("VC2 vector region has unexpected register effects");
+                const auto expected_acc = core.acc;
+                const auto expected_acclo = core.acclo;
                 const auto expected = core.vrf;
                 const auto expected_vz = core.vz, expected_vn = core.vn, expected_vc = core.vc;
                 core.vrf = before;
+                core.acc = acc; core.acclo = acclo;
                 core.vz = vz; core.vn = vn; core.vc = vc;
-                block.vector_native(core.vrf.data(), regs.data(), core.vz.data(), core.vn.data(), core.vc.data());
-                if (core.vrf != expected || core.vz != expected_vz || core.vn != expected_vn ||
+                if (block.filtered_native)
+                    block.filtered_native(core.vrf.data(), regs.data(), core.acc.data(), core.acclo.data());
+                else
+                    block.vector_native(core.vrf.data(), regs.data(), core.vz.data(), core.vn.data(), core.vc.data());
+                if (core.vrf != expected || core.acc != expected_acc || core.acclo != expected_acclo ||
+                    core.vz != expected_vz || core.vn != expected_vn ||
                     core.vc != expected_vc || core.r[31] != block.pc + 2 * block.length)
                     throw std::runtime_error("VC2 native vector region mismatch at PC " + std::to_string(block.pc));
             } else {
-                block.vector_native(core.vrf.data(), core.r.data(), core.vz.data(), core.vn.data(), core.vc.data());
+                if (block.filtered_native)
+                    block.filtered_native(core.vrf.data(), core.r.data(), core.acc.data(), core.acclo.data());
+                else
+                    block.vector_native(core.vrf.data(), core.r.data(), core.vz.data(), core.vn.data(), core.vc.data());
                 for (u32 pc : block.vector_pcs)
                     core.recent_pcs[core.recent_pc_count++ % core.recent_pcs.size()] = pc;
                 core.r[31] = block.pc + 2 * block.length;

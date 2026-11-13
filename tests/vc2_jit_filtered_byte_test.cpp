@@ -78,5 +78,134 @@ int main() {
             }
         }
     }
+    // Four dependent filter operations appear consecutively in the uploaded
+    // shaders. Compare the entire region, including overlapping columns.
+    constexpr std::array<u16, 20> sequence{
+        0x219c, 0x64f5, 0x110d, 0x780e, 0x8407,
+        0x219c, 0x64f5, 0x311d, 0x780e, 0x8007,
+        0x219c, 0x64f5, 0x512d, 0x780e, 0x8007,
+        0x219c, 0x64f5, 0x713d, 0x780e, 0x8007
+    };
+    const u32 sequence_pc = 0x30ff0; // Cross a watched code-page boundary.
+    for (auto *core : {&native, &reference})
+        for (unsigned i = 0; i < sequence.size(); ++i)
+            core->write(sequence_pc + 2 * i, sequence[i], 2);
+    for (unsigned i = 0; i < 63; ++i) {
+        native.r[31] = sequence_pc;
+        if (jit.try_execute(native, 32, sequence[0])) return 1;
+    }
+    for (unsigned trial = 0; trial < 512; ++trial) {
+        for (unsigned i = 0; i < native.vrf.size(); ++i) {
+            const u8 value = trial % 4 == 0 ? 0 : trial % 4 == 1 ? 255 : static_cast<u8>(random());
+            native.vrf[i] = reference.vrf[i] = value;
+        }
+        for (unsigned i = 0; i < 32; ++i)
+            native.r[i] = reference.r[i] = static_cast<u32>(random());
+        for (unsigned i = 0; i < 16; ++i) {
+            native.acc[i] = reference.acc[i] = static_cast<i32>(random());
+            native.acclo[i] = reference.acclo[i] = static_cast<u32>(random());
+            native.vz[i] = reference.vz[i] = (random() & 1) != 0;
+            native.vn[i] = reference.vn[i] = (random() & 1) != 0;
+            native.vc[i] = reference.vc[i] = (random() & 1) != 0;
+        }
+        native.r[30] = reference.r[30] = (trial % 4) * 16;
+        native.r[31] = reference.r[31] = sequence_pc;
+        native.recent_pc_count = reference.recent_pc_count = 0;
+        native.recent_pcs.fill(0);
+        reference.recent_pcs.fill(0);
+        if (jit.try_execute_cached(native, 3)) {
+            std::cerr << "Filtered region exceeded instruction budget\n";
+            return 1;
+        }
+        if (jit.try_execute(native, 32, sequence[0]) != 4) {
+            std::cerr << "Filtered instructions did not form a region\n";
+            return 1;
+        }
+        for (unsigned i = 0; i < 4; ++i) reference.step();
+        if (native.r != reference.r || native.vrf != reference.vrf ||
+            native.acc != reference.acc || native.acclo != reference.acclo ||
+            native.vz != reference.vz || native.vn != reference.vn ||
+            native.vc != reference.vc || native.recent_pcs != reference.recent_pcs ||
+            native.recent_pc_count != reference.recent_pc_count) {
+            std::cerr << "Filtered region mismatch at trial " << trial << '\n';
+            return 1;
+        }
+    }
+    // Vary destinations and region lengths, including destination/input
+    // overlaps. Earlier stores must remain visible to later instructions.
+    u32 varied_pc = 0x60000;
+    for (u16 destination : {u16{0x00f5}, u16{0x23f5}, u16{0x40f5},
+                            u16{0x64f5}, u16{0x6ff5}, u16{0xa0f5}, u16{0xe0f5}}) {
+        for (unsigned length : {2u, 3u, 4u}) {
+            auto program = sequence;
+            for (unsigned i = 0; i < length; ++i) program[5 * i + 1] = destination;
+            for (auto *core : {&native, &reference})
+                for (unsigned i = 0; i < length * 5; ++i)
+                    core->write(varied_pc + 2 * i, program[i], 2);
+            for (unsigned i = 0; i < 63; ++i) {
+                native.r[31] = varied_pc;
+                if (jit.try_execute(native, 32, program[0])) return 1;
+            }
+            for (unsigned trial = 0; trial < 16; ++trial) {
+                for (unsigned i = 0; i < native.vrf.size(); ++i)
+                    native.vrf[i] = reference.vrf[i] = trial == 0 ? 255 : static_cast<u8>(random());
+                for (unsigned i = 0; i < 32; ++i)
+                    native.r[i] = reference.r[i] = static_cast<u32>(random());
+                for (unsigned i = 0; i < 16; ++i) {
+                    native.acc[i] = reference.acc[i] = static_cast<i32>(random());
+                    native.acclo[i] = reference.acclo[i] = static_cast<u32>(random());
+                    native.vz[i] = reference.vz[i] = (random() & 1) != 0;
+                    native.vn[i] = reference.vn[i] = (random() & 1) != 0;
+                    native.vc[i] = reference.vc[i] = (random() & 1) != 0;
+                }
+                native.r[30] = reference.r[30] = (trial % 4) * 16;
+                native.r[31] = reference.r[31] = varied_pc;
+                native.recent_pc_count = reference.recent_pc_count = 0;
+                native.recent_pcs.fill(0);
+                reference.recent_pcs.fill(0);
+                if (jit.try_execute(native, 32, program[0]) != length) {
+                    std::cerr << "Varied filtered region did not compile\n";
+                    return 1;
+                }
+                for (unsigned i = 0; i < length; ++i) reference.step();
+                if (native.r != reference.r || native.vrf != reference.vrf ||
+                    native.acc != reference.acc || native.acclo != reference.acclo ||
+                    native.vz != reference.vz || native.vn != reference.vn ||
+                    native.vc != reference.vc || native.recent_pcs != reference.recent_pcs ||
+                    native.recent_pc_count != reference.recent_pc_count) {
+                    std::cerr << "Varied filtered region mismatch\n";
+                    return 1;
+                }
+            }
+            varied_pc += 64;
+        }
+    }
+    // The same bytes at a different guest address must reuse the native
+    // object, while each guest location keeps its own invalidation watch.
+    const auto objects = jit.loaded_object_count();
+    const u32 relocated_pc = 0x50000;
+    for (unsigned i = 0; i < sequence.size(); ++i)
+        native.write(relocated_pc + 2 * i, sequence[i], 2);
+    for (unsigned i = 0; i < 63; ++i) {
+        native.r[31] = relocated_pc;
+        if (jit.try_execute(native, 32, sequence[0])) return 1;
+    }
+    native.r[31] = relocated_pc;
+    if (jit.try_execute(native, 32, sequence[0]) != 4 ||
+        jit.loaded_object_count() != objects) {
+        std::cerr << "Relocated filtered region did not reuse its native object\n";
+        return 1;
+    }
+    native.write(sequence_pc + 20, 0x219e, 2);
+    native.r[31] = sequence_pc;
+    if (jit.try_execute_cached(native, 32)) {
+        std::cerr << "Changed filtered region was not invalidated\n";
+        return 1;
+    }
+    native.r[31] = relocated_pc;
+    if (jit.try_execute_cached(native, 32) != 4) {
+        std::cerr << "Changing one region invalidated relocated code\n";
+        return 1;
+    }
     std::cout << checked << " filtered byte executions matched the interpreter\n";
 }
