@@ -332,9 +332,9 @@ struct Jit::Impl {
         llvm::orc::ResourceTrackerSP resources;
     };
     std::unordered_map<u64, AddressKernel> address_kernels;
-    std::array<NativeAddFlags, 2> add_flags_kernels{};
+    std::array<NativeAddFlags, 3> add_flags_kernels{};
     std::vector<llvm::orc::ResourceTrackerSP> add_flags_resources =
-        std::vector<llvm::orc::ResourceTrackerSP>(2);
+        std::vector<llvm::orc::ResourceTrackerSP>(3);
     u64 next_symbol = 0;
     bool compare = false;
     bool profile = false;
@@ -1665,7 +1665,7 @@ struct Jit::Impl {
         return result;
     }
 
-    NativeAddFlags compile_add_setf_h16(bool lowcarry) {
+    NativeAddFlags compile_add_setf_h16(bool lowcarry, bool vertical = false) {
         CompilationTimer compile_timer{compile_cpu};
         auto context = std::make_unique<llvm::LLVMContext>();
         auto module = std::make_unique<llvm::Module>("vc2-add-setf-h16", *context);
@@ -1688,12 +1688,15 @@ struct Jit::Impl {
         auto *zero_flags = function->getArg(4);
         auto *negative_flags = function->getArg(5);
         auto *carry_flags = function->getArg(6);
-        emit_add_flags_simd(build, *function, lowcarry);
+        if (!vertical)
+            emit_add_flags_simd(build, *function, lowcarry);
         auto address = [&](llvm::Value *base, unsigned lane, unsigned byte) {
             auto *column = build.CreateAnd(build.CreateAdd(build.CreateAnd(base, 63),
-                llvm::ConstantInt::get(i32, lane + 16 * byte)), llvm::ConstantInt::get(i32, 63));
-            return build.CreateInBoundsGEP(i8, vrf,
-                build.CreateOr(build.CreateAnd(base, ~63u), column));
+                llvm::ConstantInt::get(i32, (vertical ? 0 : lane) + 16 * byte)), llvm::ConstantInt::get(i32, 63));
+            auto *row = vertical
+                ? build.CreateAnd(build.CreateAdd(base, llvm::ConstantInt::get(i32, lane * 64)), 0xfc0)
+                : build.CreateAnd(base, ~63u);
+            return build.CreateInBoundsGEP(i8, vrf, build.CreateOr(row, column));
         };
         auto read_halfword = [&](llvm::Value *base, unsigned lane) {
             auto *low = build.CreateZExt(build.CreateLoad(i8, address(base, lane, 0)), i16);
@@ -1703,7 +1706,8 @@ struct Jit::Impl {
         std::array<llvm::Value *, 16> sums{}, carry_values{};
         for (unsigned lane = 0; lane < 16; ++lane) {
             auto *a = read_halfword(left, lane);
-            auto *b = read_halfword(right, lane);
+            auto *b = vertical ? build.CreateSExt(build.CreateTrunc(right, i16), i32)
+                               : read_halfword(right, lane);
             sums[lane] = build.CreateAdd(a, b);
             if (lowcarry)
                 carry_values[lane] = build.CreateICmpUGT(build.CreateAdd(
@@ -1730,10 +1734,11 @@ struct Jit::Impl {
         build.CreateRetVoid();
         if (llvm::verifyFunction(*function, &llvm::errs()))
             throw std::runtime_error("VC2 JIT generated invalid vector add/flags kernel");
-        auto &resources = add_flags_resources[lowcarry];
+        auto &resources = add_flags_resources[vertical ? 2 : lowcarry];
         resources = engine->getMainJITDylib().createResourceTracker();
         return materialize(std::move(context), std::move(module), function,
-                           resources, "add-flags:" + std::to_string(lowcarry))
+                           resources, vertical ? "add-flags:vertical-lowcarry"
+                                               : "add-flags:" + std::to_string(lowcarry))
             .toPtr<NativeAddFlags>();
     }
 
@@ -2336,20 +2341,24 @@ struct Jit::Impl {
                     entry.block = &inserted->second;
                     return execute(core, inserted->second, limit);
                 }
+                // Vertical immediate carry is a firmware-derived model,
+                // retained with the interpreter's exact provisional guard.
+                const bool vertical_add = decoded && decoded->modes.lowcarry &&
+                    decoded->modes.carry_operands && decoded->bkind == 1 &&
+                    decoded->d.vertical && decoded->a.vertical;
                 if (decoded && decoded->length == length && decoded->count == 1 &&
                     vector_op == 8 && decoded->setf && !decoded->pred &&
                     !decoded->clear && !decoded->accumulate && !decoded->x15 &&
-                    decoded->sreg == 7 && decoded->bkind == 0 &&
-                    !decoded->d.discard && !decoded->d.vertical &&
-                    !decoded->a.vertical && !decoded->b.vertical &&
+                    decoded->sreg == 7 && !decoded->d.discard &&
                     decoded->d.width == 2 && decoded->a.width == 2 &&
-                    decoded->b.width == 2) {
+                    (vertical_add || (decoded->bkind == 0 && !decoded->d.vertical &&
+                     !decoded->a.vertical && !decoded->b.vertical && decoded->b.width == 2))) {
                     const bool lowcarry = decoded->modes.lowcarry &&
                                           decoded->modes.carry_operands;
-                    auto &kernel = add_flags_kernels[lowcarry];
+                    auto &kernel = add_flags_kernels[vertical_add ? 2 : lowcarry];
                     if (!kernel) {
                         const auto start = std::chrono::steady_clock::now();
-                        kernel = compile_add_setf_h16(lowcarry);
+                        kernel = compile_add_setf_h16(lowcarry, vertical_add);
                         core.jit_compile_us += static_cast<u64>(std::chrono::duration_cast<
                             std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
                         ++core.jit_compilations;
@@ -2361,6 +2370,8 @@ struct Jit::Impl {
                     add.destination = decoded->d;
                     add.source = decoded->a;
                     add.right = decoded->b;
+                    add.broadcast_operand = vertical_add;
+                    add.immediate = static_cast<u32>(decoded->immediate);
                     add.add_flags_native = kernel;
                     for (unsigned i = 0; i < length; ++i)
                         add.words[i] = static_cast<u16>(words[i]);
@@ -2671,7 +2682,8 @@ struct Jit::Impl {
                     }
                     else
                         block.add_flags_native(core.vrf.data(), destination, source,
-                            block.right.offset(core, repeat), core.vz.data(), core.vn.data(), core.vc.data());
+                            block.broadcast_operand ? block.immediate : block.right.offset(core, repeat),
+                            core.vz.data(), core.vn.data(), core.vc.data());
                 }
                 core.r[31] = block.pc + 2 * block.length;
             };
