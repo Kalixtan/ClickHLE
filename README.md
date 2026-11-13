@@ -28,8 +28,13 @@ in a `keys` folder beside the executable. Package installation is built into
 the GUI and CLI using libzip and OpenSSL. The CLI command is
 `build/bin/clickhle --install game.ipg [hdd-folder] [keys-folder]`. The CLI
 accepts `--platform 1` through `4` when a binary is shared by platforms.
-Alternate-platform eapps parse and map, but APIs with different ABI hashes
-remain unbound and stop when called.
+Platform 3 support is experimental and does not yet display games. Platforms 2
+and 4 use the same preliminary API path as a placeholder. Unimplemented APIs
+stop execution; VideoCore emulation is available only for Platform 1.
+
+Platform 1's graphics code lives in `src/video/platform1`, including the VC2
+interpreter in `vc2` and JIT in `vc2/jit`. The preliminary Classic API and
+display code live in `src/hle/platform3` and `src/video/platform3` respectively.
 
 Installed games read assets from `hdd/iPod_Control/Games_RO/<id>` and write
 saves to `GameData_RW/<id>` and statistics to `GameStats_WO/<id>` under the

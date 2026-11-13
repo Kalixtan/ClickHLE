@@ -10,8 +10,11 @@
 #include <thread>
 
 #include "clickhle/common/log.h"
+#include "clickhle/audio/audio_device.h"
 #include "clickhle/core/storage_paths.h"
 #include "clickhle/hle/modules.h"
+#include "clickhle/video/classic_surface.h"
+#include "clickhle/loader/framework_abi.h"
 
 namespace clickhle {
 namespace {
@@ -183,8 +186,12 @@ void Emulator::set_videocore_engine(VideoCoreEngine engine) {
 
 bool Emulator::load(Config config, std::string* error) {
     config_ = std::move(config);
-    videocore_ = std::make_unique<VideoCore>(config_.capture_videocore,
-                                              config_.videocore_engine);
+    videocore_.reset();
+    classic_arena_.reset();
+    classic_heap_.reset();
+    classic_compositor_.reset();
+    classic_graphics_.reset();
+    classic_audio_ = {};
     system_clock_start_ = std::chrono::steady_clock::now();
     last_system_clock_us_ = 0;
     metadata_state_ = {};
@@ -216,6 +223,14 @@ bool Emulator::load(Config config, std::string* error) {
     image_ = EappImage::load_file(config_.executable, error, config_.platform_id);
     if (!image_.has_value()) {
         return false;
+    }
+
+    if (image_->platform_id() == 1)
+        videocore_ = std::make_unique<VideoCore>(config_.capture_videocore,
+                                                 config_.videocore_engine);
+    else {
+        classic_compositor_ = std::make_unique<classic::Compositor>();
+        classic_graphics_ = std::make_unique<classic::GraphicsContext>();
     }
 
     if (!image_->map_into(memory_, config_.image_arena_end, error)) {
@@ -250,19 +265,19 @@ bool Emulator::load(Config config, std::string* error) {
                "emulator.cpp)";
     }
 
-    // See kLowMirrorBase: real hardware mirrors SDRAM here rather than
-    // faulting. Mapped read-only (a title should never legitimately write
-    // its own reset vector) and seeded with the real bytes oracle measured;
-    // the rest of the window stays zero, same as any freshly mapped region.
-    if (!memory_.map(kLowMirrorBase, kLowMirrorSize, AddressSpace::kRead,
-                     "low-mirror")) {
-        fail(error, "failed to map the low-memory mirror");
-        return false;
-    }
-    if (!memory_.write_bytes(kLowMirrorBase, kLowMirrorRealBytes,
-                             sizeof(kLowMirrorRealBytes))) {
-        fail(error, "failed to seed the low-memory mirror");
-        return false;
+    // The low mirror bytes were measured on Platform 1 only. They must not
+    // be presented as 7G firmware state without matching evidence.
+    if (image_->platform_id() == 1) {
+        if (!memory_.map(kLowMirrorBase, kLowMirrorSize, AddressSpace::kRead,
+                         "low-mirror")) {
+            fail(error, "failed to map the low-memory mirror");
+            return false;
+        }
+        if (!memory_.write_bytes(kLowMirrorBase, kLowMirrorRealBytes,
+                                 sizeof(kLowMirrorRealBytes))) {
+            fail(error, "failed to seed the low-memory mirror");
+            return false;
+        }
     }
 
     if (!memory_.map(config_.stack_base, config_.stack_size,
@@ -346,7 +361,65 @@ bool Emulator::load(Config config, std::string* error) {
         return false;
     }
 
-    register_all_modules(registry_);
+    if (image_->platform_id() == 1)
+        register_all_modules(registry_);
+    else {
+        register_classic_modules(registry_);
+        // Provisional: the constructor defaults the budget field to zero, but
+        // parser overrides and the real page-provider placement are not yet
+        // verified. Reserve guest memory through the existing mapped heap so
+        // HLE allocations cannot overlap the arena. This is not a physical
+        // S5L8702 memory-map claim.
+        constexpr u32 page_size = 0x80000;
+        const u32 bytes = classic::game_heap_budget(0) * 1024;
+        const GuestAddr control = heap_.allocate(classic::RegionHeap::control_size);
+        const GuestAddr arena_storage = heap_.allocate(bytes + page_size - 1);
+        if (!control || !arena_storage) {
+            fail(error, "failed to reserve provisional Classic arena");
+            return false;
+        }
+        const GuestAddr base = (arena_storage + page_size - 1) & ~(page_size - 1);
+        std::vector<GuestAddr> pages;
+        for (u32 offset = 0; offset < bytes; offset += page_size)
+            pages.push_back(base + offset);
+        auto layout = classic::plan_arena(pages, page_size);
+        if (!layout) {
+            fail(error, "failed to plan provisional Classic arena");
+            return false;
+        }
+        classic_heap_ = std::make_unique<classic::RegionHeap>(memory_, control);
+        classic_arena_ = std::make_unique<classic::Arena>(*classic_heap_, std::move(*layout), page_size);
+        classic_arena_->initialize();
+        register_classic_memory(registry_, *classic_arena_, 1);
+        CLICKHLE_WARN(kCategory) << "Classic arena uses provisional budget, page placement and thread identity";
+
+        // 7G game launcher selects format 5 at 320x240 and creates two
+        // type-2 buffers. Guest addresses come from our provisional heap;
+        // display-layer ownership and hardware submission are not wired yet.
+        constexpr u32 frame_bytes = 320u * 240u * 2u;
+        const GuestAddr surface_config = heap_.allocate(0x68);
+        const GuestAddr surface = heap_.allocate(0xa4);
+        const GuestAddr front = heap_.allocate(0x54);
+        const GuestAddr back = heap_.allocate(0x54);
+        const GuestAddr front_pixels = heap_.allocate(frame_bytes);
+        const GuestAddr back_pixels = heap_.allocate(frame_bytes);
+        if (!surface_config || !surface || !front || !back || !front_pixels || !back_pixels ||
+            !classic::initialize_game_config(memory_, surface_config) ||
+            !classic::initialize_surface_config(memory_, surface, surface_config) ||
+            !memory_.write<u8>(front + 8, 2) || !memory_.write<u8>(back + 8, 2) ||
+            !memory_.write<u32>(front + 0x24, front_pixels) ||
+            !memory_.write<u32>(back + 0x24, back_pixels) ||
+            !memory_.write<u32>(surface + 0x7c, front) ||
+            !memory_.write<u32>(surface + 0x80, back) ||
+            !memory_.write<u32>(surface + 0x68, back_pixels)) {
+            fail(error, "failed to create provisional Classic game surface");
+            return false;
+        }
+        classic_graphics_->set_surface_handles(surface, surface);
+        classic_graphics_->bind_draw_surface({back_pixels, frame_bytes, 320, 5,
+                                               {0, 0, 320, 240}});
+        CLICKHLE_WARN(kCategory) << "Classic game surface uses provisional guest addresses; presentation is incomplete";
+    }
     if (videocore_) {
         // Every firmware export can be dispatched without a host GL handler.
         // Execution may still stop at an unsupported firmware dependency.
@@ -588,8 +661,9 @@ bool Emulator::bind_imports(std::string* error) {
         // Ordinals from another framework version cannot be dispatched to
         // the Platform 1 registry. Keep the thunk so the image loads, but
         // stop on its first call until that ABI has been established.
-        const HleFunction* function = import.compatible_abi
-            ? registry_.resolve(import) : nullptr;
+        const bool compatible = supports_framework_abi(image_->platform_id(),
+            import.module, import.abi_hash, import.abi_count);
+        const HleFunction* function = compatible ? registry_.resolve(import) : nullptr;
         const auto thunk = thunks_.bind(import.key(), function, memory_);
         if (!thunk.has_value()) {
             fail(error, "failed to bind thunk for " + import.key());
@@ -642,6 +716,15 @@ bool Emulator::on_svc(u32 immediate) {
     ++hle_calls_;
     ++call_counts_[entry->import_key];
 
+    // Approximate the 7G audio worker at guest API boundaries. The firmware
+    // schedules it asynchronously; exact timing is not yet established.
+    if (classic_graphics_) {
+        classic_audio_.service(&heap_);
+        // Platform 3 audio output is temporarily stubbed while graphics work
+        // continues. Drain selections without decoding or opening a device.
+        (void)classic_audio_.take_pending_playback();
+    }
+
     if (entry->function == nullptr) {
         ++hle_missing_calls_;
         last_missing_import_ = entry->import_key;
@@ -658,7 +741,7 @@ bool Emulator::on_svc(u32 immediate) {
     call_history_next_ = (call_history_next_ + 1) % kCallHistory;
 
     std::optional<VideoCoreEvent> videocore_event;
-    if (videocore_trace_enabled_ &&
+    if (videocore_ && videocore_trace_enabled_ &&
         (is_videocore_boundary_call(*entry->function) ||
          (videocore_ && entry->function->module == "OpenGLES" && entry->function->has_ordinal))) {
         VideoCoreEvent event;
@@ -859,6 +942,11 @@ bool Emulator::block_thread(u32 milliseconds) {
     return true;
 }
 
+void Emulator::stop_with_error(std::string message) {
+    last_guest_call_failure_ = std::move(message);
+    if (cpu_) cpu_->request_stop();
+}
+
 void Emulator::exit_current_thread() {
     if (cpu_ == nullptr) {
         return;
@@ -902,6 +990,7 @@ bool take(const std::vector<std::byte>& in, std::size_t& at, T& value) {
 
 std::string Emulator::save_state(const std::filesystem::path& path) {
     if (videocore_) return "Save states are not supported by the experimental VC2 backend";
+    if (classic_graphics_) return "Save states are not supported by the experimental Classic graphics backend";
     if (cpu_ == nullptr) {
         return "nothing loaded";
     }
@@ -973,6 +1062,7 @@ std::string Emulator::save_state(const std::filesystem::path& path) {
 
 std::string Emulator::load_state(const std::filesystem::path& path) {
     if (videocore_) return "Save states are not supported by the experimental VC2 backend";
+    if (classic_graphics_) return "Save states are not supported by the experimental Classic graphics backend";
     if (cpu_ == nullptr) {
         return "nothing loaded";
     }
@@ -1369,6 +1459,14 @@ RunResult Emulator::run_game(u64 max_instructions) {
         (void)memory_.write<u32>(app_block + 0x2c,
                                  io_head == kNullGuest ? 0u : io_head);
 
+        // 7G frame driver 0x0828ae78 calls 0x082c6608 with app+0x38.
+        // That helper copies the current draw surface's pixel pointer.
+        if (image_->platform_id() == 3 && classic_graphics_ &&
+            classic_graphics_->draw_surface()) {
+            (void)memory_.write<u32>(app_block + 0x38,
+                                     classic_graphics_->draw_surface()->pixels);
+        }
+
         // app[0x00] -- the per-frame reason code, written immediately before
         // every vec4 by the firmware's frame driver:
         //
@@ -1732,7 +1830,14 @@ Emulator::Coverage Emulator::coverage() const {
         if (!seen.insert(key).second) {
             continue;
         }
-        if (import.compatible_abi && registry_.resolve(import) != nullptr) {
+        // Platform 3's audio handlers are temporary silent stubs. They remain
+        // callable for graphics testing but do not establish API coverage.
+        const bool silent_classic_audio = image_->platform_id() != 1 &&
+            (import.module == "Audio" || import.module == "SoundEffect");
+        if (!silent_classic_audio &&
+            supports_framework_abi(image_->platform_id(), import.module,
+                                   import.abi_hash, import.abi_count) &&
+            registry_.resolve(import) != nullptr) {
             ++result.implemented;
         } else {
             missing.insert(key);

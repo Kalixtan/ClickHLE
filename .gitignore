@@ -73,4 +73,4 @@ __pycache__/
 *.pyc
 
 # Locally archived VC2 firmware programs, compiled as immutable byte arrays
-/src/video/vc2/program_data.inc
+/src/video/platform1/vc2/program_data.inc

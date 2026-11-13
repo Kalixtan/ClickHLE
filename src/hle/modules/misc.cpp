@@ -27,11 +27,6 @@
 #include "clickhle/hle/registry.h"
 
 namespace clickhle {
-namespace {
-
-constexpr std::string_view kCategory = "misc";
-constexpr const char* kModule = "miscTBD";
-
 u32 host_battery_percent() {
     if (const char* configured = std::getenv("CLICKHLE_BATTERY_PERCENT")) {
         char* end = nullptr;
@@ -53,12 +48,10 @@ u32 host_battery_percent() {
     return 100;
 }
 
-
-
-
-}  // namespace
-
 namespace {
+
+constexpr std::string_view kCategory = "misc";
+constexpr const char* kModule = "miscTBD";
 
 /// Variadic arguments as the ARM procedure standard passes them: r1, r2, r3,
 /// then the stack.

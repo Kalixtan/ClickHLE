@@ -19,7 +19,8 @@ void register_all_modules(HleRegistry& registry) {
 
 void gles_statistics(Emulator& emulator, u64& frames, u64& draws) {
     auto* vc = emulator.videocore();
-    frames = vc ? vc->frames() : 0;
+    const auto* classic = emulator.classic_graphics();
+    frames = vc ? vc->frames() : classic ? classic->frames() : 0;
     draws = vc ? vc->draws() : 0;
 }
 

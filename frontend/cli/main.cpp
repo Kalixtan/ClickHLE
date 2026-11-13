@@ -21,6 +21,7 @@
 #include "clickhle/core/emulator.h"
 #include "clickhle/hle/modules.h"
 #include "clickhle/hle/registry.h"
+#include "clickhle/loader/framework_abi.h"
 #if CLICKHLE_HAVE_INSTALLER
 #include "clickhle/installer/package.h"
 #endif
@@ -62,6 +63,7 @@ struct Options {
     bool plan = false;
     bool headless = false;
     bool capture_videocore = false;
+    bool videocore_engine_specified = false;
     clickhle::VideoCoreEngine videocore_engine =
         clickhle::videocore_jit_available() ? clickhle::VideoCoreEngine::G5
                                            : clickhle::VideoCoreEngine::Interpreter;
@@ -387,6 +389,7 @@ bool parse_options(int argc, char** argv, Options& options) {
                 return false;
             }
         } else if (arg == "--vc2-engine") {
+            options.videocore_engine_specified = true;
             const std::string value = value_for("--vc2-engine");
             if (value == "jit") {
                 options.videocore_engine = clickhle::VideoCoreEngine::Jit;
@@ -786,7 +789,9 @@ void print_image_report(const clickhle::EappImage& image) {
         std::cout << "      " << std::left << std::setw(32) << block.name
                   << std::right << std::setw(4) << block.count
                   << "  table 0x" << std::hex << block.import_table << std::dec
-                  << (block.count && !block.compatible_abi ? "  (ABI unbound)" : "")
+                  << (block.count && !clickhle::supports_framework_abi(
+                         image.platform_id(), block.name, block.hash, block.count)
+                      ? "  (ABI unbound)" : "")
                   << "\n";
     }
 }
@@ -895,11 +900,6 @@ int main(int argc, char** argv) {
         return 2;
     }
     config.capture_videocore = options.capture_videocore;
-    if (options.videocore_engine != clickhle::VideoCoreEngine::Interpreter &&
-        !clickhle::videocore_jit_available()) {
-        std::cerr << "VC2 JIT is unavailable in this build\n";
-        return 2;
-    }
     config.videocore_engine = options.videocore_engine;
     config.cpu_backend = options.cpu_backend;
     if (options.clock_hz != 0) {
@@ -999,6 +999,21 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << error << "\n";
         return 1;
     }
+    if (emulator.platform_id() == 1 &&
+        options.videocore_engine != clickhle::VideoCoreEngine::Interpreter &&
+        !clickhle::videocore_jit_available()) {
+        std::cerr << "VC2 JIT is unavailable in this build\n";
+        return 2;
+    }
+    if (emulator.platform_id() == 3) {
+        std::cerr << "Warning: Platform 3 support is extremely preliminary; most APIs and graphics are not implemented.\n";
+    } else if (emulator.platform_id() != 1) {
+        std::cerr << "Warning: Platform " << emulator.platform_id()
+                  << " has no verified platform-specific APIs; the experimental Platform 3 path is used as a placeholder.\n";
+    }
+    if (emulator.platform_id() != 1 &&
+        (options.videocore_engine_specified || options.capture_videocore))
+        std::cerr << "Warning: VideoCore options apply only to Platform 1 and are ignored.\n";
     if (!options.replay_file.empty())
         emulator.set_replay(std::move(replay_entries));
 

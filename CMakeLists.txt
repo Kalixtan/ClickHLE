@@ -82,6 +82,11 @@ add_library(clickhle_core
     src/hle/vfs.cpp
     src/hle/scheduler.cpp
     src/hle/modules.cpp
+    src/hle/platform3/modules.cpp
+    src/hle/platform3/memory.cpp
+    src/hle/platform3/memory_api.cpp
+    src/hle/platform3/heap.cpp
+    src/hle/platform3/graphics.cpp
     src/hle/modules/misc.cpp
     src/hle/modules/input.cpp
     src/hle/modules/input_replay.cpp
@@ -91,23 +96,29 @@ add_library(clickhle_core
     src/hle/modules/metadata.cpp
     src/audio/audio_device.cpp
     src/audio/audio_decoder.cpp
-    src/video/videocore.cpp
-    src/video/graphics_api.cpp
-    src/video/g5/api.cpp
-    src/video/g5/firmware.cpp
-    src/video/graphics_state.cpp
-    src/video/graphics_buffers.cpp
-    src/video/graphics_readback.cpp
-    src/video/graphics_overlay.cpp
-    src/video/graphics_uniforms.cpp
-    src/video/graphics_math.cpp
-    src/video/graphics_draw.cpp
-    src/video/graphics_programs.cpp
-    src/video/vc2/core.cpp
-    src/video/vc2/worker.cpp
-    src/video/vc2/bus.cpp
-    src/video/vc2/vector.cpp
-    src/video/vc2/png.cpp
+    src/video/platform3/compositor.cpp
+    src/video/platform3/graphics.cpp
+    src/video/platform3/rotation.cpp
+    src/video/platform3/clear.cpp
+    src/video/platform3/pixel.cpp
+    src/video/platform3/surface.cpp
+    src/video/platform1/videocore.cpp
+    src/video/platform1/graphics_api.cpp
+    src/video/platform1/g5/api.cpp
+    src/video/platform1/g5/firmware.cpp
+    src/video/platform1/graphics_state.cpp
+    src/video/platform1/graphics_buffers.cpp
+    src/video/platform1/graphics_readback.cpp
+    src/video/platform1/graphics_overlay.cpp
+    src/video/platform1/graphics_uniforms.cpp
+    src/video/platform1/graphics_math.cpp
+    src/video/platform1/graphics_draw.cpp
+    src/video/platform1/graphics_programs.cpp
+    src/video/platform1/vc2/core.cpp
+    src/video/platform1/vc2/worker.cpp
+    src/video/platform1/vc2/bus.cpp
+    src/video/platform1/vc2/vector.cpp
+    src/video/platform1/vc2/png.cpp
     src/video/display.cpp
 )
 
@@ -120,24 +131,71 @@ target_link_libraries(clickhle_core PRIVATE Threads::Threads)
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(clickhle_classic_memory_test tests/classic_memory_test.cpp
+        src/hle/platform3/memory.cpp)
+    target_include_directories(clickhle_classic_memory_test PRIVATE include)
+    target_link_libraries(clickhle_classic_memory_test PRIVATE clickhle_flags)
+    add_test(NAME classic_memory COMMAND clickhle_classic_memory_test)
+
+    add_executable(clickhle_classic_heap_test tests/classic_heap_test.cpp
+        src/hle/platform3/heap.cpp src/core/address_space.cpp src/common/log.cpp)
+    target_include_directories(clickhle_classic_heap_test PRIVATE include)
+    target_link_libraries(clickhle_classic_heap_test PRIVATE clickhle_flags)
+    add_test(NAME classic_heap COMMAND clickhle_classic_heap_test)
+
+    add_executable(clickhle_classic_audio_test tests/classic_audio_test.cpp
+        src/hle/guest_heap.cpp src/common/log.cpp)
+    target_include_directories(clickhle_classic_audio_test PRIVATE include)
+    target_link_libraries(clickhle_classic_audio_test PRIVATE clickhle_flags)
+    add_test(NAME classic_audio COMMAND clickhle_classic_audio_test)
+    add_executable(clickhle_classic_compositor_test tests/classic_compositor_test.cpp
+                   src/video/platform3/compositor.cpp)
+    target_include_directories(clickhle_classic_compositor_test PRIVATE include src/video/platform3)
+    target_link_libraries(clickhle_classic_compositor_test PRIVATE clickhle_flags)
+    add_test(NAME classic_compositor COMMAND clickhle_classic_compositor_test)
+    add_executable(clickhle_classic_graphics_test tests/classic_graphics_test.cpp
+                   src/video/platform3/graphics.cpp src/video/platform3/rotation.cpp)
+    target_include_directories(clickhle_classic_graphics_test PRIVATE include)
+    target_link_libraries(clickhle_classic_graphics_test PRIVATE clickhle_flags)
+    add_test(NAME classic_graphics COMMAND clickhle_classic_graphics_test)
+    add_executable(clickhle_classic_graphics_api_test tests/classic_graphics_api_test.cpp)
+    target_link_libraries(clickhle_classic_graphics_api_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME classic_graphics_api COMMAND clickhle_classic_graphics_api_test)
+    add_executable(clickhle_classic_clear_test tests/classic_clear_test.cpp)
+    target_link_libraries(clickhle_classic_clear_test PRIVATE clickhle_core clickhle_flags)
+    add_test(NAME classic_clear COMMAND clickhle_classic_clear_test)
+    add_executable(clickhle_classic_pixel_test tests/classic_pixel_test.cpp
+                   src/video/platform3/pixel.cpp)
+    target_include_directories(clickhle_classic_pixel_test PRIVATE include)
+    target_link_libraries(clickhle_classic_pixel_test PRIVATE clickhle_flags)
+    add_test(NAME classic_pixel COMMAND clickhle_classic_pixel_test)
+    add_executable(clickhle_classic_surface_test tests/classic_surface_test.cpp
+                   src/video/platform3/surface.cpp src/core/address_space.cpp src/common/log.cpp)
+    target_include_directories(clickhle_classic_surface_test PRIVATE include)
+    target_link_libraries(clickhle_classic_surface_test PRIVATE clickhle_flags)
+    add_test(NAME classic_surface COMMAND clickhle_classic_surface_test)
+    add_executable(clickhle_platform_abi_test tests/platform_abi_test.cpp src/loader/framework_abi.cpp)
+    target_include_directories(clickhle_platform_abi_test PRIVATE include)
+    target_link_libraries(clickhle_platform_abi_test PRIVATE clickhle_flags)
+    add_test(NAME platform_abi COMMAND clickhle_platform_abi_test)
     add_executable(clickhle_graphics_queue_test tests/graphics_queue_test.cpp)
-    target_include_directories(clickhle_graphics_queue_test PRIVATE include src/video)
+    target_include_directories(clickhle_graphics_queue_test PRIVATE include src/video/platform1)
     target_link_libraries(clickhle_graphics_queue_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME graphics_queue COMMAND clickhle_graphics_queue_test)
     add_executable(clickhle_vc2_worker_test tests/vc2_worker_test.cpp)
-    target_include_directories(clickhle_vc2_worker_test PRIVATE src/video/vc2)
+    target_include_directories(clickhle_vc2_worker_test PRIVATE src/video/platform1/vc2)
     target_link_libraries(clickhle_vc2_worker_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME vc2_worker COMMAND clickhle_vc2_worker_test)
     add_executable(clickhle_g5_firmware_test tests/g5_firmware_test.cpp)
-    target_include_directories(clickhle_g5_firmware_test PRIVATE include src/video/vc2)
+    target_include_directories(clickhle_g5_firmware_test PRIVATE include src/video/platform1/vc2 src/video/platform1/vc2/jit)
     target_link_libraries(clickhle_g5_firmware_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME g5_firmware COMMAND clickhle_g5_firmware_test)
     add_executable(clickhle_vc2_state_test tests/vc2_state_test.cpp)
-    target_include_directories(clickhle_vc2_state_test PRIVATE include src/video/vc2)
+    target_include_directories(clickhle_vc2_state_test PRIVATE include src/video/platform1/vc2 src/video/platform1/vc2/jit)
     target_link_libraries(clickhle_vc2_state_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME vc2_state COMMAND clickhle_vc2_state_test)
     add_executable(clickhle_g5_api_test tests/g5_api_test.cpp)
-    target_include_directories(clickhle_g5_api_test PRIVATE include src/video)
+    target_include_directories(clickhle_g5_api_test PRIVATE include src/video/platform1)
     target_link_libraries(clickhle_g5_api_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME g5_api COMMAND clickhle_g5_api_test)
     add_executable(clickhle_guest_heap_test tests/guest_heap_test.cpp)
@@ -147,11 +205,11 @@ if(BUILD_TESTING)
     add_executable(clickhle_vc2_compact_predicate_test
         tests/vc2_compact_predicate_test.cpp)
     target_include_directories(clickhle_vc2_compact_predicate_test PRIVATE
-        include src/video/vc2)
+        include src/video/platform1/vc2 src/video/platform1/vc2/jit)
     target_link_libraries(clickhle_vc2_compact_predicate_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME vc2_compact_predicate COMMAND clickhle_vc2_compact_predicate_test)
     add_executable(clickhle_vc2_alpha_clamp_test tests/vc2_alpha_clamp_test.cpp)
-    target_include_directories(clickhle_vc2_alpha_clamp_test PRIVATE include src/video/vc2)
+    target_include_directories(clickhle_vc2_alpha_clamp_test PRIVATE include src/video/platform1/vc2 src/video/platform1/vc2/jit)
     target_link_libraries(clickhle_vc2_alpha_clamp_test PRIVATE clickhle_core clickhle_flags)
     add_test(NAME vc2_alpha_clamp COMMAND clickhle_vc2_alpha_clamp_test)
     add_executable(clickhle_storage_paths_test
@@ -186,21 +244,21 @@ option(CLICKHLE_WITH_VC2_JIT "Build the optional VC2 JIT backend" ON)
 if(CLICKHLE_WITH_VC2_JIT)
     find_package(LLVM 16 QUIET CONFIG)
     if(LLVM_FOUND AND TARGET LLVM)
-        target_sources(clickhle_core PRIVATE src/video/vc2/jit.cpp src/video/vc2/jit_cache.cpp)
+        target_sources(clickhle_core PRIVATE src/video/platform1/vc2/jit/jit.cpp src/video/platform1/vc2/jit/jit_cache.cpp)
         target_include_directories(clickhle_core SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
         target_link_libraries(clickhle_core PRIVATE LLVM)
         target_compile_definitions(clickhle_core PRIVATE CLICKHLE_HAVE_VC2_JIT=1)
         if(BUILD_TESTING)
             add_executable(clickhle_vc2_jit_cache_test tests/vc2_jit_cache_test.cpp)
-            target_include_directories(clickhle_vc2_jit_cache_test PRIVATE include src/video/vc2)
+            target_include_directories(clickhle_vc2_jit_cache_test PRIVATE include src/video/platform1/vc2 src/video/platform1/vc2/jit)
             target_link_libraries(clickhle_vc2_jit_cache_test PRIVATE clickhle_core clickhle_flags)
             add_test(NAME vc2_jit_cache COMMAND clickhle_vc2_jit_cache_test)
             add_executable(clickhle_vc2_jit_filtered_byte_test tests/vc2_jit_filtered_byte_test.cpp)
-            target_include_directories(clickhle_vc2_jit_filtered_byte_test PRIVATE include src/video/vc2)
+            target_include_directories(clickhle_vc2_jit_filtered_byte_test PRIVATE include src/video/platform1/vc2 src/video/platform1/vc2/jit)
             target_link_libraries(clickhle_vc2_jit_filtered_byte_test PRIVATE clickhle_core clickhle_flags)
             add_test(NAME vc2_jit_filtered_byte COMMAND clickhle_vc2_jit_filtered_byte_test)
             add_executable(clickhle_vc2_jit_vertical_add_test tests/vc2_jit_vertical_add_test.cpp)
-            target_include_directories(clickhle_vc2_jit_vertical_add_test PRIVATE include src/video/vc2)
+            target_include_directories(clickhle_vc2_jit_vertical_add_test PRIVATE include src/video/platform1/vc2 src/video/platform1/vc2/jit)
             target_link_libraries(clickhle_vc2_jit_vertical_add_test PRIVATE clickhle_core clickhle_flags)
             add_test(NAME vc2_jit_vertical_add COMMAND clickhle_vc2_jit_vertical_add_test)
         endif()

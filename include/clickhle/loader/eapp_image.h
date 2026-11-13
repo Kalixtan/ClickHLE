@@ -125,7 +125,9 @@ struct GuestImport {
     std::string name;           ///< Empty when imported by ordinal alone.
     u32 ordinal = 0;
     bool by_ordinal = true;
-    bool compatible_abi = false; ///< Safe to bind against the current HLE registry.
+    bool compatible_abi = false; ///< Matches a known Platform 1 framework.
+    std::string abi_hash;
+    u32 abi_count = 0;
     GuestAddr slot_address = 0; ///< Pointer-table word this import resolves to.
 
     /// "OpenGLES#42" -- a stable key for registry lookups and coverage

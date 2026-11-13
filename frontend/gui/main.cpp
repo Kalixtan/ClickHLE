@@ -437,7 +437,7 @@ private:
 
         connect(refresh, &QPushButton::clicked, this, [this] { refreshGameLibrary(); });
         connect(platform_selector_, &QComboBox::currentIndexChanged, this,
-                [this] { populateGameLibrary(); });
+                [this] { populateGameLibrary(); updateActions(); });
         connect(library_search_, &QLineEdit::textChanged, this,
                 [this] { populateGameLibrary(); });
         connect(library_table_, &QTableWidget::cellDoubleClicked, this,
@@ -905,6 +905,13 @@ private:
         videocore_detail_->clear();
         current_game_ = path;
         current_platform_id_ = emulator_->platform_id();
+        if (current_platform_id_ == 3) {
+            QMessageBox::warning(this, tr("Preliminary Platform Support"),
+                tr("Platform 3 support is extremely preliminary. Most APIs and graphics are not implemented, and games may stop or display nothing."));
+        } else if (current_platform_id_ != 1) {
+            QMessageBox::warning(this, tr("Unsupported Platform"),
+                tr("Platform %1 has no verified platform-specific APIs. The experimental Platform 3 API is used as a placeholder, and games are unlikely to work.").arg(current_platform_id_));
+        }
         central_stack_->setCurrentWidget(canvas_);
         addRecent(path);
         canvas_->setFrame({});
@@ -1249,6 +1256,14 @@ private:
 
     void updateActions() {
         const bool loaded = static_cast<bool>(emulator_);
+        const u32 selected_platform = loaded ? current_platform_id_
+            : (platform_selector_ ? platform_selector_->currentData().toUInt() : 1);
+        const bool vc2 = selected_platform == 0 || selected_platform == 1;
+        interpreter_action_->setEnabled(vc2);
+        jit_action_->setEnabled(vc2 && clickhle::videocore_jit_available());
+        g5_action_->setEnabled(vc2 && clickhle::videocore_jit_available());
+        videocore_dock_->toggleViewAction()->setEnabled(vc2);
+        if (!vc2) videocore_dock_->hide();
         open_action_->setEnabled(true);
         close_action_->setEnabled(loaded);
         screenshot_action_->setEnabled(loaded && !canvas_->frame().isNull());

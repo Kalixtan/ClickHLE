@@ -13,8 +13,10 @@
 
 #include "clickhle/core/address_space.h"
 #include "clickhle/audio/audio_device.h"
+#include "clickhle/audio/classic_audio.h"
 #include "clickhle/core/cpu.h"
 #include "clickhle/hle/guest_heap.h"
+#include "clickhle/hle/classic_memory.h"
 #include "clickhle/hle/registry.h"
 #include "clickhle/hle/scheduler.h"
 #include "clickhle/hle/vfs.h"
@@ -22,6 +24,8 @@
 #include "clickhle/loader/eapp_image.h"
 #include "clickhle/loader/music_database.h"
 #include "clickhle/video/display.h"
+#include "clickhle/video/classic_compositor.h"
+#include "clickhle/video/classic_graphics.h"
 #include "clickhle/video/videocore.h"
 
 namespace clickhle {
@@ -36,8 +40,17 @@ public:
     struct DeviceSettings {
         // Unset values retain the CLI environment overrides and defaults.
         std::optional<u32> language;
+        std::optional<u32> display_level;
         std::optional<bool> time_format_24;
         bool hold_switch = false;
+        // Unconnected 7G power-service inputs; their hardware mapping and
+        // persistence have not yet been modeled.
+        bool power_input_a = false;
+        bool power_input_b = false;
+        i32 power_mode = 0;
+        bool power_status_inhibited = false;
+        u8 backlight_dim_state = 0;
+        std::optional<u32> applied_backlight_level;
     };
 
     DeviceSettings& device_settings() noexcept { return device_settings_; }
@@ -320,6 +333,8 @@ public:
     };
 
     Emulator() = default;
+    // Stop a guest call with a diagnostic that survives callback unwinding.
+    void stop_with_error(std::string message);
     Emulator(const Emulator&) = delete;
     Emulator& operator=(const Emulator&) = delete;
 
@@ -511,6 +526,9 @@ public:
     [[nodiscard]] std::string load_state(const std::filesystem::path& path);
     [[nodiscard]] Display& display() noexcept { return *display_; }
     [[nodiscard]] VideoCore* videocore() noexcept { return videocore_.get(); }
+    [[nodiscard]] classic::Compositor* classic_compositor() noexcept { return classic_compositor_.get(); }
+    [[nodiscard]] classic::GraphicsContext* classic_graphics() noexcept { return classic_graphics_.get(); }
+    [[nodiscard]] classic::AudioService& classic_audio() noexcept { return classic_audio_; }
     void set_videocore_engine(VideoCoreEngine engine);
 
     /// Host audio output.
@@ -675,6 +693,8 @@ private:
     HleRegistry registry_;
     ThunkTable thunks_;
     GuestHeap heap_;
+    std::unique_ptr<classic::RegionHeap> classic_heap_;
+    std::unique_ptr<classic::Arena> classic_arena_;
     MetadataState metadata_state_;
     AudioState audio_state_;
     InputState input_state_;
@@ -687,6 +707,9 @@ private:
     GuestAddr current_thunk_ = 0;
     unsigned call_depth_ = 0;
     std::unique_ptr<VideoCore> videocore_;
+    std::unique_ptr<classic::Compositor> classic_compositor_;
+    std::unique_ptr<classic::GraphicsContext> classic_graphics_;
+    classic::AudioService classic_audio_;
     std::unique_ptr<Display> display_ = Display::create();
     std::unique_ptr<AudioDevice> audio_;
     std::string audio_error_;

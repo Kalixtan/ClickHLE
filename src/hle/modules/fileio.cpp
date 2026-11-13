@@ -303,6 +303,77 @@ void register_fileio(HleRegistry& registry) {
     // contract and this is what advances it.
     registry.add(kModule, 2, "afio_read", 1, [](HleCallFrame& f) {
         const GuestAddr req = f.args.next_ptr();
+        if (f.emulator.platform_id() == 3) {
+            // 7G: 0x081e3a64 validates the request, 0x081e4114 reads it.
+            const auto operation = f.memory.read<u8>(req + 0x10);
+            const auto handle = f.memory.read<u32>(req + 0x34);
+            if (!operation || !handle) { f.cpu.request_stop(); return; }
+            if (*operation != 3 && *operation != 4 && *operation != 5) {
+                f.ret(0);
+                return;
+            }
+            if (*handle == 0 || *handle == kFailure) { f.ret(0); return; }
+            if (*operation == 5) {
+                // 0x081e4158 passes a sign-extended offset and whence to
+                // 0x0826d8e0, which rejects invalid origins and positions.
+                const auto offset = f.memory.read<u32>(req + 0x18);
+                const auto whence = f.memory.read<u8>(req + 0x1c);
+                if (!offset || !whence) { f.cpu.request_stop(); return; }
+                Vfs& vfs = f.emulator.vfs();
+                const i64 size = vfs.size(*handle);
+                if (size < 0) { f.cpu.request_stop(); return; }
+                u32 status = 0;
+                i64 target = static_cast<i32>(*offset);
+                if (*whence == 1) target += vfs.tell(*handle);
+                else if (*whence == 2) target += size;
+                else if (*whence != 0) status = 6;
+                if (!status && (target < 0 || target > size)) status = 5;
+                if (!status && !vfs.seek(*handle, target)) {
+                    f.cpu.request_stop();
+                    return;
+                }
+                if (!store_guest_or_stop(f, req + 0x28, status)) return;
+                f.emulator.queue_io_completion(req, "");
+                f.ret(1);
+                return;
+            }
+            if (*operation != 3) {
+                CLICKHLE_ERROR(kCategory) << "7G async write is not implemented";
+                f.cpu.request_stop();
+                return;
+            }
+            const auto buffer = f.memory.read<u32>(req + 0x20);
+            const auto length = f.memory.read<u32>(req + 0x24);
+            if (!buffer || !length || (*length && !*buffer)) {
+                f.cpu.request_stop();
+                return;
+            }
+            Vfs& vfs = f.emulator.vfs();
+            const i64 position = vfs.tell(*handle);
+            const i64 size = vfs.size(*handle);
+            if (position < 0 || size < 0) { f.cpu.request_stop(); return; }
+            // 0x0826d5fc reports 5 for a nonempty read beginning at EOF.
+            if (*length && position == size) {
+                if (!store_guest_or_stop(f, req + 0x2c, 0u) ||
+                    !store_guest_or_stop(f, req + 0x28, 5u)) return;
+                f.emulator.queue_io_completion(req, "");
+                f.ret(1);
+                return;
+            }
+            std::vector<u8> bytes(*length);
+            const i64 loaded = vfs.read(*handle, bytes.data(), *length);
+            if (loaded < 0 || (loaded && !f.memory.write_bytes(
+                    *buffer, bytes.data(), static_cast<u32>(loaded)))) {
+                CLICKHLE_ERROR(kCategory) << "7G async read failed";
+                f.cpu.request_stop();
+                return;
+            }
+            if (!store_guest_or_stop(f, req + 0x2c, static_cast<u32>(loaded)) ||
+                !store_guest_or_stop(f, req + 0x28, 0u)) return;
+            f.emulator.queue_io_completion(req, "");
+            f.ret(1);
+            return;
+        }
         const auto operation = f.memory.read<u8>(req + request::kOperation);
         if (!operation.has_value()) {
             f.cpu.request_stop();
@@ -558,6 +629,21 @@ void register_fileio(HleRegistry& registry) {
 
     registry.add(kModule, 1, "afio_close", 1, [](HleCallFrame& f) {
         const GuestAddr req = f.args.next_ptr();
+        if (f.emulator.platform_id() == 3) {
+            // 0x081e3714 validates the request; 0x081e41b0 closes it.
+            const auto operation = f.memory.read<u8>(req + 0x10);
+            const auto handle = f.memory.read<u32>(req + 0x34);
+            if (!operation || !handle) { f.cpu.request_stop(); return; }
+            if (*operation != 2 || *handle == 0 || *handle == kFailure ||
+                !f.emulator.vfs().close(*handle)) {
+                f.ret(0);
+                return;
+            }
+            if (!store_guest_or_stop(f, req + 0x28, 0u)) return;
+            f.emulator.queue_io_completion(req, "");
+            f.ret(1);
+            return;
+        }
         const auto operation = f.memory.read<u8>(req + request::kOperation);
         if (!operation.has_value()) {
             f.cpu.request_stop();
@@ -718,6 +804,45 @@ void register_fileio(HleRegistry& registry) {
         const GuestAddr path_address = f.args.next_ptr();
         const u32 flag = f.args.next_u32() & 0xffu;
         const GuestAddr req = f.args.next_ptr();
+        if (f.emulator.platform_id() == 3) {
+            // 7G worker 0x081e4078 uses a different request layout from 5G.
+            const auto operation = f.memory.read<u8>(req + 0x10);
+            if (!operation) { f.cpu.request_stop(); return; }
+            if (*operation != 1 || path_address == 0 ||
+                ((mode == 0 || mode == 4) && flag == 0)) {
+                f.ret(0);
+                return;
+            }
+            const auto path = read_path_strict(f, path_address);
+            const auto name_space = file_namespace(mode);
+            if (!path || !name_space) { f.cpu.request_stop(); return; }
+            Vfs& vfs = f.emulator.vfs();
+            const u32 handle = vfs.open(*path, open_mode(*name_space), true,
+                                        *name_space);
+            if (!handle) {
+                // The 7G filesystem's error mapping is not yet established.
+                CLICKHLE_ERROR(kCategory) << "7G open failed: " << *path;
+                f.emulator.stop_with_error("7G file-open error is not yet modeled: " + *path);
+                return;
+            }
+            const i64 size = vfs.size(handle);
+            if (size < 0 || static_cast<u64>(size) > 0xffffffffu) {
+                f.cpu.request_stop();
+                return;
+            }
+            const auto object = f.memory.read<u32>(req + 0x14);
+            if (!object || !store_guest_or_stop(f, req + 0x34, handle) ||
+                !store_guest_or_stop(f, req + 0x28, 0u) ||
+                !store_guest_or_stop(f, req + 0x30, static_cast<u32>(size)) ||
+                (*object && !store_guest_or_stop(f, *object + 8,
+                                                  static_cast<u32>(size)))) return;
+            CLICKHLE_INFO(kCategory) << "7G open(\"" << *path << "\") -> "
+                                     << size << " bytes";
+            f.emulator.queue_io_completion(req, *path);
+            f.ret(1);
+            return;
+        }
+        dump_request(f, req);
         const auto operation = f.memory.read<u8>(req + request::kOperation);
         if (!operation.has_value()) {
             f.cpu.request_stop();
@@ -725,6 +850,9 @@ void register_fileio(HleRegistry& registry) {
         }
         if (*operation != 1 || path_address == 0 ||
             (mode == 0 && flag == 0)) {
+            CLICKHLE_DEBUG(kCategory) << "open4 rejected: mode=" << mode
+                                     << ", flag=" << flag
+                                     << ", operation=" << unsigned(*operation);
             f.ret(0);
             return;
         }
@@ -734,8 +862,6 @@ void register_fileio(HleRegistry& registry) {
             return;
         }
         const std::string& path = *path_value;
-        dump_request(f, req);
-
         Vfs& vfs = f.emulator.vfs();
         const auto name_space = file_namespace(mode);
         if (!name_space) { f.ret(0); return; }

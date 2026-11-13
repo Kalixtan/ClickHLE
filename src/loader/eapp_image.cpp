@@ -234,6 +234,8 @@ std::optional<EappImage> EappImage::parse(std::span<const std::byte> data,
             import.ordinal = i;
             import.by_ordinal = true;
             import.compatible_abi = block.compatible_abi;
+            import.abi_hash = block.hash;
+            import.abi_count = block.count;
             import.slot_address = block.import_table + 4u * i;
             image.imports_.push_back(std::move(import));
         }

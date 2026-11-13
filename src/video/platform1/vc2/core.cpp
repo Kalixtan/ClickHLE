@@ -1,7 +1,7 @@
 
 #include "core.h"
 #if defined(CLICKHLE_HAVE_VC2_JIT) && CLICKHLE_HAVE_VC2_JIT
-#include "jit.h"
+#include "jit/jit.h"
 #endif
 #include <algorithm>
 #include <bit>

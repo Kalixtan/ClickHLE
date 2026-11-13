@@ -13,6 +13,10 @@ enum class Button;
 
 class HleRegistry;
 struct HleCallFrame;
+namespace classic { class Arena; }
+
+void register_classic_memory(HleRegistry& registry, classic::Arena& arena,
+                             u16 thread_id);
 
 /// HLE modules register themselves through explicit calls rather than static
 /// constructors. Static self-registration across translation units depends on
@@ -23,6 +27,7 @@ struct HleCallFrame;
 
 /// Apple's "miscTBD", typo and all: 15 ordinals, every game. Holds the heap.
 void register_misc(HleRegistry& registry);
+u32 host_battery_percent();
 
 /// "InputEvents": the click wheel. Two ordinals for the whole input API.
 void register_input(HleRegistry& registry);
@@ -56,6 +61,7 @@ void register_audio(HleRegistry& registry);
 void register_metadata(HleRegistry& registry);
 
 void register_all_modules(HleRegistry& registry);
+void register_classic_modules(HleRegistry& registry);
 
 /// Frames presented and draw calls issued so far. Zero until the renderer is
 /// wired up.

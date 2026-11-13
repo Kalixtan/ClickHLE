@@ -11,4 +11,8 @@ namespace clickhle {
 [[nodiscard]] bool has_compatible_framework_abi(std::string_view name,
                                                 std::string_view hash, u32 count);
 
+// Platforms 2 and 4 currently use the Classic subset as a placeholder.
+[[nodiscard]] bool supports_framework_abi(u32 platform, std::string_view name,
+                                          std::string_view hash, u32 count);
+
 } // namespace clickhle

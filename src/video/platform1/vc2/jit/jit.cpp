@@ -1,7 +1,7 @@
 #include "jit.h"
 #include "jit_cache.h"
 #include "jit_vector.h"
-#include "core.h"
+#include "../core.h"
 
 #include <algorithm>
 #include <array>
