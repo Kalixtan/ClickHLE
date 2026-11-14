@@ -879,7 +879,7 @@ private:
         if (!path.isEmpty()) loadGame(path);
     }
 
-    void loadGame(const QString& path, u32 platform_id = 0) {
+    void loadGame(QString path, u32 platform_id = 0) {
         frame_timer_->stop();
         emulator_.reset();
         current_game_.clear();
