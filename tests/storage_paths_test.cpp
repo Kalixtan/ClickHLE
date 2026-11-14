@@ -1,10 +1,13 @@
 #include "clickhle/core/storage_paths.h"
 #include "clickhle/hle/vfs.h"
+#include "clickhle/loader/music_database.h"
 
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 
 int main() {
@@ -17,10 +20,34 @@ int main() {
     const auto hdd = root / "hdd";
     const auto paths = clickhle::storage_paths_for_game(source, hdd);
     const auto control = hdd / "iPod_Control";
-    bool valid = paths.device_root == hdd &&
+    std::string init_error;
+    bool valid = clickhle::initialize_ipod_hdd(hdd, &init_error) && init_error.empty() &&
+        paths.device_root == hdd &&
         paths.game_data == control / "GameData_RW" / "88908" &&
         paths.game_stats == control / "GameStats_WO" / "88908" &&
-        paths.shared_data == control / "GameData_ShareRW";
+        paths.shared_data == control / "GameData_ShareRW" &&
+        fs::is_directory(control / "Games_RO") &&
+        fs::is_directory(control / "GameData_RW") &&
+        fs::is_directory(control / "GameStats_WO") &&
+        fs::is_directory(control / "GameData_ShareRW") &&
+        fs::is_directory(control / "Music");
+
+    clickhle::MusicDatabase database;
+    std::string database_error;
+    valid = valid && database.load(control / "iTunes" / "iTunesDB", &database_error) &&
+        database.tracks.empty() && database.playlists.empty();
+
+    {
+        std::ofstream existing(control / "iTunes" / "iTunesDB",
+                               std::ios::binary | std::ios::trunc);
+        existing << "keep this device database";
+    }
+    valid = clickhle::initialize_ipod_hdd(hdd, &init_error) && valid;
+    {
+        std::ifstream existing(control / "iTunes" / "iTunesDB", std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(existing)), {});
+        valid = valid && contents == "keep this device database";
+    }
 
     const auto loose = clickhle::storage_paths_for_game(root / "games" / "Demo.bin", hdd);
     valid = valid && loose.game_data == control / "GameData_RW" / "Demo";

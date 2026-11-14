@@ -224,7 +224,7 @@ if(BUILD_TESTING)
     add_test(NAME vc2_alpha_clamp COMMAND clickhle_vc2_alpha_clamp_test)
     add_executable(clickhle_storage_paths_test
         tests/storage_paths_test.cpp src/core/storage_paths.cpp
-        src/hle/vfs.cpp src/common/log.cpp)
+        src/hle/vfs.cpp src/common/log.cpp src/loader/music_database.cpp)
     target_include_directories(clickhle_storage_paths_test PRIVATE include)
     target_link_libraries(clickhle_storage_paths_test PRIVATE clickhle_flags)
     add_test(NAME storage_paths COMMAND clickhle_storage_paths_test)

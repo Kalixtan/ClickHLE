@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace clickhle {
 
@@ -17,5 +18,11 @@ struct StoragePaths {
 [[nodiscard]] StoragePaths storage_paths_for_game(
     const std::filesystem::path& executable,
     const std::filesystem::path& hdd_root);
+
+// Create the empty directory tree expected by the game-facing iPod filesystem.
+// A minimal empty iTunesDB accepted by ClickHLE's reader is created only when
+// the device has no database yet; existing device data is never replaced.
+[[nodiscard]] bool initialize_ipod_hdd(const std::filesystem::path& hdd_root,
+                                       std::string* error = nullptr);
 
 } // namespace clickhle

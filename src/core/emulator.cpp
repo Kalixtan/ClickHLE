@@ -337,6 +337,11 @@ bool Emulator::load(Config config, std::string* error) {
     // Keep the installed title ID even if --content-root changes where assets
     // are read. Save data always belongs on the selected emulated HDD.
     const auto storage = storage_paths_for_game(config_.executable, config_.hdd_root);
+    std::string hdd_error;
+    if (!initialize_ipod_hdd(storage.device_root, &hdd_error)) {
+        fail(error, "cannot initialize the emulated iPod drive: " + hdd_error);
+        return false;
+    }
     vfs_.set_device_root(storage.device_root);
     if (!vfs_.device_root().empty()) {
         const auto database = vfs_.resolve(

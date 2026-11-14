@@ -59,6 +59,7 @@
 
 #include "clickhle/common/log.h"
 #include "clickhle/core/emulator.h"
+#include "clickhle/core/storage_paths.h"
 #include "clickhle/hle/modules.h"
 #include "clickhle/loader/game_manifest.h"
 #if CLICKHLE_HAVE_INSTALLER
@@ -452,6 +453,13 @@ private:
         const auto app = std::filesystem::path(
             QCoreApplication::applicationDirPath().toStdString());
         hdd_root_ = app / "hdd";
+        std::string hdd_error;
+        if (!clickhle::initialize_ipod_hdd(hdd_root_, &hdd_error)) {
+            const QString message = tr("Could not prepare the iPod drive: %1")
+                                        .arg(QString::fromStdString(hdd_error));
+            statusBar()->showMessage(message);
+            appendLog(message);
+        }
         installed_games_ = clickhle::scan_installed_games(hdd_root_);
         const u32 previous = platform_selector_->currentData().toUInt();
         platform_selector_->blockSignals(true);
