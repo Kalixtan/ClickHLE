@@ -44,6 +44,7 @@
 *.eapp
 *.elf
 *.ipsw
+*.ipg
 *.rom
 *.iso
 *.vll
