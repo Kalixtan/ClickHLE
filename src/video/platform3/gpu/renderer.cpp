@@ -133,6 +133,13 @@ bool GpuRenderer::texture_sub_image(u32 target, i32 level, i32 x, i32 y, i32 wid
 #if CLICKHLE_HAVE_CLASSIC_GPU
     if (eglGetCurrentContext() != impl_->context &&
         !eglMakeCurrent(impl_->display, impl_->surface, impl_->surface, impl_->context)) return false;
+    // Match the storage swizzles selected by texture_image() for GLES 1.x
+    // alpha, luminance, and luminance-alpha images.
+    constexpr u32 red = 0x1903, rg = 0x8227;
+    if (type == 0x1401) {
+        if (format == 0x1906 || format == 0x1909) format = red;
+        else if (format == 0x190a) format = rg;
+    }
     glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
     return glGetError() == GL_NO_ERROR;
 #else
@@ -143,6 +150,7 @@ bool GpuRenderer::texture_sub_image(u32 target, i32 level, i32 x, i32 y, i32 wid
 
 bool GpuRenderer::draw_arrays(u32 mode, i32 first, i32 count, std::span<const float> xy,
                               std::span<const float, 16> matrix, std::span<const float, 4> color,
+                              bool cull_face_enabled,
                               std::span<u8> rgb565, u32 stride_pixels, u32 width, u32 height) {
 #if CLICKHLE_HAVE_CLASSIC_GPU
     if (eglGetCurrentContext() != impl_->context &&
@@ -169,6 +177,7 @@ bool GpuRenderer::draw_arrays(u32 mode, i32 first, i32 count, std::span<const fl
     }
     glBindVertexArray(impl_->vertex_array);
     glBindFramebuffer(GL_FRAMEBUFFER, 0); glViewport(0, 0, 320, 240);
+    if (cull_face_enabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
     glUseProgram(impl_->program); glBindBuffer(GL_ARRAY_BUFFER, impl_->vertex_buffer);
     const GLint transform = glGetUniformLocation(impl_->program, "transform");
     glUniformMatrix4fv(transform, 1, GL_FALSE, matrix.data());
@@ -191,7 +200,7 @@ bool GpuRenderer::draw_arrays(u32 mode, i32 first, i32 count, std::span<const fl
     }
     return true;
 #else
-    (void)mode; (void)first; (void)count; (void)xy; (void)matrix; (void)color; (void)rgb565; (void)stride_pixels; (void)width; (void)height; return false;
+    (void)mode; (void)first; (void)count; (void)xy; (void)matrix; (void)color; (void)cull_face_enabled; (void)rgb565; (void)stride_pixels; (void)width; (void)height; return false;
 #endif
 }
 

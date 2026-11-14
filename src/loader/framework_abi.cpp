@@ -39,6 +39,8 @@ bool supports_framework_abi(u32 platform, std::string_view name,
                             std::string_view hash, u32 count) {
     if (platform == 1) return has_compatible_framework_abi(name, hash, count);
     if (platform < 2 || platform > 4) return false;
+    if (platform == 3 && name == "Metadata" && count == 169 &&
+        hash == "1eeeb60309134d1b77a8c3ca3298fa7b") return true;
     if ((name == "AsyncFileIO" || name == "InputEvents") &&
         has_compatible_framework_abi(name, hash, count)) return true;
     if (name == "OpenGLES" && count == 170 &&

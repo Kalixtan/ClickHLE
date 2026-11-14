@@ -25,8 +25,10 @@ ClearResult clear_bound_surface(GraphicsContext& context, AddressSpace& memory, 
         context.invalid_value();
         return ClearResult::complete;
     }
-    // Depth and stencil clears require their own surface and mask semantics.
-    if ((mask & 0x500u) != 0) return ClearResult::unsupported_buffers;
+    // The current 7G surface model exposes the guest's RGB565 color plane but
+    // does not yet model depth or stencil storage. Those bits must not prevent
+    // a color clear from taking effect; their planes are left untouched.
+    mask &= 0x4000u;
     if ((mask & 0x4000u) == 0) return ClearResult::complete;
     if (surface->format < 4 || surface->format > 7) return ClearResult::unsupported_buffers;
     if (surface->byte_size == 0 || !memory.host_ptr(surface->pixels, surface->byte_size))

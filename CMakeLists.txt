@@ -83,6 +83,7 @@ add_library(clickhle_core
     src/hle/scheduler.cpp
     src/hle/modules.cpp
     src/hle/platform3/modules.cpp
+    src/hle/platform3/metadata.cpp
     src/hle/platform3/memory.cpp
     src/hle/platform3/memory_api.cpp
     src/hle/platform3/heap.cpp

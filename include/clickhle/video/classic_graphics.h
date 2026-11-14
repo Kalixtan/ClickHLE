@@ -58,6 +58,8 @@ public:
     bool multiply_matrix(const std::array<i32, 16>& matrix) noexcept;
     bool load_matrix(const std::array<i32, 16>& matrix) noexcept;
     void set_blend(bool enabled) noexcept { blend_enabled_ = enabled; }
+    void set_cull_face(bool enabled) noexcept { cull_face_enabled_ = enabled; }
+    [[nodiscard]] bool cull_face_enabled() const noexcept { return cull_face_enabled_.value_or(false); }
     void set_blend_factors(u32 source, u32 destination) noexcept;
     void set_vertex_pointer(u32 size, u32 type, u32 stride, GuestAddr pointer) noexcept;
     bool set_texture_pointer(u32 size, u32 type, u32 stride, GuestAddr pointer) noexcept;
@@ -156,6 +158,7 @@ private:
     std::array<std::optional<bool>, 2> texture_matrix_identity_{};
     // Initial enable states remain unverified; populated by API calls.
     std::optional<bool> blend_enabled_;
+    std::optional<bool> cull_face_enabled_;
     std::optional<u8> blend_source_;
     std::optional<u8> blend_destination_;
     // 7G stores the compare enum and reference at context +0x9c9/+0x9cc.

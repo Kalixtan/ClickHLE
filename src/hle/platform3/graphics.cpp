@@ -74,6 +74,7 @@ void register_classic_graphics(HleRegistry& registry) {
             // 0x082492c0 updates the corresponding context byte.
             if (capability == 0x0be2) context->set_blend(enabled);
             else if (capability == 0x0b71) context->set_depth_test(enabled);
+            else if (capability == 0x0b44) context->set_cull_face(enabled);
             else if (capability == 0x0de1) {
                 if (!context->set_texture_enabled(context->active_texture(), enabled))
                     frame.cpu.request_stop();
@@ -445,6 +446,7 @@ void register_classic_gpu_graphics(HleRegistry& registry) {
                 color[i] = static_cast<float>((*context->current_color())[i]) / 65536.0f;
         }
         if (!pixels || !gpu->draw_arrays(mode, 0, count, xy, matrix, color,
+              context->cull_face_enabled(),
               {reinterpret_cast<u8*>(pixels), surface->byte_size}, surface->stride, 320, 240))
             frame.emulator.stop_with_error("Desktop GPU draw failed");
         else context->note_draw();
@@ -509,6 +511,7 @@ void register_classic_gpu_graphics(HleRegistry& registry) {
         }
         auto* pixels = frame.memory.host_ptr(surface->pixels, surface->byte_size);
         if (!pixels || !gpu->draw_arrays(mode, 0, count, xy, matrix, color,
+                context->cull_face_enabled(),
                 {reinterpret_cast<u8*>(pixels), surface->byte_size}, surface->stride, 320, 240))
             frame.emulator.stop_with_error("Desktop GPU indexed draw failed");
         else context->note_draw();

@@ -240,6 +240,9 @@ public:
     struct MetadataState {
         std::vector<bool> music_library_slots;
         std::vector<bool> artwork_library_slots;
+        // Opaque object handles used by the 7G Metadata exports.
+        std::vector<GuestAddr> classic_objects;
+        std::vector<GuestAddr> classic_auxiliary_objects;
         MusicDatabase music_database;
         bool music_database_available = false;
         GuestAddr service_object = 0;

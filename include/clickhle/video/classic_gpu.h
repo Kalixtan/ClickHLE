@@ -23,6 +23,7 @@ public:
     bool texture_parameter(u32 target, u32 parameter, i32 value);
     bool draw_arrays(u32 mode, i32 first, i32 count, std::span<const float> xy,
                      std::span<const float, 16> matrix, std::span<const float, 4> color,
+                     bool cull_face_enabled,
                      std::span<u8> rgb565, u32 stride_pixels, u32 width, u32 height);
 private:
     struct Impl;
