@@ -45,6 +45,7 @@
 *.elf
 *.ipsw
 *.ipg
+*.pak
 *.rom
 *.iso
 *.vll
@@ -62,6 +63,10 @@
 *.png
 *.zip
 *.7z
+*.dat
+*.db
+*.sqlite
+*.sqlite3
 
 # Editor and OS files
 .DS_Store
