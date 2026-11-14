@@ -4,9 +4,11 @@ ClickHLE does not bundle its dependencies. Unicorn Engine is required at runtime
 
 Each dependency is distributed under its own license. Check the terms for the version and package you install, especially if redistributing a build that includes or links optional libraries.
 
-The native VC2 core in `src/video/vc2/` ports the ProkBox scalar, vector and peripheral models
-from `prokbox/prokbox5g`, revision `fe22071c2706ee8e14e9e51f8eb8df9c73f1a360`.
-Those derived files retain GPL-2.0-or-later notices; see `src/video/vc2/COPYING`.
+The native VC2 core in `src/video/platform1/vc2/` includes code derived from the
+ProkBox scalar, vector, and peripheral models in `prokbox/prokbox5g`, revision
+`fe22071c2706ee8e14e9e51f8eb8df9c73f1a360`.
+Those derived files retain GPL-2.0-or-later notices; see
+`src/video/platform1/vc2/COPYING`.
 They also include locally tested experimental instruction forms. The reference's hypotheses
 remain hypotheses in this port. Firmware and game assets are not included.
 
